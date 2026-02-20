@@ -1,0 +1,26 @@
+display_information:
+  name: Feature Factory
+  description: Slack intake bot for feature requests
+  background_color: "#1f2937"
+features:
+  bot_user:
+    display_name: Feature Factory
+    always_online: false
+  slash_commands:
+    - command: /feature
+      description: Create a feature request
+      usage_hint: Add invoice export
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+      - channels:read
+      - groups:read
+      - im:read
+      - mpim:read
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

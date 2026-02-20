@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Feature Factory{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container">
+      <div class="brand">
+        <a href="/">Feature Factory</a>
+        <span class="tag">local-first scaffold</span>
+      </div>
+      <nav class="nav">
+        <a href="/docs" class="muted" style="display:none;">Docs</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <span class="muted">MOCK_MODE-friendly | FastAPI + Postgres + Redis</span>
+    </div>
+  </footer>
+</body>
+</html>

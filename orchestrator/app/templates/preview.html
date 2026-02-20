@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Preview {{ preview_id }} • Feature Factory{% endblock %}
+
+{% block content %}
+
+<a href="/" class="muted">← Back</a>
+
+<section class="card">
+  <h1>Mock Preview</h1>
+  <p class="muted">This page simulates a preview deployment for local testing.</p>
+
+  <div class="alert">
+    Preview ID: <code>{{ preview_id }}</code>
+  </div>
+
+  <p>
+    In a real setup, this would be a Vercel/Netlify/K8s ephemeral environment link
+    posted back to Slack.
+  </p>
+</section>
+
+{% endblock %}

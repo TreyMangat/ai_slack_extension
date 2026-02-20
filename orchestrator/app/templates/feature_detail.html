@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+
+{% block title %}{{ feature.title }} - Feature Factory{% endblock %}
+
+{% block content %}
+
+<a href="/" class="muted">&lt;- Back</a>
+
+<section class="card">
+  <div class="header-row">
+    <div>
+      <h1>{{ feature.title }}</h1>
+      <div class="muted">id: <code>{{ feature.id }}</code></div>
+    </div>
+    <div class="pill">{{ feature.status }}</div>
+  </div>
+
+  {% if feature.spec.get('_validation') and not feature.spec.get('_validation').get('is_valid') %}
+    <div class="alert">
+      <strong>Spec needs clarification.</strong>
+      <div>Missing: {{ feature.spec.get('_validation').get('missing') }}</div>
+    </div>
+  {% endif %}
+
+  <div class="grid-2">
+    <div>
+      <h3>Problem</h3>
+      <pre class="pre">{{ feature.spec.get('problem','') }}</pre>
+
+      <h3>Why now</h3>
+      <pre class="pre">{{ feature.spec.get('business_justification','') }}</pre>
+
+      <h3>Build strategy</h3>
+      <ul>
+        <li>Mode: <code>{{ feature.spec.get('implementation_mode', 'new_feature') }}</code></li>
+        <li>Primary repo: <code>{{ feature.spec.get('repo', '(none)') }}</code></li>
+      </ul>
+
+      <h3>Source repos (reference-only snapshots)</h3>
+      <ul>
+        {% for repo in feature.spec.get('source_repos', []) %}
+          <li><code>{{ repo }}</code></li>
+        {% endfor %}
+        {% if feature.spec.get('source_repos', [])|length == 0 %}
+          <li class="muted">(none)</li>
+        {% endif %}
+      </ul>
+
+      <h3>Acceptance criteria</h3>
+      <ul>
+        {% for ac in feature.spec.get('acceptance_criteria', []) %}
+          <li>{{ ac }}</li>
+        {% endfor %}
+        {% if feature.spec.get('acceptance_criteria', [])|length == 0 %}
+          <li class="muted">(none provided)</li>
+        {% endif %}
+      </ul>
+
+      <h3>Links</h3>
+      <ul>
+        {% for link in feature.spec.get('links', []) %}
+          <li><a href="{{ link }}" target="_blank">{{ link }}</a></li>
+        {% endfor %}
+        {% if feature.spec.get('links', [])|length == 0 %}
+          <li class="muted">(none)</li>
+        {% endif %}
+      </ul>
+
+      <h3>Execution</h3>
+      <ul>
+        <li>Issue: {% if feature.github_issue_url %}<a href="{{ feature.github_issue_url }}" target="_blank">{{ feature.github_issue_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+        <li>PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank">{{ feature.github_pr_url }}</a>{% else %}<span class="muted">(none / pending)</span>{% endif %}</li>
+        <li>Preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank">{{ feature.preview_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+      </ul>
+
+      <div class="row">
+        {% if ready_for_build %}
+          <form method="post" action="/features/{{ feature.id }}/build">
+            <button class="btn">Run Build</button>
+          </form>
+        {% else %}
+          <button class="btn" disabled>Run Build</button>
+        {% endif %}
+
+        {% if can_approve %}
+          <form method="post" action="/features/{{ feature.id }}/approve">
+            <button class="btn secondary">Approve</button>
+          </form>
+        {% else %}
+          <button class="btn secondary" disabled>Approve</button>
+        {% endif %}
+      </div>
+
+      {% if feature.last_error %}
+        <div class="alert danger">
+          <strong>Last error:</strong>
+          <pre class="pre">{{ feature.last_error }}</pre>
+        </div>
+      {% endif %}
+    </div>
+
+    <div>
+      <h3>Update details</h3>
+      <p class="muted small">Use this when the request is in NEEDS_INFO or if requirements changed.</p>
+      <form method="post" action="/features/{{ feature.id }}/update" class="form">
+        <label>
+          Title
+          <input name="title" required value="{{ feature.spec.get('title', '') }}" />
+        </label>
+
+        <label>
+          Problem
+          <textarea name="problem" rows="3" required>{{ feature.spec.get('problem', '') }}</textarea>
+        </label>
+
+        <label>
+          Why is this needed now?
+          <textarea name="business_justification" rows="3" required>{{ feature.spec.get('business_justification', '') }}</textarea>
+        </label>
+
+        <label>
+          Build mode
+          <select name="implementation_mode">
+            <option value="new_feature" {% if feature.spec.get('implementation_mode', 'new_feature') == 'new_feature' %}selected{% endif %}>Build from scratch</option>
+            <option value="reuse_existing" {% if feature.spec.get('implementation_mode', 'new_feature') == 'reuse_existing' %}selected{% endif %}>Reuse existing repo patterns</option>
+          </select>
+        </label>
+
+        <label>
+          Source repos (one per line, for reuse mode)
+          <textarea name="source_repos" rows="3">{{ feature.spec.get('source_repos', []) | join('\n') }}</textarea>
+        </label>
+
+        <label>
+          Acceptance criteria (one per line)
+          <textarea name="acceptance_criteria" rows="4">{{ feature.spec.get('acceptance_criteria', []) | join('\n') }}</textarea>
+        </label>
+
+        <label>
+          Proposed solution
+          <textarea name="proposed_solution" rows="3">{{ feature.spec.get('proposed_solution', '') }}</textarea>
+        </label>
+
+        <label>
+          Non-goals (one per line)
+          <textarea name="non_goals" rows="3">{{ feature.spec.get('non_goals', []) | join('\n') }}</textarea>
+        </label>
+
+        <label>
+          Repo
+          <input name="repo" value="{{ feature.spec.get('repo', '') }}" />
+        </label>
+
+        <label>
+          Risk flags (comma-separated)
+          <input name="risk_flags" value="{{ feature.spec.get('risk_flags', []) | join(', ') }}" />
+        </label>
+
+        <label>
+          Links (one per line)
+          <textarea name="links" rows="2">{{ feature.spec.get('links', []) | join('\n') }}</textarea>
+        </label>
+
+        <button class="btn" type="submit">Save and revalidate</button>
+      </form>
+
+      <h3>Event log</h3>
+      <ul class="timeline">
+        {% for e in events %}
+          <li>
+            <div class="small muted">{{ e.created_at }}</div>
+            <div><strong>{{ e.event_type }}</strong> - {{ e.message }}</div>
+          </li>
+        {% endfor %}
+      </ul>
+
+      <h3>Raw spec JSON</h3>
+      <pre class="pre">{{ feature.spec | tojson(indent=2) }}</pre>
+    </div>
+  </div>
+</section>
+
+{% endblock %}

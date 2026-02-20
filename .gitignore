@@ -1,0 +1,17 @@
+.env
+.env.local
+.env.*.local
+
+.vscode/
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+
+orchestrator/app/__pycache__/
+orchestrator/app/api/__pycache__/
+orchestrator/app/api/routes/__pycache__/
+orchestrator/app/services/__pycache__/
+orchestrator/app/tasks/__pycache__/
+
+*.log

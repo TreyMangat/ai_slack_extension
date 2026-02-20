@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block title %}Feature Factory{% endblock %}
+
+{% block content %}
+
+<div class="grid">
+  <section class="card">
+    <h2>Create a feature request</h2>
+    <p class="muted">This is the local UI. Slack is optional.</p>
+
+    <form method="post" action="/create" class="form">
+      <label>
+        Title
+        <input name="title" placeholder="e.g. Export invoices as CSV" required />
+      </label>
+
+      <label>
+        Problem
+        <textarea name="problem" rows="4" placeholder="What problem are we solving?" required></textarea>
+      </label>
+
+      <label>
+        Why is this needed now?
+        <textarea name="business_justification" rows="3" placeholder="Business impact, urgency, and expected value" required></textarea>
+      </label>
+
+      <div class="row">
+        <label>
+          Build mode
+          <select name="implementation_mode">
+            <option value="new_feature" selected>Build from scratch</option>
+            <option value="reuse_existing">Reuse existing repo patterns</option>
+          </select>
+        </label>
+
+        <label>
+          Source repos (one per line, for reuse mode)
+          <textarea name="source_repos" rows="3" placeholder="org/existing-repo&#10;https://github.com/org/another-repo"></textarea>
+        </label>
+      </div>
+
+      <label>
+        Acceptance criteria (one per line)
+        <textarea name="acceptance_criteria" rows="4" placeholder="- User can click Export\n- CSV downloads with columns X,Y,Z"></textarea>
+      </label>
+
+      <label>
+        Proposed solution (optional)
+        <textarea name="proposed_solution" rows="3" placeholder="Any suggested approach"></textarea>
+      </label>
+
+      <div class="row">
+        <label>
+          Repo (optional)
+          <input name="repo" placeholder="org/repo" />
+        </label>
+
+        <label>
+          Risk flags (comma separated)
+          <input name="risk_flags" placeholder="auth, payments, migrations" />
+        </label>
+      </div>
+
+      <label>
+        Non-goals (one per line)
+        <textarea name="non_goals" rows="3" placeholder="- No redesign\n- No billing changes"></textarea>
+      </label>
+
+      <button type="submit" class="btn">Create</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Recent requests</h2>
+    {% if features|length == 0 %}
+      <p class="muted">No requests yet. Create one on the left.</p>
+    {% else %}
+      <ul class="list">
+        {% for f in features %}
+          <li class="list-item">
+            <div>
+              <a href="/features/{{ f.id }}"><strong>{{ f.title }}</strong></a>
+              <div class="muted small">{{ f.id }}</div>
+            </div>
+            <div class="pill">{{ f.status }}</div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </section>
+</div>
+
+{% endblock %}
