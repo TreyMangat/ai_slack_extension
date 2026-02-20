@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rich.console import Console
 
@@ -155,12 +155,23 @@ def _clone_snapshot(repo_ref: str, destination: Path, *, token: str, timeout_sec
     return clone_url
 
 
-def cleanup_old_workspaces() -> WorkspaceCleanupResult:
+def _extract_feature_id_from_workspace_dir(path: Path) -> str:
+    # Pattern: ff-<feature-uuid>-<unix-ts>
+    match = re.match(r"^ff-([0-9a-fA-F-]{36})-\d+$", path.name)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def cleanup_old_workspaces(
+    *,
+    retention_resolver: Callable[[str], int] | None = None,
+) -> WorkspaceCleanupResult:
     settings = get_settings()
     workspace_root = Path(settings.workspace_root).resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
 
-    retention_seconds = max(settings.workspace_retention_hours, 1) * 3600
+    default_retention_seconds = max(settings.workspace_retention_hours, 1) * 3600
     now = int(time.time())
     removed_paths: list[str] = []
     errors: list[str] = []
@@ -168,6 +179,14 @@ def cleanup_old_workspaces() -> WorkspaceCleanupResult:
     candidates = sorted([p for p in workspace_root.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime)
     for path in candidates[: settings.workspace_cleanup_max_per_run]:
         try:
+            retention_seconds = default_retention_seconds
+            if retention_resolver is not None:
+                feature_id = _extract_feature_id_from_workspace_dir(path)
+                if feature_id:
+                    resolved_hours = retention_resolver(feature_id)
+                    if isinstance(resolved_hours, int) and resolved_hours > 0:
+                        retention_seconds = resolved_hours * 3600
+
             age_seconds = now - int(path.stat().st_mtime)
             if age_seconds < retention_seconds:
                 continue

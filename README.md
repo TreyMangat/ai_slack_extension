@@ -144,6 +144,10 @@ Safety defaults:
 - `WORKSPACE_ENABLE_GIT_CLONE=false` (remote clone disabled unless explicitly enabled)
 - local path snapshots are restricted to `WORKSPACE_LOCAL_COPY_ROOT`
 - `.git` metadata is removed from snapshots
+- retention policy supports shorter storage for failed/non-PR work:
+  - `WORKSPACE_RETENTION_HOURS_WITH_PR`
+  - `WORKSPACE_RETENTION_HOURS_WITHOUT_PR`
+  - `WORKSPACE_RETENTION_HOURS_FAILED`
 
 ---
 

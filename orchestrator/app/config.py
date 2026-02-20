@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     )
     workspace_retention_hours: int = Field(default=24, alias="WORKSPACE_RETENTION_HOURS")
     workspace_cleanup_max_per_run: int = Field(default=50, alias="WORKSPACE_CLEANUP_MAX_PER_RUN")
+    workspace_retention_hours_with_pr: int = Field(default=168, alias="WORKSPACE_RETENTION_HOURS_WITH_PR")
+    workspace_retention_hours_without_pr: int = Field(default=24, alias="WORKSPACE_RETENTION_HOURS_WITHOUT_PR")
+    workspace_retention_hours_failed: int = Field(default=12, alias="WORKSPACE_RETENTION_HOURS_FAILED")
 
     def slack_allowed_channel_set(self) -> set[str]:
         return {c.strip() for c in self.slack_allowed_channels.split(",") if c.strip()}

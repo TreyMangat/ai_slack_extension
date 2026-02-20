@@ -48,6 +48,7 @@ This project is now stable for local testing, but these items are required for a
 - Add cleanup jobs for `WORKSPACE_ROOT` (TTL/retention).
 - Add storage quotas to avoid large repo snapshot growth.
 - Keep local snapshot roots restricted and monitored.
+- Use status-aware retention so rejected/non-PR work expires faster than PR-backed work.
 
 ## Suggested release sequence
 

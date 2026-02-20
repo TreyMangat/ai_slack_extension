@@ -140,7 +140,21 @@ async def kickoff_build(feature_id: str) -> None:
         log_event(db, feature, event_type="build_started", message="Build started")
 
         spec = feature.spec or {}
-        cleanup_result = cleanup_old_workspaces()
+
+        def _retention_resolver(fid: str) -> int:
+            row = db.get(FeatureRequest, fid)
+            if not row:
+                return max(settings.workspace_retention_hours_without_pr, 1)
+
+            status = str(row.status or "").strip().upper()
+            has_pr = bool(str(row.github_pr_url or "").strip())
+            if has_pr:
+                return max(settings.workspace_retention_hours_with_pr, 1)
+            if status in {"FAILED_SPEC", "FAILED_BUILD", "FAILED_PREVIEW", "NEEDS_INFO", "NEEDS_HUMAN"}:
+                return max(settings.workspace_retention_hours_failed, 1)
+            return max(settings.workspace_retention_hours_without_pr, 1)
+
+        cleanup_result = cleanup_old_workspaces(retention_resolver=_retention_resolver)
         if cleanup_result.removed_paths or cleanup_result.errors:
             log_event(
                 db,
