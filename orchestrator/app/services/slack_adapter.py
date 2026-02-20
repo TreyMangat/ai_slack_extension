@@ -63,6 +63,6 @@ class RealSlackAdapter(SlackAdapter):
 
 def get_slack_adapter() -> SlackAdapter:
     settings = get_settings()
-    if settings.mock_mode or not settings.enable_slack_bot or not settings.slack_bot_token:
+    if not settings.enable_slack_bot or not settings.slack_bot_token:
         return MockSlackAdapter()
     return RealSlackAdapter(settings.slack_bot_token)

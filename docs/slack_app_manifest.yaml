@@ -17,6 +17,7 @@ oauth_config:
       - chat:write
       - commands
       - channels:read
+      - channels:join
       - groups:read
       - im:read
       - mpim:read

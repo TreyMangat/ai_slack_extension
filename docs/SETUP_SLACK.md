@@ -19,6 +19,7 @@ The `/feature` flow is designed for non-technical users:
    - `chat:write`
    - `commands`
    - `channels:read`
+   - `channels:join` (recommended)
    - `groups:read`
    - `im:read`
    - `mpim:read`

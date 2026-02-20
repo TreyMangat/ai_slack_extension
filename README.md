@@ -163,6 +163,7 @@ Recommended bot scopes (minimum viable):
 - `chat:write`
 - `commands`
 - `channels:read`
+- `channels:join` (recommended, lets bot join public channels)
 - `groups:read`
 - `im:read`
 - `mpim:read`
