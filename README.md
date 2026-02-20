@@ -278,6 +278,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
 
 - Edit `docs/ARCHITECTURE.md` to match your real infrastructure
 - Review `docs/PRODUCTION_READINESS.md` for org-grade rollout requirements
+- Use `docs/ORG_DEPLOYMENT.md` for server/VM deployment and storage lifecycle policy
 - Replace mock adapters with real deployments:
   - preview environments (Vercel/Netlify/K8s)
   - stricter policy gates
