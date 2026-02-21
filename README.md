@@ -312,10 +312,12 @@ For `native_llm`, also set:
 
 For OpenClaw/OpenCode delegated mode (`CODERUNNER_MODE=opencode`):
 - keep `MOCK_MODE=false`
-- the GitHub workflow default model is `openai-codex/gpt-5.3-codex`
+- the GitHub workflow default model is `github-copilot/gpt-4.1` (no OpenAI key required)
 - override with repo variable `OPENCODE_MODEL` if needed
 - note: interactive OAuth is local-only; GitHub Actions runners cannot complete OAuth prompts.
-  - for GitHub Actions, use an API-key-backed model/provider (`OPENAI_API_KEY`, etc.)
+  - for GitHub Actions, use non-interactive auth:
+    - preferred no-key path: `COPILOT_GITHUB_TOKEN` (or built-in `GITHUB_TOKEN`)
+    - API-key path: provider key such as `OPENAI_API_KEY`
 
 ### 3) Put GitHub config in `.env`
 
@@ -341,9 +343,10 @@ Now, when you run a build, the worker will:
 - Post the `/oc ...` trigger comment
 
 OpenCode workflow secrets/variables in the target repo:
-- `OPENAI_API_KEY` (only if selected `OPENCODE_MODEL` requires OpenAI API key auth)
+- `COPILOT_GITHUB_TOKEN` (recommended if using `github-copilot/*` models; falls back to Actions `GITHUB_TOKEN`)
+- `OPENAI_API_KEY` (only if selected `OPENCODE_MODEL` needs OpenAI API key auth)
 - `FEATURE_FACTORY_CALLBACK_URL` (optional, full URL or base URL of orchestrator)
-- `FEATURE_FACTORY_WEBHOOK_SECRET` (optional, must match `INTEGRATION_WEBHOOK_SECRET`)
+- `FEATURE_FACTORY_WEBHOOK_SECRET` (optional, must match `INTEGRATION_WEBHOOK_SECRET`; set together with callback URL)
 - `OPENCODE_MODEL` repo variable (optional override of default model)
 
 If your external runner can call back, use:

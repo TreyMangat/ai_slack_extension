@@ -75,12 +75,14 @@ Set the trigger comment:
 
 Recommended repo settings for the workflow:
 
-- Repo variable: `OPENCODE_MODEL=openai-codex/gpt-5.3-codex` (or provider/model of your choice)
-- Secret: `OPENAI_API_KEY` (if chosen model/provider requires OpenAI API key auth)
+- Repo variable: `OPENCODE_MODEL=github-copilot/gpt-4.1` (default if unset)
+- Secret: `COPILOT_GITHUB_TOKEN` (recommended for `github-copilot/*`; workflow falls back to Actions `GITHUB_TOKEN`)
+- Secret: `OPENAI_API_KEY` (only if chosen model/provider requires OpenAI API key auth)
 - Optional secret: `FEATURE_FACTORY_CALLBACK_URL`
   - either full endpoint URL or base URL where `/api/integrations/execution-callback` can be appended
 - Optional secret: `FEATURE_FACTORY_WEBHOOK_SECRET`
   - must match orchestrator `INTEGRATION_WEBHOOK_SECRET`
+  - set together with callback URL (workflow now fails fast on partial callback secret config)
 
 OpenClaw OAuth note:
 - Local interactive terminals can use:

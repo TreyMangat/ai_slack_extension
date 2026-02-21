@@ -14,7 +14,20 @@
 
 When `CODERUNNER_MODE=opencode`, this orchestrator delegates coding to your external OpenCode runner.
 
-To run with OpenClaw + OpenAI provider:
+To run with OpenCode in GitHub Actions without `OPENAI_API_KEY`:
+
+1. Keep orchestrator in delegated mode:
+   - `MOCK_MODE=false`
+   - `CODERUNNER_MODE=opencode`
+2. Use a GitHub-hosted model path in workflow:
+   - `OPENCODE_MODEL=github-copilot/gpt-4.1` (default in this repo workflow)
+3. Provide token auth in the runner env:
+   - `COPILOT_GITHUB_TOKEN=<token>` (recommended)
+   - fallback: Actions `GITHUB_TOKEN`
+4. Ensure runner posts signed callbacks back to:
+   - `POST /api/integrations/execution-callback`
+
+To run with OpenCode + OpenAI API-key mode:
 
 1. Keep orchestrator in delegated mode:
    - `MOCK_MODE=false`
