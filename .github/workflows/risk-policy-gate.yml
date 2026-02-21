@@ -1,0 +1,385 @@
+name: risk-policy-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_head_sha:
+        description: Optional SHA guard for deterministic reruns.
+        required: false
+        type: string
+
+concurrency:
+  group: risk-policy-${{ github.event.pull_request.number || github.ref_name || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    outputs:
+      risk_tier: ${{ steps.gate.outputs.risk_tier }}
+      required_checks_json: ${{ steps.gate.outputs.required_checks_json }}
+      ui_required: ${{ steps.gate.outputs.ui_required }}
+      docs_drift_ok: ${{ steps.gate.outputs.docs_drift_ok }}
+      blocked: ${{ steps.gate.outputs.blocked }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      base_sha: ${{ steps.gate.outputs.base_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install gate dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml==6.0.2
+
+      - name: Resolve SHAs
+        id: shas
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            echo "base_sha=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+            echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enforce expected head SHA for manual reruns
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_head_sha != '' }}
+        shell: bash
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [[ "$actual" != "${{ inputs.expected_head_sha }}" ]]; then
+            echo "Expected SHA '${{ inputs.expected_head_sha }}' does not match current HEAD '$actual'."
+            exit 1
+          fi
+
+      - name: Run risk policy gate
+        id: gate
+        run: |
+          python .github/scripts/risk_policy_gate.py \
+            --policy .github/risk-policy.yml \
+            --event-name "${{ github.event_name }}" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --base-sha "${{ steps.shas.outputs.base_sha }}" \
+            --head-sha "${{ steps.shas.outputs.head_sha }}" \
+            --output-json "$RUNNER_TEMP/risk-policy-output.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload policy evaluation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: risk-policy-output
+          path: ${{ runner.temp }}/risk-policy-output.json
+          if-no-files-found: error
+
+  lint_static:
+    name: lint-static
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.required_checks_json), 'lint-static') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: python -m pip install --disable-pip-version-check -r orchestrator/requirements.txt
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall orchestrator/app
+          python -m compileall .github/scripts
+
+      - name: Validate dependency graph
+        run: python -m pip check
+
+  unit_tests:
+    name: unit-tests
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.required_checks_json), 'unit-tests') }}
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql+psycopg2://feature:feature@localhost:5432/feature_factory
+      REDIS_URL: redis://localhost:6379/0
+      SECRET_KEY: ci-secret-key
+      APP_ENV: ci
+      AUTH_MODE: disabled
+      MOCK_MODE: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r orchestrator/requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest
+
+  db_migrations:
+    name: db-migrations
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.required_checks_json), 'db-migrations') }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: feature
+          POSTGRES_PASSWORD: feature
+          POSTGRES_DB: feature_factory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U feature -d feature_factory"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg2://feature:feature@localhost:5432/feature_factory
+      REDIS_URL: redis://localhost:6379/0
+      SECRET_KEY: ci-secret-key
+      APP_ENV: ci
+      AUTH_MODE: disabled
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r orchestrator/requirements.txt
+
+      - name: Wait for postgres readiness
+        shell: bash
+        run: |
+          for i in {1..60}; do
+            if (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "postgres did not become ready in time"
+          exit 1
+
+      - name: Apply Alembic migrations
+        run: |
+          cd orchestrator
+          alembic -c alembic.ini upgrade head
+          alembic -c alembic.ini current
+
+  api_smoke:
+    name: api-smoke
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.required_checks_json), 'api-smoke') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Start stack
+        run: docker compose up -d --build api worker db redis
+
+      - name: Wait for API health
+        shell: bash
+        run: |
+          for i in {1..90}; do
+            if curl -fsS http://localhost:8000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed health checks in time."
+          docker compose logs --no-color
+          exit 1
+
+      - name: Run smoke test
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/smoke_test.ps1 -BaseUrl http://localhost:8000 -PollSeconds 90
+
+      - name: Build UI evidence manifest when required
+        if: ${{ needs.preflight.outputs.ui_required == 'true' }}
+        run: >
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ui_evidence.ps1
+          -BaseUrl http://localhost:8000
+          -OutputPath artifacts/ui-evidence-manifest.json
+          -HeadSha "${{ needs.preflight.outputs.head_sha }}"
+
+      - name: Capture docker logs
+        if: always()
+        run: docker compose logs --no-color > docker-compose.log
+
+      - name: Upload docker logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: docker-compose-logs
+          path: docker-compose.log
+          if-no-files-found: ignore
+
+      - name: Upload UI evidence manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ui-evidence-manifest
+          path: artifacts/ui-evidence-manifest.json
+          if-no-files-found: ignore
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
+  ui_evidence:
+    name: ui-evidence
+    needs: [preflight, api_smoke]
+    if: ${{ needs.preflight.result == 'success' && needs.preflight.outputs.ui_required == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml==6.0.2
+
+      - name: Download UI evidence manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ui-evidence-manifest
+          path: artifacts
+
+      - name: Validate UI evidence manifest
+        run: |
+          python .github/scripts/validate_ui_evidence.py \
+            --policy .github/risk-policy.yml \
+            --manifest artifacts/ui-evidence-manifest.json \
+            --expected-head-sha "${{ needs.preflight.outputs.head_sha }}"
+
+  security_codeql:
+    name: security-codeql
+    needs: [preflight]
+    if: ${{ needs.preflight.result == 'success' && contains(fromJSON(needs.preflight.outputs.required_checks_json), 'security-codeql') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@60d8f0d1f1f8c8d07ef53bd027032705d414ec28
+        with:
+          languages: python
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@60d8f0d1f1f8c8d07ef53bd027032705d414ec28
+        with:
+          category: "/language:python"
+
+  review_agent:
+    name: review-agent
+    needs: [preflight, lint_static, unit_tests, db_migrations, api_smoke, ui_evidence, security_codeql]
+    if: ${{ always() && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Evaluate fallback review-agent findings
+        env:
+          REQUIRED_CHECKS_JSON: ${{ needs.preflight.outputs.required_checks_json }}
+          CHECK_RESULTS_JSON: >-
+            {"lint-static":"${{ needs.lint_static.result }}","unit-tests":"${{ needs.unit_tests.result }}","db-migrations":"${{ needs.db_migrations.result }}","api-smoke":"${{ needs.api_smoke.result }}","ui-evidence":"${{ needs.ui_evidence.result }}","security-codeql":"${{ needs.security_codeql.result }}"}
+        run: |
+          python .github/scripts/review_agent_fallback.py \
+            --required-checks-json "$REQUIRED_CHECKS_JSON" \
+            --check-results-json "$CHECK_RESULTS_JSON" \
+            --risk-tier "${{ needs.preflight.outputs.risk_tier }}" \
+            --head-sha "${{ needs.preflight.outputs.head_sha }}" \
+            --output artifacts/review-agent-findings.json
+
+      - name: Upload review-agent findings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: review-agent-findings
+          path: artifacts/review-agent-findings.json
+          if-no-files-found: error
+
+  head_sha_gate:
+    name: head-sha-gate
+    needs: [preflight, review_agent]
+    if: ${{ always() && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Verify required checks on current head SHA
+        run: |
+          python .github/scripts/verify_head_sha_checks.py \
+            --repo "${{ github.repository }}" \
+            --token "${{ github.token }}" \
+            --head-sha "${{ needs.preflight.outputs.head_sha }}" \
+            --required-checks-json '${{ needs.preflight.outputs.required_checks_json }}' \
+            --must-include preflight \
+            --must-include review-agent

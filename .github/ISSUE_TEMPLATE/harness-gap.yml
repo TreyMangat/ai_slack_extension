@@ -1,0 +1,62 @@
+name: Harness gap
+description: Track a finding/incident that needs deterministic regression coverage.
+title: "[Harness gap]: "
+labels:
+  - harness-gap
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to convert findings into repeatable coverage in `tests/harness/`.
+
+  - type: input
+    id: source
+    attributes:
+      label: Source
+      description: Where was this found? (review-agent, incident, manual QA, etc.)
+      placeholder: review-agent finding in PR #123
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk_tier
+    attributes:
+      label: Risk tier
+      options:
+        - low
+        - medium
+        - high
+        - critical
+    validations:
+      required: true
+
+  - type: textarea
+    id: trigger
+    attributes:
+      label: Trigger
+      description: What input/change caused the issue?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Steps to reproduce deterministically.
+    validations:
+      required: true
+
+  - type: textarea
+    id: assertions
+    attributes:
+      label: Assertions to automate
+      description: List explicit pass/fail checks that should become harness coverage.
+    validations:
+      required: true

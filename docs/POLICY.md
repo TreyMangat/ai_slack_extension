@@ -1,23 +1,30 @@
 # Policy (Merge + Risk)
 
-This scaffold intentionally **does not auto-merge** by default.
+This project enforces merge policy through a machine-readable contract:
 
-## Why
+- `.github/risk-policy.yml`
 
-User approval in Slack/UI is **product approval**, not engineering approval.
+The preflight gate uses that file to compute risk tier from changed paths and enforce deterministic rules before expensive checks run.
 
-In production you should require:
-- CI checks passing
-- CODEOWNERS approvals
-- security scans
-- explicit human review for risky changes
+## Current policy model
 
-## Config
+- Risk tiers by changed paths: `low`, `medium`, `high`, `critical`
+- Required checks per tier
+- Unit test gate on all risk tiers
+- Docs drift enforcement for control-plane changes
+- Conditional UI evidence checks for UI-related paths
+- Head SHA freshness gate to reject stale check signals
 
-- `DISABLE_AUTOMERGE=true` blocks auto-merge even when everything is green.
+## Merge principles
 
-Future improvements:
-- risk scoring by touched paths
-- detection of migrations/auth/payments
-- feature-flag requirement for risky areas
+User approval in Slack/UI is product approval only. Merge readiness still requires engineering/security gates.
 
+Defaults:
+
+- `DISABLE_AUTOMERGE=true` (auto-merge off)
+- required CI checks before merge (configure in branch protection)
+
+See:
+
+- `docs/code-factory.md` for full PR loop operations
+- `.github/workflows/risk-policy-gate.yml` for enforced CI order

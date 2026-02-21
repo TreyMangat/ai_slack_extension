@@ -20,7 +20,7 @@ The Slack intake is novice-oriented:
 - captures whether to build from scratch or reuse existing repo patterns
 - captures source repos for safe reference cloning
 - posts clarifying questions when details are missing
-- supports iterative updates through an **Add details** action
+- supports iterative updates through an **Add details in chat** action
 - routes preview/PR output to reviewer/admin approval
 
 ---
@@ -30,6 +30,7 @@ The Slack intake is novice-oriented:
 - **FastAPI** web app (local UI + JSON API)
 - **Postgres** database
 - **Redis + RQ** worker for background jobs
+- **Cleanup worker** for scheduled workspace retention
 - Optional **Slack bot** process (disabled by default)
 - Pluggable adapters for Slack, GitHub, Code Runner, Preview
 
@@ -66,14 +67,26 @@ Copy-Item .env.example .env
 ```
 
 Leave everything as-is for now (MOCK_MODE is enabled by default).
+Local defaults keep `AUTH_MODE=disabled`; production should use `AUTH_MODE=edge_sso`.
 
 ### 4) Start the stack
 
 In VS Code Terminal (PowerShell):
 
 ```powershell
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
+
+Helper script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1
+```
+
+`docker-compose.yml` is production-safe by default (no hot reload, no host DB/Redis ports).
+`docker-compose.dev.yml` adds local developer overrides.
+If you are reusing an older local DB volume after schema changes, run `scripts/migrate.ps1`
+or reset with `scripts/reset_db.ps1`.
 
 ### 5) Open the local UI
 
@@ -100,7 +113,20 @@ This verifies the core API workflow end-to-end:
 - preview readiness
 - product approval
 
-### 7) (Optional) Verify real-mode callback flow
+### 7) (Optional) Run Alembic migration path locally
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1
+```
+
+This exercises the production migration path (`alembic upgrade head`).
+If your local DB was created before Alembic, run once with bootstrap stamping:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1 -BootstrapStamp
+```
+
+### 8) (Optional) Verify real-mode callback flow
 
 This validates the non-mock execution path where an external runner posts status back.
 
@@ -110,7 +136,7 @@ This validates the non-mock execution path where an external runner posts status
 2. Restart:
 
 ```powershell
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 3. Run:
@@ -167,10 +193,20 @@ Recommended bot scopes (minimum viable):
 - `chat:write`
 - `commands`
 - `channels:read`
+- `channels:history`
 - `channels:join` (recommended, lets bot join public channels)
 - `groups:read`
+- `groups:history`
 - `im:read`
+- `im:history`
 - `mpim:read`
+- `mpim:history`
+
+Event subscriptions (bot events):
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
 
 Add a Slash Command:
 - `/feature`
@@ -191,7 +227,13 @@ Set:
 ### 3) Restart
 
 ```powershell
-docker compose --profile slack up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile slack up --build
+```
+
+or:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 ```
 
 Then in Slack, run:
@@ -200,27 +242,90 @@ Then in Slack, run:
 /feature Add a button to export invoices
 ```
 
+The bot will continue intake in thread (chat-first, no popup modal).
+
+If thread replies are ignored, validate scopes/events:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check_slack_setup.ps1
+```
+
 ---
 
 ## (Optional) Connect GitHub + OpenCode
 
 This scaffold can create GitHub issues and post a comment that triggers OpenCode.
+It can also run a native in-container LLM coding loop (experimental).
 
 ### 1) Prepare your target repo
 
 - Create or choose a GitHub repo you want OpenCode to work on
-- Install the **OpenCode GitHub integration / Action** in that repo
+- This repo now includes `.github/workflows/opencode-runner.yml`
+- Push that workflow to the target repo so `/oc` comments trigger OpenCode automatically
 
-### 2) Create a GitHub token
+### 1b) Set up OpenClaw locally (Codex OAuth)
 
-For testing you can use a **classic Personal Access Token** (PAT) with:
-- `repo` scope (private repos)
+Install/update and set model:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_openclaw.ps1
+```
+
+Complete OAuth in an interactive terminal:
+
+```powershell
+openclaw onboard --auth-choice openai-codex
+# or
+openclaw models auth login --provider openai-codex
+```
+
+Verify:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1
+```
+
+### 2) Choose GitHub auth mode
+
+For local testing:
+- `GITHUB_AUTH_MODE=token`
+- `GITHUB_TOKEN=<PAT with repo scope>`
+
+For production:
+- `GITHUB_AUTH_MODE=app`
+- `GITHUB_APP_ID=...`
+- `GITHUB_APP_INSTALLATION_ID=...`
+- `GITHUB_APP_PRIVATE_KEY_PATH=...`
+  - For Docker Compose, store key in `./secrets` and use `/run/secrets/<file>.pem`
+
+### 2b) Choose code runner mode
+
+- `CODERUNNER_MODE=opencode` (default): triggers external runner and expects signed callbacks.
+- `CODERUNNER_MODE=native_llm` (experimental): the worker clones target repo, asks LLM for patch, runs tests, pushes branch, opens PR.
+
+For `native_llm`, also set:
+- `LLM_PROVIDER=openai`
+- `LLM_API_KEY=...`
+- `LLM_MODEL=gpt-4.1-mini` (or preferred model)
+- `LLM_TEST_COMMAND=pytest -q` (or your repo's test command)
+- `repo` in feature spec, or `GITHUB_REPO_OWNER` + `GITHUB_REPO_NAME`
+
+For OpenClaw/OpenCode delegated mode (`CODERUNNER_MODE=opencode`):
+- keep `MOCK_MODE=false`
+- the GitHub workflow default model is `openai-codex/gpt-5.3-codex`
+- override with repo variable `OPENCODE_MODEL` if needed
+- note: interactive OAuth is local-only; GitHub Actions runners cannot complete OAuth prompts.
+  - for GitHub Actions, use an API-key-backed model/provider (`OPENAI_API_KEY`, etc.)
 
 ### 3) Put GitHub config in `.env`
 
 Set:
 - `GITHUB_ENABLED=true`
-- `GITHUB_TOKEN=...`
+- `GITHUB_AUTH_MODE=token|app`
+- `GITHUB_TOKEN=...` (token mode)
+- `GITHUB_APP_ID=...` (app mode)
+- `GITHUB_APP_INSTALLATION_ID=...` (app mode)
+- `GITHUB_APP_PRIVATE_KEY_PATH=...` (app mode)
 - `GITHUB_REPO_OWNER=your-org-or-user`
 - `GITHUB_REPO_NAME=your-repo`
 - `WORKSPACE_ENABLE_GIT_CLONE=true` (if reuse mode should pull remote source repos)
@@ -228,18 +333,39 @@ Set:
 ### 4) Restart
 
 ```powershell
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
 Now, when you run a build, the worker will:
 - Create a GitHub issue
 - Post the `/oc ...` trigger comment
 
+OpenCode workflow secrets/variables in the target repo:
+- `OPENAI_API_KEY` (only if selected `OPENCODE_MODEL` requires OpenAI API key auth)
+- `FEATURE_FACTORY_CALLBACK_URL` (optional, full URL or base URL of orchestrator)
+- `FEATURE_FACTORY_WEBHOOK_SECRET` (optional, must match `INTEGRATION_WEBHOOK_SECRET`)
+- `OPENCODE_MODEL` repo variable (optional override of default model)
+
 If your external runner can call back, use:
 - `POST /api/integrations/execution-callback`
 - Signed with:
   - `X-Feature-Factory-Timestamp`
   - `X-Feature-Factory-Signature`
+  - `X-Feature-Factory-Event-Id` (idempotency key)
+
+### 5) Verify GitHub App install + permissions
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check_github_app.ps1
+```
+
+Current required app permissions for this scaffold:
+- `Issues: Read and write` (create issue + post trigger comment)
+- `Metadata: Read`
+- `Contents: Read` only if `WORKSPACE_ENABLE_GIT_CLONE=true`
+
+Optional for future automation (not required today):
+- `Pull requests: Read and write`
 
 Helper script:
 
@@ -261,6 +387,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
 - `orchestrator/app/services/*` - adapters and business logic
 - `orchestrator/app/tasks/jobs.py` - queued background jobs
 - `orchestrator/app/worker.py` - RQ worker
+- `orchestrator/app/cleanup_worker.py` - scheduled workspace cleanup worker
 - `orchestrator/app/slackbot.py` - Slack Socket Mode bot (optional)
 
 ---
@@ -270,7 +397,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
 - Auto-merge is disabled by default (`DISABLE_AUTOMERGE=true`).
 - Slack and GitHub adapters are designed to be least-privilege.
 - Treat Slack messages and attachments as **untrusted input**.
-- Optional API auth: set `API_AUTH_TOKEN` and pass `X-FF-Token` for mutating `/api` calls.
+- Auth/RBAC are configurable:
+  - local: `AUTH_MODE=disabled`
+  - edge SSO: `AUTH_MODE=edge_sso` + trusted headers (`X-Forwarded-Email`, `X-Forwarded-Groups`)
+  - service calls: `API_AUTH_TOKEN` with `X-FF-Token`
+- Scheduled cleanup is independent from build flow (`WORKSPACE_CLEANUP_INTERVAL_MINUTES`).
 
 ---
 
@@ -279,6 +410,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
 - Edit `docs/ARCHITECTURE.md` to match your real infrastructure
 - Review `docs/PRODUCTION_READINESS.md` for org-grade rollout requirements
 - Use `docs/ORG_DEPLOYMENT.md` for server/VM deployment and storage lifecycle policy
+- Use `docs/SETUP_AUTH.md` for edge SSO + RBAC configuration
+- Track finalized deployment assumptions in `PRODUCTION_INPUTS.md`
+- Use `docs/code-factory.md` for risk-aware PR gating and review-agent operations
+- Use `docs/MODEL_PROVIDERS.md` for multi-provider runner strategy (OpenAI/Claude/Gemini)
 - Replace mock adapters with real deployments:
   - preview environments (Vercel/Netlify/K8s)
   - stricter policy gates

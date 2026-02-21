@@ -9,8 +9,22 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.models import FeatureRequest
 from app.queue import get_queue
+from app.security import (
+    AuthenticatedUser,
+    require_authenticated_user,
+    require_can_approve,
+    require_can_build,
+    require_can_request_or_update_spec,
+    user_can_access_feature,
+    user_can_view_all_features,
+)
 from app.schemas import FeatureRequestCreate, FeatureSpec, FeatureSpecPatch, FeatureSpecUpdateRequest
-from app.services.feature_service import create_feature_request, update_feature_spec
+from app.services.feature_service import (
+    BuildAlreadyInProgressError,
+    create_feature_request,
+    transition_feature_to_building,
+    update_feature_spec,
+)
 from app.state_machine import READY_FOR_BUILD, PREVIEW_READY
 from app.tasks.jobs import kickoff_build_job
 
@@ -20,8 +34,15 @@ templates = Jinja2Templates(directory="app/templates")
 
 
 @router.get("/", response_class=HTMLResponse)
-def home(request: Request, db: Session = Depends(get_db)):
-    features = db.execute(select(FeatureRequest).order_by(FeatureRequest.created_at.desc())).scalars().all()
+def home(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+):
+    stmt = select(FeatureRequest)
+    if not user_can_view_all_features(user):
+        stmt = stmt.where(FeatureRequest.requester_user_id.in_(sorted(user.identity_candidates())))
+    features = db.execute(stmt.order_by(FeatureRequest.created_at.desc())).scalars().all()
     return templates.TemplateResponse(
         "index.html",
         {
@@ -44,6 +65,7 @@ def create_from_form(
     repo: str = Form(""),
     risk_flags: str = Form(""),
     db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_can_request_or_update_spec),
 ):
     ac_list = [line.strip() for line in acceptance_criteria.splitlines() if line.strip()]
     ng_list = [line.strip() for line in non_goals.splitlines() if line.strip()]
@@ -64,7 +86,7 @@ def create_from_form(
         risk_flags=rf_list,
     )
 
-    payload = FeatureRequestCreate(spec=spec, requester_user_id="local-user")
+    payload = FeatureRequestCreate(spec=spec, requester_user_id=user.actor_id)
     feature = create_feature_request(db, payload)
     db.commit()
 
@@ -72,10 +94,17 @@ def create_from_form(
 
 
 @router.get("/features/{feature_id}", response_class=HTMLResponse)
-def feature_detail(feature_id: str, request: Request, db: Session = Depends(get_db)):
+def feature_detail(
+    feature_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404)
+    if not user_can_access_feature(user, feature.requester_user_id):
+        raise HTTPException(status_code=403)
 
     events = sorted(feature.events, key=lambda e: e.created_at)
 
@@ -92,25 +121,44 @@ def feature_detail(feature_id: str, request: Request, db: Session = Depends(get_
 
 
 @router.post("/features/{feature_id}/build")
-def build_from_ui(feature_id: str, db: Session = Depends(get_db)):
-    feature = db.get(FeatureRequest, feature_id)
+def build_from_ui(
+    feature_id: str,
+    db: Session = Depends(get_db),
+    _user: AuthenticatedUser = Depends(require_can_build),
+):
+    feature = (
+        db.execute(select(FeatureRequest).where(FeatureRequest.id == feature_id).with_for_update())
+        .scalars()
+        .first()
+    )
     if not feature:
         raise HTTPException(status_code=404)
 
-    if feature.status != READY_FOR_BUILD:
-        raise HTTPException(status_code=400, detail=f"Not ready for build ({feature.status})")
+    try:
+        transition_feature_to_building(feature)
+    except BuildAlreadyInProgressError:
+        return RedirectResponse(url=f"/features/{feature.id}", status_code=303)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     q = get_queue()
     try:
-        q.enqueue(kickoff_build_job, feature.id)
+        job = q.enqueue(kickoff_build_job, feature.id)
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=503, detail=f"Failed to enqueue build: {e}")
 
+    feature.active_build_job_id = job.id
+    db.commit()
     return RedirectResponse(url=f"/features/{feature.id}", status_code=303)
 
 
 @router.post("/features/{feature_id}/approve")
-def approve_from_ui(feature_id: str, db: Session = Depends(get_db)):
+def approve_from_ui(
+    feature_id: str,
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_can_approve),
+):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404)
@@ -118,7 +166,7 @@ def approve_from_ui(feature_id: str, db: Session = Depends(get_db)):
     from app.services.feature_service import mark_product_approved
 
     try:
-        mark_product_approved(db, feature, approver="local-user")
+        mark_product_approved(db, feature, approver=user.actor_id, preauthorized=True)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
@@ -143,10 +191,13 @@ def update_from_ui(
     risk_flags: str = Form(""),
     links: str = Form(""),
     db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_can_request_or_update_spec),
 ):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404)
+    if not user_can_access_feature(user, feature.requester_user_id):
+        raise HTTPException(status_code=403)
 
     ac_list = [line.strip() for line in acceptance_criteria.splitlines() if line.strip()]
     ng_list = [line.strip() for line in non_goals.splitlines() if line.strip()]
@@ -171,7 +222,7 @@ def update_from_ui(
     payload = FeatureSpecUpdateRequest(
         spec=patch,
         actor_type="user",
-        actor_id="local-user",
+        actor_id=user.actor_id,
         message="Spec updated from local UI",
     )
 

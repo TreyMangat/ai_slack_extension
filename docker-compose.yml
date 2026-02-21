@@ -11,9 +11,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     volumes:
-      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
 
   worker:
     build:
@@ -26,8 +33,22 @@ services:
       redis:
         condition: service_healthy
     command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
     volumes:
-      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
+
+  cleanup:
+    build:
+      context: ./orchestrator
+    env_file:
+      - ./.env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.cleanup_worker"]
+    restart: unless-stopped
+    volumes:
+      - ./secrets:/run/secrets:ro
 
   slackbot:
     build:
@@ -43,8 +64,9 @@ services:
       api:
         condition: service_started
     command: ["python", "-m", "app.slackbot"]
+    restart: unless-stopped
     volumes:
-      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
 
   db:
     image: postgres:16
@@ -52,8 +74,6 @@ services:
       POSTGRES_USER: feature
       POSTGRES_PASSWORD: feature
       POSTGRES_DB: feature_factory
-    ports:
-      - "5432:5432"
     volumes:
       - ff_db:/var/lib/postgresql/data
     healthcheck:
@@ -65,8 +85,6 @@ services:
 
   redis:
     image: redis:7
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

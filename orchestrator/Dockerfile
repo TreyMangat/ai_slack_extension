@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
 
 # System deps (kept minimal)
@@ -10,6 +14,14 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app /app/app
+COPY alembic.ini /app/alembic.ini
+COPY alembic /app/alembic
+
+RUN useradd --create-home --home-dir /home/app --shell /usr/sbin/nologin app \
+    && mkdir -p /tmp/feature_factory_workspaces \
+    && chown -R app:app /app /tmp/feature_factory_workspaces
+
+USER app
 
 EXPOSE 8000
 

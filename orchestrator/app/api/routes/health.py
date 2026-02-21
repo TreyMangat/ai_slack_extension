@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.observability import metrics
 from app.queue import get_redis
 
 router = APIRouter()
@@ -36,3 +37,8 @@ def readiness(db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail={"ok": False, "checks": checks})
 
     return {"ok": True, "checks": checks}
+
+
+@router.get("/health/metrics")
+def health_metrics():
+    return {"ok": True, "metrics": metrics.snapshot()}

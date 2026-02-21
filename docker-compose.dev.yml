@@ -1,0 +1,30 @@
+services:
+  api:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
+
+  worker:
+    volumes:
+      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
+
+  cleanup:
+    volumes:
+      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
+
+  slackbot:
+    volumes:
+      - ./orchestrator:/app
+      - ./secrets:/run/secrets:ro
+
+  db:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+

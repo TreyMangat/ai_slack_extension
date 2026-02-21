@@ -7,9 +7,12 @@ from sqlalchemy.orm import Session
 from app.models import FeatureRequest
 from app.schemas import FeatureRequestCreate, FeatureSpecUpdateRequest
 from app.services.event_logger import log_event
+from app.services.prompt_optimizer import attach_optimized_prompt
 from app.services.reviewer_service import ensure_approver_allowed
 from app.services.spec_validator import validate_spec
+from app.services.url_safety import normalize_external_url_list
 from app.state_machine import (
+    BUILDING,
     FAILED_SPEC,
     NEEDS_INFO,
     NEW,
@@ -18,6 +21,15 @@ from app.state_machine import (
     perform_action,
     validate_transition,
 )
+
+
+class BuildAlreadyInProgressError(ValueError):
+    def __init__(self, *, job_id: str = "") -> None:
+        self.job_id = job_id
+        message = "Build already in progress"
+        if job_id:
+            message = f"{message} (job_id={job_id})"
+        super().__init__(message)
 
 
 def _set_validation_metadata(feature: FeatureRequest, *, is_valid: bool, missing: list[str], warnings: list[str]) -> None:
@@ -38,6 +50,10 @@ def _status_after_validation(current_status: str, *, is_valid: bool) -> str:
 
 
 def create_feature_request(db: Session, payload: FeatureRequestCreate) -> FeatureRequest:
+    spec_data = payload.spec.model_dump()
+    spec_data["links"] = normalize_external_url_list(spec_data.get("links") or [])
+    spec_data = attach_optimized_prompt(spec_data)
+
     feature = FeatureRequest(
         status=NEW,
         title=payload.spec.title,
@@ -45,7 +61,7 @@ def create_feature_request(db: Session, payload: FeatureRequestCreate) -> Featur
         slack_channel_id=payload.slack_channel_id or "",
         slack_thread_ts=payload.slack_thread_ts or "",
         slack_message_ts=payload.slack_message_ts or "",
-        spec=payload.spec.model_dump(),
+        spec=spec_data,
     )
     db.add(feature)
     db.flush()  # assign id
@@ -129,6 +145,8 @@ def update_feature_spec(db: Session, feature: FeatureRequest, payload: FeatureSp
 
     next_spec = dict(feature.spec or {})
     next_spec.update(normalized_patch)
+    next_spec["links"] = normalize_external_url_list(next_spec.get("links") or [])
+    next_spec = attach_optimized_prompt(next_spec)
     feature.spec = next_spec
     feature.title = str(next_spec.get("title", "")).strip()[:200]
 
@@ -145,8 +163,15 @@ def update_feature_spec(db: Session, feature: FeatureRequest, payload: FeatureSp
     return refresh_spec_validation(db, feature)
 
 
-def mark_product_approved(db: Session, feature: FeatureRequest, *, approver: str) -> FeatureRequest:
-    ensure_approver_allowed(approver)
+def mark_product_approved(
+    db: Session,
+    feature: FeatureRequest,
+    *,
+    approver: str,
+    preauthorized: bool = False,
+) -> FeatureRequest:
+    if not preauthorized:
+        ensure_approver_allowed(approver)
 
     action_result = perform_action(feature.status, "approve")
     validate_transition(feature.status, action_result.new_status)
@@ -180,3 +205,14 @@ def mark_ready_to_merge(db: Session, feature: FeatureRequest, *, actor_id: str =
         message="Marked READY_TO_MERGE",
     )
     return feature
+
+
+def transition_feature_to_building(feature: FeatureRequest) -> None:
+    if feature.status == BUILDING:
+        raise BuildAlreadyInProgressError(job_id=(feature.active_build_job_id or "").strip())
+    if feature.status != READY_FOR_BUILD:
+        raise ValueError(f"Feature must be READY_FOR_BUILD (currently {feature.status})")
+
+    action_result = perform_action(feature.status, "start_build")
+    validate_transition(feature.status, action_result.new_status)
+    feature.status = action_result.new_status

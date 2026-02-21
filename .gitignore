@@ -15,3 +15,6 @@ orchestrator/app/services/__pycache__/
 orchestrator/app/tasks/__pycache__/
 
 *.log
+artifacts/
+tmp_x_article.html
+secrets/

@@ -59,7 +59,7 @@
       <h3>Links</h3>
       <ul>
         {% for link in feature.spec.get('links', []) %}
-          <li><a href="{{ link }}" target="_blank">{{ link }}</a></li>
+          <li><a href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ link }}</a></li>
         {% endfor %}
         {% if feature.spec.get('links', [])|length == 0 %}
           <li class="muted">(none)</li>
@@ -68,9 +68,9 @@
 
       <h3>Execution</h3>
       <ul>
-        <li>Issue: {% if feature.github_issue_url %}<a href="{{ feature.github_issue_url }}" target="_blank">{{ feature.github_issue_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
-        <li>PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank">{{ feature.github_pr_url }}</a>{% else %}<span class="muted">(none / pending)</span>{% endif %}</li>
-        <li>Preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank">{{ feature.preview_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+        <li>Issue: {% if feature.github_issue_url %}<a href="{{ feature.github_issue_url }}" target="_blank" rel="noopener noreferrer">{{ feature.github_issue_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+        <li>PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank" rel="noopener noreferrer">{{ feature.github_pr_url }}</a>{% else %}<span class="muted">(none / pending)</span>{% endif %}</li>
+        <li>Preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank" rel="noopener noreferrer">{{ feature.preview_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
       </ul>
 
       <div class="row">

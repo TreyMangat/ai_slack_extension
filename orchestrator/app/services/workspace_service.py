@@ -8,10 +8,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from rich.console import Console
 
 from app.config import get_settings
+from app.services.github_auth import get_github_token_provider
 
 
 console = Console()
@@ -134,6 +136,7 @@ def _clone_snapshot(repo_ref: str, destination: Path, *, token: str, timeout_sec
     if not clone_url:
         raise ValueError("Unsupported repository reference format for clone")
 
+    safe_clone_url = redact_clone_url_for_logging(clone_url)
     if token and clone_url.startswith("https://github.com/"):
         clone_url = clone_url.replace("https://", f"https://x-access-token:{token}@")
 
@@ -149,10 +152,27 @@ def _clone_snapshot(repo_ref: str, destination: Path, *, token: str, timeout_sec
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     if result.returncode != 0:
         stderr = result.stderr.strip() or result.stdout.strip() or "unknown git clone error"
+        stderr = stderr.replace(clone_url, safe_clone_url)
         raise RuntimeError(stderr)
 
     _strip_git_metadata(destination)
-    return clone_url
+    return safe_clone_url
+
+
+def redact_clone_url_for_logging(clone_url: str) -> str:
+    """Remove credentials from clone URLs before persisting/logging."""
+
+    text = (clone_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except Exception:
+        return text
+    if parsed.scheme and parsed.netloc and "@" in parsed.netloc:
+        host = parsed.netloc.split("@", 1)[1]
+        return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    return text
 
 
 def _extract_feature_id_from_workspace_dir(path: Path) -> str:
@@ -239,6 +259,12 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
 
     allowed_copy_root = Path(settings.workspace_local_copy_root).resolve()
     ignore_patterns = settings.workspace_copy_ignore_patterns()
+    clone_token = ""
+    if settings.workspace_enable_git_clone and settings.github_enabled:
+        try:
+            clone_token = get_github_token_provider().get_token()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"could not acquire GitHub auth token for clone: {e}")
 
     for index, repo_ref in enumerate(repos_to_process, start=1):
         slug = _safe_slug(repo_ref, index=index)
@@ -299,7 +325,7 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
             cloned_url = _clone_snapshot(
                 repo_ref,
                 destination,
-                token=settings.github_token,
+                token=clone_token,
                 timeout_seconds=settings.workspace_git_clone_timeout_seconds,
             )
             prepared_references.append(

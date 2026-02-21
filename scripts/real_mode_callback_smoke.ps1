@@ -20,12 +20,41 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ApiToken = ""
+$AuthMode = ""
+$AuthHeaderEmail = "X-Forwarded-Email"
+$AuthHeaderGroups = "X-Forwarded-Groups"
+$AuthEmail = "real-mode-smoke@example.local"
+$AuthGroups = "engineering,admins"
 
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
   if ($tokenLine) {
     $ApiToken = (($tokenLine.Line -split '=', 2)[1]).Trim()
   }
+  $authModeLine = Select-String -Path ".env" -Pattern '^AUTH_MODE=' -ErrorAction SilentlyContinue
+  if ($authModeLine) {
+    $AuthMode = (($authModeLine.Line -split '=', 2)[1]).Trim().ToLowerInvariant()
+  }
+  $emailHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_EMAIL=' -ErrorAction SilentlyContinue
+  if ($emailHeaderLine) {
+    $AuthHeaderEmail = (($emailHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+  $groupHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_GROUPS=' -ErrorAction SilentlyContinue
+  if ($groupHeaderLine) {
+    $AuthHeaderGroups = (($groupHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+}
+
+function New-AuthHeaders {
+  $headers = @{}
+  if ($ApiToken) {
+    $headers["X-FF-Token"] = $ApiToken
+  }
+  if ($AuthMode -eq "edge_sso") {
+    $headers[$AuthHeaderEmail] = $AuthEmail
+    $headers[$AuthHeaderGroups] = $AuthGroups
+  }
+  return $headers
 }
 
 function Assert-True {
@@ -43,14 +72,16 @@ function Invoke-Json {
     [object]$Body = $null
   )
   if ($null -eq $Body) {
-    if ($ApiToken) {
-      return Invoke-RestMethod -Method $Method -Uri $Url -Headers @{ "X-FF-Token" = $ApiToken } -TimeoutSec 30
+    $headers = New-AuthHeaders
+    if ($headers.Count -gt 0) {
+      return Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers -TimeoutSec 30
     }
     return Invoke-RestMethod -Method $Method -Uri $Url -TimeoutSec 30
   }
   $json = $Body | ConvertTo-Json -Depth 8
-  if ($ApiToken) {
-    return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -Headers @{ "X-FF-Token" = $ApiToken } -TimeoutSec 30
+  $headers = New-AuthHeaders
+  if ($headers.Count -gt 0) {
+    return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -Headers $headers -TimeoutSec 30
   }
   return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -TimeoutSec 30
 }
@@ -60,8 +91,13 @@ function Send-SignedCallback {
     [string]$FeatureId,
     [string]$Event,
     [string]$PreviewUrl,
-    [string]$GithubPrUrl
+    [string]$GithubPrUrl,
+    [string]$EventId = ""
   )
+
+  if (-not $EventId) {
+    $EventId = [Guid]::NewGuid().ToString()
+  }
 
   $payload = @{
     feature_id = $FeatureId
@@ -70,6 +106,7 @@ function Send-SignedCallback {
     github_pr_url = $GithubPrUrl
     message = "Callback from real_mode_callback_smoke.ps1"
     actor_id = "real-mode-smoke"
+    event_id = $EventId
     metadata = @{ source = "real-mode-smoke" }
   }
 
@@ -87,6 +124,7 @@ function Send-SignedCallback {
     -Headers @{
       "X-Feature-Factory-Timestamp" = $timestamp
       "X-Feature-Factory-Signature" = "sha256=$hex"
+      "X-Feature-Factory-Event-Id" = $EventId
     } `
     -ContentType "application/json" `
     -Body $json `

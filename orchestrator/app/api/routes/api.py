@@ -4,48 +4,61 @@ import hashlib
 import hmac
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FeatureRequest
+from app.models import FeatureRequest, IntegrationCallbackReceipt
 from app.queue import get_queue
-from app.security import require_api_auth
+from app.security import (
+    AuthenticatedUser,
+    require_authenticated_user,
+    require_can_approve,
+    require_can_build,
+    require_can_request_or_update_spec,
+    user_can_access_feature,
+    user_can_view_all_features,
+)
 from app.schemas import (
     BuildRequest,
     ExecutionCallbackIn,
     FeatureRequestCreate,
+    FeatureRequestListOut,
     FeatureRequestOut,
     FeatureSpecUpdateRequest,
 )
 from app.services.event_logger import log_event
 from app.services.feature_service import (
+    BuildAlreadyInProgressError,
     create_feature_request,
     mark_product_approved,
     refresh_spec_validation,
+    transition_feature_to_building,
     update_feature_spec,
 )
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
+from app.services.url_safety import normalize_external_url
 from app.state_machine import (
-    BUILDING,
     FAILED_BUILD,
     FAILED_PREVIEW,
     PREVIEW_READY,
     PR_OPENED,
-    READY_FOR_BUILD,
+    BUILDING,
     perform_action,
     validate_transition,
 )
 from app.tasks.jobs import kickoff_build_job
 
 router = APIRouter()
+integration_router = APIRouter()
 
 
-def _feature_to_out(feature: FeatureRequest) -> FeatureRequestOut:
+def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> FeatureRequestOut:
     return FeatureRequestOut(
         id=feature.id,
         created_at=feature.created_at,
@@ -59,10 +72,11 @@ def _feature_to_out(feature: FeatureRequest) -> FeatureRequestOut:
         github_issue_url=feature.github_issue_url,
         github_pr_url=feature.github_pr_url,
         preview_url=feature.preview_url,
+        active_build_job_id=feature.active_build_job_id,
         product_approved_by=feature.product_approved_by,
         product_approved_at=feature.product_approved_at,
         last_error=feature.last_error,
-        events=[
+        events=[] if not include_events else [
             {
                 "id": e.id,
                 "created_at": e.created_at,
@@ -106,9 +120,8 @@ def _verify_execution_callback_signature(request: Request, raw_body: bytes) -> N
 
 def _transition_feature(feature: FeatureRequest, action: str) -> None:
     result = perform_action(feature.status, action)
-    if result.new_status != feature.status:
-        validate_transition(feature.status, result.new_status)
-        feature.status = result.new_status
+    validate_transition(feature.status, result.new_status)
+    feature.status = result.new_status
 
 
 def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbackIn) -> None:
@@ -120,7 +133,9 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
         elif feature.status != PR_OPENED:
             raise ValueError(f"Cannot apply pr_opened in status {feature.status}")
         if payload.github_pr_url:
-            feature.github_pr_url = payload.github_pr_url
+            safe_pr_url = normalize_external_url(payload.github_pr_url)
+            if safe_pr_url:
+                feature.github_pr_url = safe_pr_url
         return
 
     if event == "preview_ready":
@@ -131,9 +146,14 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
         elif feature.status != PREVIEW_READY:
             raise ValueError(f"Cannot apply preview_ready in status {feature.status}")
         if payload.github_pr_url:
-            feature.github_pr_url = payload.github_pr_url
+            safe_pr_url = normalize_external_url(payload.github_pr_url)
+            if safe_pr_url:
+                feature.github_pr_url = safe_pr_url
         if payload.preview_url:
-            feature.preview_url = payload.preview_url
+            safe_preview_url = normalize_external_url(payload.preview_url)
+            if safe_preview_url:
+                feature.preview_url = safe_preview_url
+        feature.active_build_job_id = ""
         return
 
     if event == "build_failed":
@@ -142,6 +162,7 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
         elif feature.status != FAILED_BUILD:
             raise ValueError(f"Cannot apply build_failed in status {feature.status}")
         feature.last_error = payload.message or "External build reported failure"
+        feature.active_build_job_id = ""
         return
 
     if event == "preview_failed":
@@ -150,23 +171,68 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
         elif feature.status != FAILED_PREVIEW:
             raise ValueError(f"Cannot apply preview_failed in status {feature.status}")
         feature.last_error = payload.message or "External preview reported failure"
+        feature.active_build_job_id = ""
         return
 
     raise ValueError(f"Unsupported callback event: {event}")
 
 
-@router.get("/feature-requests", response_model=list[FeatureRequestOut])
-def list_feature_requests(db: Session = Depends(get_db)):
-    rows = db.execute(select(FeatureRequest).order_by(FeatureRequest.created_at.desc())).scalars().all()
-    return [_feature_to_out(r) for r in rows]
+@router.get("/feature-requests", response_model=FeatureRequestListOut)
+def list_feature_requests(
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: str = Query(default=""),
+    mine: bool = Query(default=True),
+    include_events: bool = Query(default=False),
+):
+    conditions = []
+    status_filter = status.strip()
+    if status_filter:
+        conditions.append(FeatureRequest.status == status_filter)
+
+    can_view_all = user_can_view_all_features(user)
+    if mine or not can_view_all:
+        identities = sorted(user.identity_candidates())
+        if not identities:
+            return FeatureRequestListOut(items=[], total=0, limit=limit, offset=offset, has_more=False)
+        conditions.append(FeatureRequest.requester_user_id.in_(identities))
+
+    total_stmt = select(func.count()).select_from(FeatureRequest)
+    if conditions:
+        total_stmt = total_stmt.where(*conditions)
+    total = int(db.execute(total_stmt).scalar_one() or 0)
+
+    stmt = select(FeatureRequest)
+    if conditions:
+        stmt = stmt.where(*conditions)
+    rows = (
+        db.execute(stmt.order_by(FeatureRequest.created_at.desc()).offset(offset).limit(limit))
+        .scalars()
+        .all()
+    )
+    items = [_feature_to_out(r, include_events=include_events) for r in rows]
+    return FeatureRequestListOut(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=(offset + len(items)) < total,
+    )
 
 
 @router.post("/feature-requests", response_model=FeatureRequestOut)
 def create_feature(
     payload: FeatureRequestCreate,
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_api_auth),
+    user: AuthenticatedUser = Depends(require_can_request_or_update_spec),
 ):
+    requester = (payload.requester_user_id or "").strip()
+    if user.auth_source != "api_token" or not requester:
+        requester = user.actor_id
+    payload = payload.model_copy(update={"requester_user_id": requester})
+
     feature = create_feature_request(db, payload)
     db.commit()
     db.refresh(feature)
@@ -174,10 +240,16 @@ def create_feature(
 
 
 @router.get("/feature-requests/{feature_id}", response_model=FeatureRequestOut)
-def get_feature(feature_id: str, db: Session = Depends(get_db)):
+def get_feature(
+    feature_id: str,
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404, detail="Not found")
+    if not user_can_access_feature(user, feature.requester_user_id):
+        raise HTTPException(status_code=403, detail="Not allowed to view this feature")
     return _feature_to_out(feature)
 
 
@@ -185,11 +257,13 @@ def get_feature(feature_id: str, db: Session = Depends(get_db)):
 def revalidate_spec(
     feature_id: str,
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_api_auth),
+    user: AuthenticatedUser = Depends(require_can_request_or_update_spec),
 ):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404, detail="Not found")
+    if not user_can_access_feature(user, feature.requester_user_id):
+        raise HTTPException(status_code=403, detail="Not allowed to revalidate this feature")
 
     try:
         refresh_spec_validation(db, feature)
@@ -206,13 +280,19 @@ def patch_spec(
     feature_id: str,
     payload: FeatureSpecUpdateRequest,
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_api_auth),
+    user: AuthenticatedUser = Depends(require_can_request_or_update_spec),
 ):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404, detail="Not found")
+    if not user_can_access_feature(user, feature.requester_user_id):
+        raise HTTPException(status_code=403, detail="Not allowed to update this feature")
 
     try:
+        actor_id = (payload.actor_id or "").strip()
+        if user.auth_source != "api_token" or not actor_id:
+            actor_id = user.actor_id
+        payload = payload.model_copy(update={"actor_id": actor_id})
         update_feature_spec(db, feature, payload)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -227,28 +307,50 @@ def start_build(
     feature_id: str,
     payload: BuildRequest | None = None,
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_api_auth),
+    user: AuthenticatedUser = Depends(require_can_build),
 ):
-    feature = db.get(FeatureRequest, feature_id)
+    feature = (
+        db.execute(select(FeatureRequest).where(FeatureRequest.id == feature_id).with_for_update())
+        .scalars()
+        .first()
+    )
     if not feature:
         raise HTTPException(status_code=404, detail="Not found")
 
-    if feature.status != READY_FOR_BUILD:
-        raise HTTPException(status_code=400, detail=f"Feature must be READY_FOR_BUILD (currently {feature.status})")
+    build_payload = payload or BuildRequest()
+    actor_id = (build_payload.actor_id or "").strip()
+    if user.auth_source != "api_token" or not actor_id:
+        actor_id = user.actor_id
+
+    try:
+        transition_feature_to_building(feature)
+    except BuildAlreadyInProgressError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Build already in progress",
+                "feature_id": feature.id,
+                "job_id": e.job_id,
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     q = get_queue()
     try:
         job = q.enqueue(kickoff_build_job, feature.id)
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=503, detail=f"Failed to enqueue build: {e}")
 
+    feature.active_build_job_id = job.id
     log_event(
         db,
         feature,
         event_type="build_enqueued",
-        actor_type=(payload.actor_type if payload else "user"),
-        actor_id=(payload.actor_id if payload else ""),
-        message=(payload.message if payload else "Build enqueued"),
+        actor_type=build_payload.actor_type or "user",
+        actor_id=actor_id,
+        message=build_payload.message or "Build enqueued",
         data={"job_id": job.id},
     )
     db.commit()
@@ -259,16 +361,20 @@ def start_build(
 @router.post("/feature-requests/{feature_id}/approve", response_model=FeatureRequestOut)
 def approve(
     feature_id: str,
-    approver: str = "local-user",
+    approver: str = "",
     db: Session = Depends(get_db),
-    _auth: None = Depends(require_api_auth),
+    user: AuthenticatedUser = Depends(require_can_approve),
 ):
     feature = db.get(FeatureRequest, feature_id)
     if not feature:
         raise HTTPException(status_code=404, detail="Not found")
 
+    effective_approver = (approver or "").strip()
+    if user.auth_source != "api_token" or not effective_approver:
+        effective_approver = user.actor_id
+
     try:
-        feature = mark_product_approved(db, feature, approver=approver)
+        feature = mark_product_approved(db, feature, approver=effective_approver, preauthorized=True)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except Exception as e:
@@ -279,7 +385,7 @@ def approve(
     return _feature_to_out(feature)
 
 
-@router.post("/integrations/execution-callback", response_model=FeatureRequestOut)
+@integration_router.post("/integrations/execution-callback", response_model=FeatureRequestOut)
 async def execution_callback(request: Request, db: Session = Depends(get_db)):
     raw_body = await request.body()
     _verify_execution_callback_signature(request, raw_body)
@@ -289,13 +395,46 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid callback payload: {e}")
 
+    idempotency_key = (
+        (request.headers.get("X-Feature-Factory-Event-Id") or "").strip()
+        or (payload.event_id or "").strip()
+    )
+    if not idempotency_key:
+        raise HTTPException(status_code=400, detail="Missing callback idempotency key")
+
+    payload_hash = hashlib.sha256(raw_body).hexdigest()
+    existing_receipt = db.get(IntegrationCallbackReceipt, idempotency_key)
+    if existing_receipt:
+        feature = db.get(FeatureRequest, existing_receipt.feature_id)
+        if not feature:
+            raise HTTPException(status_code=409, detail="Idempotency key already used for missing feature")
+        return _feature_to_out(feature)
+
     feature = db.get(FeatureRequest, payload.feature_id)
     if not feature:
         raise HTTPException(status_code=404, detail="Feature not found")
 
+    db.add(
+        IntegrationCallbackReceipt(
+            idempotency_key=idempotency_key,
+            feature_id=feature.id,
+            event_type=payload.event,
+            payload_hash=payload_hash,
+        )
+    )
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        feature = db.get(FeatureRequest, payload.feature_id)
+        if not feature:
+            raise HTTPException(status_code=409, detail="Duplicate callback with missing feature")
+        return _feature_to_out(feature)
+
     try:
         _apply_execution_callback(feature, payload)
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
     log_event(
@@ -307,6 +446,7 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
         message=payload.message or f"Execution callback: {payload.event}",
         data={
             "event": payload.event,
+            "event_id": idempotency_key,
             "github_pr_url": payload.github_pr_url,
             "preview_url": payload.preview_url,
             "metadata": payload.metadata,

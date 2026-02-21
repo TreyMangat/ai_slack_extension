@@ -1,0 +1,98 @@
+version: 1
+
+# Highest tier that matches any changed file wins.
+tier_order:
+  - low
+  - medium
+  - high
+  - critical
+
+defaults:
+  risk_tier: low
+
+risk_tiers:
+  low:
+    description: Docs, templates for harness tracking, and metadata-only changes.
+    globs:
+      - "docs/**"
+      - "*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - "tests/harness/**"
+  medium:
+    description: Runtime-adjacent scripts, containers, and dependency pinning.
+    globs:
+      - "scripts/**"
+      - "docker-compose.yml"
+      - "orchestrator/requirements.txt"
+      - "orchestrator/Dockerfile"
+  high:
+    description: Core application behavior and server-rendered UI code paths.
+    globs:
+      - "orchestrator/app/**"
+  critical:
+    description: Security, external integrations, and CI control-plane changes.
+    globs:
+      - "orchestrator/app/security.py"
+      - "orchestrator/app/slackbot.py"
+      - "orchestrator/app/services/github_adapter.py"
+      - "orchestrator/app/services/slack_adapter.py"
+      - "orchestrator/app/api/routes/**"
+      - ".github/workflows/**"
+      - ".github/scripts/**"
+      - ".github/risk-policy.yml"
+
+# Check names must match workflow job names exactly.
+required_checks_by_tier:
+  low:
+    - lint-static
+    - unit-tests
+  medium:
+    - lint-static
+    - unit-tests
+    - db-migrations
+    - api-smoke
+  high:
+    - lint-static
+    - unit-tests
+    - db-migrations
+    - api-smoke
+    - security-codeql
+  critical:
+    - lint-static
+    - unit-tests
+    - db-migrations
+    - api-smoke
+    - security-codeql
+
+# Extra checks only required when relevant files change.
+conditional_required_checks:
+  - check: ui-evidence
+    when_any_globs:
+      - "orchestrator/app/templates/**"
+      - "orchestrator/app/static/**"
+      - "orchestrator/app/api/routes/ui.py"
+
+docs_drift:
+  control_plane_globs:
+    - ".github/workflows/**"
+    - ".github/scripts/**"
+    - ".github/risk-policy.yml"
+    - "scripts/**"
+  required_docs_globs:
+    - "docs/**"
+    - "README.md"
+    - "docs/POLICY.md"
+    - "docs/code-factory.md"
+
+ui_evidence:
+  enabled: true
+  entrypoint: "http://localhost:8000"
+  requires_identity_context: false
+  trigger_globs:
+    - "orchestrator/app/templates/**"
+    - "orchestrator/app/static/**"
+    - "orchestrator/app/api/routes/ui.py"
+  required_flows:
+    - "home_page_renders"
+    - "feature_detail_renders"
+    - "create_request_then_open_feature_ui"

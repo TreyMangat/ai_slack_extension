@@ -91,6 +91,7 @@ class FeatureRequestOut(BaseModel):
     github_issue_url: str
     github_pr_url: str
     preview_url: str
+    active_build_job_id: str
 
     product_approved_by: str
     product_approved_at: Optional[datetime]
@@ -98,6 +99,14 @@ class FeatureRequestOut(BaseModel):
     last_error: str
 
     events: list[FeatureEventOut] = Field(default_factory=list)
+
+
+class FeatureRequestListOut(BaseModel):
+    items: list[FeatureRequestOut] = Field(default_factory=list)
+    total: int
+    limit: int
+    offset: int
+    has_more: bool
 
 
 class TransitionRequest(BaseModel):
@@ -124,4 +133,5 @@ class ExecutionCallbackIn(BaseModel):
     preview_url: str = ""
     message: str = ""
     actor_id: str = "integration"
+    event_id: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)

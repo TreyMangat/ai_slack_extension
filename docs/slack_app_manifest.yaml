@@ -17,11 +17,21 @@ oauth_config:
       - chat:write
       - commands
       - channels:read
+      - channels:history
       - channels:join
       - groups:read
+      - groups:history
       - im:read
+      - im:history
       - mpim:read
+      - mpim:history
 settings:
+  event_subscriptions:
+    bot_events:
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

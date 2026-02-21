@@ -41,6 +41,7 @@ class FeatureRequest(Base):
     github_issue_url: Mapped[str] = mapped_column(Text, default="")
     github_pr_url: Mapped[str] = mapped_column(Text, default="")
     preview_url: Mapped[str] = mapped_column(Text, default="")
+    active_build_job_id: Mapped[str] = mapped_column(String(128), default="")
 
     # Approvals
     product_approved_by: Mapped[str] = mapped_column(String(128), default="")
@@ -73,3 +74,20 @@ class FeatureEvent(Base):
 
 
 Index("ix_feature_events_feature_created", FeatureEvent.feature_id, FeatureEvent.created_at)
+
+
+class IntegrationCallbackReceipt(Base):
+    __tablename__ = "integration_callback_receipts"
+
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    feature_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+Index(
+    "ix_integration_callback_receipts_feature_received",
+    IntegrationCallbackReceipt.feature_id,
+    IntegrationCallbackReceipt.received_at,
+)

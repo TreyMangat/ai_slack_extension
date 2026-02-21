@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import re
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -14,25 +15,111 @@ from app.services.reviewer_service import is_approver_allowed
 console = Console()
 
 QUESTION_BY_FIELD: dict[str, str] = {
-    "title": "What should we call this feature?",
-    "problem": "What user problem should this solve?",
-    "business_justification": "Why is this needed now and what outcome do you expect?",
-    "acceptance_criteria": "How will we know this is complete? Please share acceptance criteria.",
-    "source_repos": "Which existing repos should be used as reference snapshots?",
-    "implementation_mode": "Should this be built from scratch or reuse existing repos?",
+    "title": "What do you want to build?",
+    "problem": "What problem are users facing?",
+    "business_justification": "Why is this needed now?",
+    "links": "Attach request if applicable: paste links or drop files in this thread. Reply `skip` if none.",
+    "repo": "Do you know what project/repo this belongs to? Reply with `org/repo`, repo URL, or `unsure`.",
+    "implementation_mode": "Should implementation start from scratch or reuse existing project patterns? Reply `scratch` or `reuse`.",
+    "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
+    "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
+    "acceptance_criteria": "How will we know this is done? Share acceptance criteria, one per line.",
 }
+
+CREATE_FLOW_FIELDS = [
+    "title",
+    "problem",
+    "business_justification",
+    "links",
+    "repo",
+    "implementation_mode",
+    "source_repos",
+    "proposed_solution",
+    "acceptance_criteria",
+]
+
+UPDATE_FALLBACK_FIELDS = [
+    "problem",
+    "business_justification",
+    "acceptance_criteria",
+    "proposed_solution",
+    "links",
+    "repo",
+]
+
+SESSION_TTL_SECONDS = 2 * 60 * 60
+URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+SKIP_TOKENS = {"skip", "n/a", "na", "none", "no", "not sure", "unsure", "unknown", "idk"}
+
+
+@dataclass
+class IntakeSession:
+    mode: str  # create | update
+    feature_id: str
+    user_id: str
+    channel_id: str
+    thread_ts: str
+    message_ts: str
+    queue: list[str] = field(default_factory=list)
+    answers: dict[str, Any] = field(default_factory=dict)
+    asked_fields: set[str] = field(default_factory=set)
+    base_spec: dict[str, Any] = field(default_factory=dict)
+    started_at: float = field(default_factory=time.time)
+
+
+ACTIVE_INTAKES: dict[str, IntakeSession] = {}
 
 
 def _parse_lines(text: str) -> list[str]:
-    return [line.strip().lstrip("- ") for line in (text or "").splitlines() if line.strip()]
+    return [line.strip().lstrip("- ").strip() for line in (text or "").splitlines() if line.strip()]
 
 
-def _value(values: dict[str, Any], block_id: str) -> str:
-    return values.get(block_id, {}).get("value", {}).get("value", "")
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for raw in values:
+        item = str(raw).strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
-def _selected(values: dict[str, Any], block_id: str) -> str:
-    return values.get(block_id, {}).get("value", {}).get("selected_option", {}).get("value", "")
+def _extract_urls(text: str) -> list[str]:
+    return _dedupe(URL_RE.findall(text or ""))
+
+
+def _extract_file_links(event: dict[str, Any]) -> list[str]:
+    links: list[str] = []
+    for item in event.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        permalink = str(item.get("permalink") or "").strip()
+        if permalink:
+            links.append(permalink)
+    return _dedupe(links)
+
+
+def _is_skip(text: str) -> bool:
+    value = (text or "").strip().lower()
+    return value in SKIP_TOKENS
+
+
+def _normalize_mode(text: str) -> str:
+    value = (text or "").strip().lower()
+    if value in {"scratch", "new", "new_feature", "from scratch", "build from scratch"}:
+        return "new_feature"
+    if value in {"reuse", "existing", "reuse_existing", "use existing", "existing patterns"}:
+        return "reuse_existing"
+    if "scratch" in value:
+        return "new_feature"
+    if "reuse" in value or "existing" in value:
+        return "reuse_existing"
+    return ""
 
 
 def _format_mode(mode: str) -> str:
@@ -41,338 +128,32 @@ def _format_mode(mode: str) -> str:
     return "Build from scratch"
 
 
-def _extract_spec_from_form(values: dict[str, Any]) -> dict[str, Any]:
-    mode = _selected(values, "mode").strip() or "new_feature"
-    return {
-        "title": _value(values, "title").strip(),
-        "problem": _value(values, "problem").strip(),
-        "business_justification": _value(values, "why").strip(),
-        "implementation_mode": mode,
-        "source_repos": _parse_lines(_value(values, "source_repos")),
-        "proposed_solution": _value(values, "solution").strip(),
-        "acceptance_criteria": _parse_lines(_value(values, "acceptance")),
-        "non_goals": _parse_lines(_value(values, "non_goals")),
-        "repo": _value(values, "repo").strip(),
-        "risk_flags": [x.strip() for x in _value(values, "risk").split(",") if x.strip()],
-        "links": _parse_lines(_value(values, "links")),
-    }
+def _session_key(*, channel_id: str, thread_ts: str, user_id: str) -> str:
+    return f"{channel_id}:{thread_ts}:{user_id}"
 
 
-def _build_feature_modal(initial_title: str, channel_id: str) -> dict[str, Any]:
-    return {
-        "type": "modal",
-        "callback_id": "ff_feature_submit",
-        "private_metadata": json.dumps({"channel_id": channel_id}),
-        "title": {"type": "plain_text", "text": "New feature"},
-        "submit": {"type": "plain_text", "text": "Create"},
-        "close": {"type": "plain_text", "text": "Cancel"},
-        "blocks": [
-            {
-                "type": "input",
-                "block_id": "title",
-                "label": {"type": "plain_text", "text": "What should we build?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": initial_title[:150] if initial_title else "",
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "problem",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "What problem are users facing?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "why",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Why is this needed now?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "mode",
-                "label": {"type": "plain_text", "text": "How should implementation start?"},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "value",
-                    "initial_option": {
-                        "text": {"type": "plain_text", "text": "Build from scratch"},
-                        "value": "new_feature",
-                    },
-                    "options": [
-                        {
-                            "text": {"type": "plain_text", "text": "Build from scratch"},
-                            "value": "new_feature",
-                        },
-                        {
-                            "text": {"type": "plain_text", "text": "Reuse existing repo patterns"},
-                            "value": "reuse_existing",
-                        },
-                    ],
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "source_repos",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Source repos (one per line for reuse mode)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "org/existing-repo\nhttps://github.com/org/another-repo",
-                    },
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "acceptance",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Acceptance criteria (one per line)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "solution",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Suggested solution (optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "non_goals",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Non-goals (one per line, optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "repo",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Primary target repo (optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "risk",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Risk flags (optional, comma-separated)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "links",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Links (one per line, optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                },
-            },
-        ],
-    }
+def _cleanup_expired_sessions() -> None:
+    now = time.time()
+    expired = [k for k, s in ACTIVE_INTAKES.items() if now - s.started_at > SESSION_TTL_SECONDS]
+    for key in expired:
+        ACTIVE_INTAKES.pop(key, None)
 
 
-def _build_update_modal(
-    feature: dict[str, Any],
-    *,
-    channel_id: str,
-    message_ts: str,
-    thread_ts: str,
-) -> dict[str, Any]:
-    spec = feature.get("spec") or {}
-    mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
+def _store_session(session: IntakeSession) -> None:
+    _cleanup_expired_sessions()
+    key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
+    ACTIVE_INTAKES[key] = session
 
-    return {
-        "type": "modal",
-        "callback_id": "ff_feature_update",
-        "private_metadata": json.dumps(
-            {
-                "feature_id": feature["id"],
-                "channel_id": channel_id,
-                "message_ts": message_ts,
-                "thread_ts": thread_ts,
-            }
-        ),
-        "title": {"type": "plain_text", "text": "Update details"},
-        "submit": {"type": "plain_text", "text": "Save"},
-        "close": {"type": "plain_text", "text": "Cancel"},
-        "blocks": [
-            {
-                "type": "input",
-                "block_id": "title",
-                "label": {"type": "plain_text", "text": "What should we build?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": str(spec.get("title", ""))[:150],
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "problem",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "What problem are users facing?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": str(spec.get("problem", "")),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "why",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Why is this needed now?"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": str(spec.get("business_justification", "")),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "mode",
-                "label": {"type": "plain_text", "text": "How should implementation start?"},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "value",
-                    "initial_option": {
-                        "text": {"type": "plain_text", "text": _format_mode(mode)},
-                        "value": mode,
-                    },
-                    "options": [
-                        {
-                            "text": {"type": "plain_text", "text": "Build from scratch"},
-                            "value": "new_feature",
-                        },
-                        {
-                            "text": {"type": "plain_text", "text": "Reuse existing repo patterns"},
-                            "value": "reuse_existing",
-                        },
-                    ],
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "source_repos",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Source repos (one per line for reuse mode)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": "\n".join([str(x) for x in spec.get("source_repos", []) if str(x).strip()]),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "acceptance",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Acceptance criteria (one per line)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": "\n".join(
-                        [str(x) for x in spec.get("acceptance_criteria", []) if str(x).strip()]
-                    ),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "solution",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Suggested solution (optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": str(spec.get("proposed_solution", "")),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "non_goals",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Non-goals (one per line, optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": "\n".join([str(x) for x in spec.get("non_goals", []) if str(x).strip()]),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "repo",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Primary target repo (optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": str(spec.get("repo", "")),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "risk",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Risk flags (optional, comma-separated)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "initial_value": ", ".join([str(x) for x in spec.get("risk_flags", []) if str(x).strip()]),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "links",
-                "optional": True,
-                "label": {"type": "plain_text", "text": "Links (one per line, optional)"},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "value",
-                    "multiline": True,
-                    "initial_value": "\n".join([str(x) for x in spec.get("links", []) if str(x).strip()]),
-                },
-            },
-        ],
-    }
+
+def _get_session(*, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
+    _cleanup_expired_sessions()
+    key = _session_key(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+    return ACTIVE_INTAKES.get(key)
+
+
+def _drop_session(session: IntakeSession) -> None:
+    key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
+    ACTIVE_INTAKES.pop(key, None)
 
 
 def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
@@ -397,7 +178,7 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
         {
             "type": "button",
             "action_id": "ff_add_details",
-            "text": {"type": "plain_text", "text": "Add details"},
+            "text": {"type": "plain_text", "text": "Add details in chat"},
             "value": fid,
         },
         {
@@ -458,21 +239,50 @@ def _post_clarification_prompt(client: Any, channel_id: str, thread_ts: str, fea
     if not questions:
         return
 
-    prompt = "I need a few clarifications before I can start the build:\n"
+    prompt = "I still need a few clarifications before build:\n"
     prompt += "\n".join([f"- {q}" for q in questions])
-    prompt += "\nUse *Add details* to update the request."
+    prompt += "\nClick *Add details in chat* and reply in this thread."
     client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=prompt)
 
 
-def _fetch_feature(settings: Any, feature_id: str) -> dict[str, Any]:
-    headers = {}
+def _api_headers(settings: Any, *, actor: str = "slackbot") -> dict[str, str] | None:
     token = (settings.api_auth_token or "").strip()
-    if token:
-        headers["X-FF-Token"] = token
+    if not token:
+        return None
+    actor_header = (settings.auth_service_actor_header or "").strip() or "X-Feature-Factory-Actor"
+    return {
+        "X-FF-Token": token,
+        actor_header: actor,
+    }
+
+
+def _ensure_bot_in_channel(client: Any, channel_id: str, logger: Any) -> None:
+    """Best-effort auto-join for public channels so thread replies are visible."""
+
+    if not channel_id:
+        return
+    try:
+        client.conversations_join(channel=channel_id)
+    except Exception as e:  # noqa: BLE001
+        text = str(e)
+        non_fatal_tokens = [
+            "already_in_channel",
+            "method_not_supported_for_channel_type",
+            "not_in_channel",
+            "is_archived",
+            "channel_not_found",
+        ]
+        if any(token in text for token in non_fatal_tokens):
+            return
+        logger.warning("slack_conversations_join_failed channel=%s error=%s", channel_id, text)
+
+
+def _fetch_feature(settings: Any, feature_id: str) -> dict[str, Any]:
+    headers = _api_headers(settings)
     r = httpx.get(
         f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}",
         timeout=30,
-        headers=headers or None,
+        headers=headers,
     )
     r.raise_for_status()
     return r.json()
@@ -487,6 +297,343 @@ def _update_feature_message(client: Any, feature: dict[str, Any], *, channel_id:
         text=f"Feature request: *{feature['title']}*",
         blocks=blocks,
     )
+
+
+def _default_spec() -> dict[str, Any]:
+    return {
+        "title": "",
+        "problem": "",
+        "business_justification": "",
+        "proposed_solution": "",
+        "acceptance_criteria": [],
+        "non_goals": [],
+        "repo": "",
+        "implementation_mode": "new_feature",
+        "source_repos": [],
+        "risk_flags": [],
+        "links": [],
+    }
+
+
+def _build_create_queue(*, has_title: bool) -> list[str]:
+    queue = list(CREATE_FLOW_FIELDS)
+    if has_title:
+        queue.remove("title")
+    return queue
+
+
+def _build_update_queue(feature: dict[str, Any]) -> list[str]:
+    spec = feature.get("spec") or {}
+    validation = spec.get("_validation") or {}
+    missing = [str(x).strip() for x in (validation.get("missing") or []) if str(x).strip()]
+
+    ordered_missing: list[str] = []
+    for field in ["title", "problem", "business_justification", "acceptance_criteria", "implementation_mode", "source_repos"]:
+        if field in missing:
+            ordered_missing.append(field)
+
+    if ordered_missing:
+        return ordered_missing
+    return list(UPDATE_FALLBACK_FIELDS)
+
+
+def _next_field(session: IntakeSession) -> str:
+    while session.queue:
+        current = session.queue[0]
+        if current == "source_repos":
+            mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
+            if mode != "reuse_existing":
+                session.queue.pop(0)
+                continue
+        return current
+    return ""
+
+
+def _ask_next_question(client: Any, session: IntakeSession) -> None:
+    field = _next_field(session)
+    if not field:
+        return
+    prompt = QUESTION_BY_FIELD.get(field, f"Please provide `{field}`.")
+    if session.mode == "update":
+        prompt = f"Update request: {prompt}"
+    client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=prompt)
+
+
+def _capture_field_answer(session: IntakeSession, *, field: str, event: dict[str, Any]) -> tuple[bool, str]:
+    text = str(event.get("text") or "").strip()
+    file_links = _extract_file_links(event)
+
+    if field in {"title", "problem", "business_justification"}:
+        if not text or _is_skip(text):
+            return False, "That field is required before build. Please provide a short answer."
+        session.answers[field] = text
+        session.asked_fields.add(field)
+        return True, "Captured."
+
+    if field == "links":
+        links = _dedupe(_extract_urls(text) + file_links)
+        if links:
+            existing = [str(x).strip() for x in (session.answers.get("links") or []) if str(x).strip()]
+            session.answers["links"] = _dedupe(existing + links)
+            session.asked_fields.add("links")
+            return True, f"Saved {len(links)} link(s)/attachment(s)."
+        return True, "No links added."
+
+    if field == "repo":
+        if not text or _is_skip(text):
+            session.answers["repo"] = ""
+            return True, "Repo left unspecified."
+        session.answers["repo"] = text.splitlines()[0].strip()
+        session.asked_fields.add("repo")
+        return True, "Captured repo/project."
+
+    if field == "implementation_mode":
+        mode = _normalize_mode(text)
+        if not mode:
+            return False, "Please reply with `scratch` or `reuse`."
+        session.answers["implementation_mode"] = mode
+        session.asked_fields.add("implementation_mode")
+        return True, f"Using mode: `{mode}`."
+
+    if field == "source_repos":
+        mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
+        if mode != "reuse_existing":
+            return True, "Reuse references not needed for scratch mode."
+
+        repos = _parse_lines(text)
+        if (not repos and _is_skip(text)) or (not repos and not text):
+            repo_hint = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
+            if repo_hint:
+                repos = [repo_hint]
+        if not repos:
+            return False, "Reuse mode needs at least one reference repo. Please provide one per line."
+        session.answers["source_repos"] = repos
+        session.asked_fields.add("source_repos")
+        return True, f"Saved {len(repos)} source repo reference(s)."
+
+    if field == "proposed_solution":
+        if not text or _is_skip(text):
+            return True, "No preferred implementation approach captured."
+        session.answers["proposed_solution"] = text
+        session.asked_fields.add("proposed_solution")
+        return True, "Captured implementation notes."
+
+    if field == "acceptance_criteria":
+        criteria = _parse_lines(text)
+        if not criteria:
+            return False, "Please provide at least one acceptance criterion."
+        session.answers["acceptance_criteria"] = criteria
+        session.asked_fields.add("acceptance_criteria")
+        return True, f"Captured {len(criteria)} acceptance criteria item(s)."
+
+    return False, f"Unsupported intake field `{field}`."
+
+
+def _create_spec_from_session(session: IntakeSession) -> dict[str, Any]:
+    spec = _default_spec()
+    spec.update(session.answers)
+
+    mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
+    spec["implementation_mode"] = mode
+    spec["source_repos"] = [str(x).strip() for x in (spec.get("source_repos") or []) if str(x).strip()]
+    spec["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
+
+    if mode == "reuse_existing" and not spec["source_repos"] and spec.get("repo"):
+        spec["source_repos"] = [str(spec["repo"]).strip()]
+
+    return spec
+
+
+def _update_patch_from_session(session: IntakeSession) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for field in sorted(session.asked_fields):
+        if field in session.answers:
+            patch[field] = session.answers[field]
+    return patch
+
+
+def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id: str, seed_title: str) -> None:
+    msg = client.chat_postMessage(
+        channel=channel_id,
+        text=f"Feature request intake started by <@{user_id}>. Reply in this thread.",
+    )
+    thread_ts = msg["ts"]
+
+    answers: dict[str, Any] = {}
+    if seed_title:
+        answers["title"] = seed_title[:200]
+
+    session = IntakeSession(
+        mode="create",
+        feature_id="",
+        user_id=user_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        message_ts=thread_ts,
+        queue=_build_create_queue(has_title=bool(seed_title)),
+        answers=answers,
+    )
+    if seed_title:
+        session.asked_fields.add("title")
+
+    _store_session(session)
+
+    if seed_title:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=f"Captured request title: *{seed_title[:200]}*",
+        )
+
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        text=(
+            "I will ask one question at a time in this thread.\n"
+            "If I stop responding after your reply, update Slack app scopes/events per `docs/SETUP_SLACK.md` and reinstall."
+        ),
+    )
+
+    _ask_next_question(client, session)
+
+
+def _start_update_intake(client: Any, settings: Any, *, feature: dict[str, Any], channel_id: str, thread_ts: str, user_id: str, message_ts: str) -> None:
+    spec = feature.get("spec") or {}
+    queue = _build_update_queue(feature)
+    answers: dict[str, Any] = {}
+    if "links" in queue:
+        answers["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
+
+    session = IntakeSession(
+        mode="update",
+        feature_id=str(feature.get("id") or ""),
+        user_id=user_id,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        message_ts=message_ts,
+        queue=queue,
+        answers=answers,
+        base_spec=spec,
+    )
+    _store_session(session)
+
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        text=(
+            f"Updating request `{feature['id']}` in chat. "
+            "Reply here and I will update one field at a time. Send `cancel` to stop."
+        ),
+    )
+    _ask_next_question(client, session)
+
+
+def _finalize_create_session(client: Any, settings: Any, session: IntakeSession) -> None:
+    spec = _create_spec_from_session(session)
+    title = str(spec.get("title") or "").strip() or "(untitled feature)"
+
+    payload = {
+        "spec": spec,
+        "requester_user_id": session.user_id,
+        "slack_channel_id": session.channel_id,
+        "slack_thread_ts": session.thread_ts,
+        "slack_message_ts": session.message_ts,
+    }
+
+    try:
+        headers = _api_headers(settings)
+        r = httpx.post(
+            f"{settings.orchestrator_internal_url}/api/feature-requests",
+            json=payload,
+            timeout=30,
+            headers=headers,
+        )
+        r.raise_for_status()
+        feature = r.json()
+    except Exception as e:  # noqa: BLE001
+        client.chat_postMessage(
+            channel=session.channel_id,
+            thread_ts=session.thread_ts,
+            text=f"Failed to create request: `{e}`",
+        )
+        return
+    finally:
+        _drop_session(session)
+
+    blocks = _feature_message_blocks(feature, settings.base_url)
+    client.chat_update(
+        channel=session.channel_id,
+        ts=session.message_ts,
+        text=f"Feature request: *{title}*",
+        blocks=blocks,
+    )
+
+    client.chat_postMessage(
+        channel=session.channel_id,
+        thread_ts=session.thread_ts,
+        text=(
+            f"Created request `{feature['id']}` with status `{feature['status']}`.\n"
+            f"Mode: {_format_mode(str(spec.get('implementation_mode', 'new_feature')))}"
+        ),
+    )
+    if feature.get("status") == "NEEDS_INFO":
+        _post_clarification_prompt(client, session.channel_id, session.thread_ts, feature)
+
+
+def _finalize_update_session(client: Any, settings: Any, session: IntakeSession) -> None:
+    patch = _update_patch_from_session(session)
+    if not patch:
+        client.chat_postMessage(
+            channel=session.channel_id,
+            thread_ts=session.thread_ts,
+            text="No updates captured. Request was not changed.",
+        )
+        _drop_session(session)
+        return
+
+    payload = {
+        "spec": patch,
+        "actor_type": "slack",
+        "actor_id": session.user_id,
+        "message": "Spec updated from Slack chat intake",
+    }
+
+    try:
+        headers = _api_headers(settings)
+        r = httpx.patch(
+            f"{settings.orchestrator_internal_url}/api/feature-requests/{session.feature_id}/spec",
+            json=payload,
+            timeout=30,
+            headers=headers,
+        )
+        r.raise_for_status()
+        feature = r.json()
+    except Exception as e:  # noqa: BLE001
+        client.chat_postMessage(
+            channel=session.channel_id,
+            thread_ts=session.thread_ts,
+            text=f"Could not save details for `{session.feature_id}`: `{e}`",
+        )
+        return
+    finally:
+        _drop_session(session)
+
+    if session.message_ts:
+        _update_feature_message(client, feature, channel_id=session.channel_id, message_ts=session.message_ts)
+
+    client.chat_postMessage(
+        channel=session.channel_id,
+        thread_ts=session.thread_ts,
+        text=f"Updated request `{feature['id']}`. Status is now `{feature['status']}`.",
+    )
+    if feature.get("status") == "NEEDS_INFO":
+        _post_clarification_prompt(client, session.channel_id, session.thread_ts, feature)
+    elif feature.get("status") == "READY_FOR_BUILD":
+        client.chat_postMessage(
+            channel=session.channel_id,
+            thread_ts=session.thread_ts,
+            text="Spec looks complete. Click *Run build* when ready.",
+        )
 
 
 def main() -> None:
@@ -525,62 +672,79 @@ def main() -> None:
             client.chat_postEphemeral(channel=channel_id, user=user_id, text="You are not allowlisted.")
             return
 
-        view = _build_feature_modal(text, channel_id)
-        client.views_open(trigger_id=body["trigger_id"], view=view)
+        _ensure_bot_in_channel(client, channel_id, logger)
+        _start_create_intake(client, settings, channel_id=channel_id, user_id=user_id, seed_title=text)
 
-    @app.view("ff_feature_submit")
-    def handle_feature_submit(ack, body, view, client, logger):
-        user_id = body["user"]["id"]
-        meta = json.loads(view.get("private_metadata") or "{}")
-        channel_id = meta.get("channel_id")
-
-        values = view["state"]["values"]
-        spec = _extract_spec_from_form(values)
-        title = spec.get("title", "").strip() or "(untitled feature)"
-
-        ack()
-
-        msg = client.chat_postMessage(channel=channel_id, text=f"Feature request: *{title}* (creating...)")
-        thread_ts = msg["ts"]
-
-        payload = {
-            "spec": spec,
-            "requester_user_id": user_id,
-            "slack_channel_id": channel_id,
-            "slack_thread_ts": thread_ts,
-            "slack_message_ts": thread_ts,
-        }
-
-        try:
-            headers = {}
-            token = (settings.api_auth_token or "").strip()
-            if token:
-                headers["X-FF-Token"] = token
-            r = httpx.post(
-                f"{settings.orchestrator_internal_url}/api/feature-requests",
-                json=payload,
-                timeout=30,
-                headers=headers or None,
-            )
-            r.raise_for_status()
-            feature = r.json()
-        except Exception as e:
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Failed to create request: `{e}`")
+    @app.event("message")
+    def handle_message_events(event, client, logger):
+        subtype = event.get("subtype")
+        if subtype in {"bot_message", "message_changed", "message_deleted", "channel_join", "channel_leave"}:
+            return
+        if event.get("bot_id"):
             return
 
-        blocks = _feature_message_blocks(feature, settings.base_url)
-        client.chat_update(channel=channel_id, ts=thread_ts, text=f"Feature request: *{title}*", blocks=blocks)
+        user_id = str(event.get("user") or "").strip()
+        channel_id = str(event.get("channel") or "").strip()
+        thread_ts = str(event.get("thread_ts") or "").strip()
+        text = str(event.get("text") or "").strip()
 
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=(
-                f"Created request `{feature['id']}` with status `{feature['status']}`.\n"
-                f"Mode: {_format_mode(str(spec.get('implementation_mode', 'new_feature')))}"
-            ),
+        if not user_id or not channel_id or not thread_ts:
+            return
+
+        session = _get_session(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        if not session:
+            logger.debug(
+                "slack_message_event_no_session channel=%s thread=%s user=%s subtype=%s",
+                channel_id,
+                thread_ts,
+                user_id,
+                subtype,
+            )
+            return
+
+        logger.info(
+            "slack_message_event_matched_session channel=%s thread=%s user=%s field=%s subtype=%s",
+            channel_id,
+            thread_ts,
+            user_id,
+            _next_field(session),
+            subtype or "",
         )
-        if feature.get("status") == "NEEDS_INFO":
-            _post_clarification_prompt(client, channel_id, thread_ts, feature)
+
+        if text.lower() in {"cancel", "stop", "quit"}:
+            _drop_session(session)
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="Intake cancelled. Use `/feature` to start again.",
+            )
+            return
+
+        field = _next_field(session)
+        if not field:
+            _drop_session(session)
+            return
+
+        ok, note = _capture_field_answer(session, field=field, event=event)
+        if not ok:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
+            _ask_next_question(client, session)
+            return
+
+        session.queue.pop(0)
+        _store_session(session)
+
+        if note:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
+
+        if _next_field(session):
+            _ask_next_question(client, session)
+            return
+
+        if session.mode == "create":
+            _finalize_create_session(client, settings, session)
+            return
+        _finalize_update_session(client, settings, session)
 
     @app.action("ff_add_details")
     def handle_add_details(ack, body, client, logger):
@@ -588,13 +752,13 @@ def main() -> None:
         action = body["actions"][0]
         feature_id = action["value"]
         channel_id = body.get("channel", {}).get("id")
+        user_id = body["user"]["id"]
         message_ts = body.get("message", {}).get("ts")
         thread_ts = body.get("message", {}).get("thread_ts") or message_ts
 
         try:
             feature = _fetch_feature(settings, feature_id)
-        except Exception as e:
-            user_id = body["user"]["id"]
+        except Exception as e:  # noqa: BLE001
             client.chat_postEphemeral(
                 channel=channel_id,
                 user=user_id,
@@ -602,74 +766,15 @@ def main() -> None:
             )
             return
 
-        view = _build_update_modal(
-            feature,
+        _start_update_intake(
+            client,
+            settings,
+            feature=feature,
             channel_id=channel_id,
-            message_ts=message_ts,
             thread_ts=thread_ts,
+            user_id=user_id,
+            message_ts=message_ts,
         )
-        client.views_open(trigger_id=body["trigger_id"], view=view)
-
-    @app.view("ff_feature_update")
-    def handle_feature_update(ack, body, view, client, logger):
-        user_id = body["user"]["id"]
-        meta = json.loads(view.get("private_metadata") or "{}")
-        feature_id = meta.get("feature_id", "")
-        channel_id = meta.get("channel_id", "")
-        message_ts = meta.get("message_ts", "")
-        thread_ts = meta.get("thread_ts", "") or message_ts
-
-        values = view["state"]["values"]
-        spec_patch = _extract_spec_from_form(values)
-
-        ack()
-
-        payload = {
-            "spec": spec_patch,
-            "actor_type": "slack",
-            "actor_id": user_id,
-            "message": "Spec updated from Slack Add details modal",
-        }
-
-        try:
-            headers = {}
-            token = (settings.api_auth_token or "").strip()
-            if token:
-                headers["X-FF-Token"] = token
-            r = httpx.patch(
-                f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}/spec",
-                json=payload,
-                timeout=30,
-                headers=headers or None,
-            )
-            r.raise_for_status()
-            feature = r.json()
-        except Exception as e:
-            if channel_id and thread_ts:
-                client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    text=f"Could not save details for `{feature_id}`: `{e}`",
-                )
-            return
-
-        if channel_id and message_ts:
-            _update_feature_message(client, feature, channel_id=channel_id, message_ts=message_ts)
-
-        if channel_id and thread_ts:
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=f"Updated request `{feature['id']}`. Status is now `{feature['status']}`.",
-            )
-            if feature.get("status") == "NEEDS_INFO":
-                _post_clarification_prompt(client, channel_id, thread_ts, feature)
-            elif feature.get("status") == "READY_FOR_BUILD":
-                client.chat_postMessage(
-                    channel=channel_id,
-                    thread_ts=thread_ts,
-                    text="Spec looks complete. Click *Run build* when ready.",
-                )
 
     @app.action("ff_run_build")
     def handle_run_build(ack, body, client, logger):
@@ -695,19 +800,16 @@ def main() -> None:
             return
 
         try:
-            headers = {}
-            token = (settings.api_auth_token or "").strip()
-            if token:
-                headers["X-FF-Token"] = token
+            headers = _api_headers(settings)
             r = httpx.post(
                 f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}/build",
                 json={"actor_type": "slack", "actor_id": user_id, "message": "Build requested from Slack"},
                 timeout=30,
-                headers=headers or None,
+                headers=headers,
             )
             r.raise_for_status()
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="Build enqueued")
-        except Exception as e:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="Build enqueued.")
+        except Exception as e:  # noqa: BLE001
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Failed to enqueue build: `{e}`")
 
     @app.action("ff_approve")
@@ -729,15 +831,12 @@ def main() -> None:
             return
 
         try:
-            headers = {}
-            token = (settings.api_auth_token or "").strip()
-            if token:
-                headers["X-FF-Token"] = token
+            headers = _api_headers(settings)
             r = httpx.post(
                 f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}/approve",
                 params={"approver": user_id},
                 timeout=30,
-                headers=headers or None,
+                headers=headers,
             )
             r.raise_for_status()
             feature = r.json()
@@ -749,7 +848,7 @@ def main() -> None:
 
             if channel_id and message_ts:
                 _update_feature_message(client, feature, channel_id=channel_id, message_ts=message_ts)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Failed to approve: `{e}`")
 
     console.print("[green]Starting Slack Socket Mode handler...[/green]")

@@ -19,7 +19,8 @@ param(
   [string]$GithubPrUrl = "",
   [string]$PreviewUrl = "",
   [string]$Message = "",
-  [string]$ActorId = "local-integration"
+  [string]$ActorId = "local-integration",
+  [string]$EventId = ""
 )
 
 Set-StrictMode -Version Latest
@@ -32,10 +33,16 @@ $payload = @{
   preview_url = $PreviewUrl
   message = $Message
   actor_id = $ActorId
+  event_id = ""
   metadata = @{
     source = "powershell-script"
   }
 }
+
+if (-not $EventId) {
+  $EventId = [Guid]::NewGuid().ToString()
+}
+$payload.event_id = $EventId
 
 $json = $payload | ConvertTo-Json -Depth 8 -Compress
 $timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
@@ -49,6 +56,7 @@ $signature = "sha256=$hex"
 $headers = @{
   "X-Feature-Factory-Timestamp" = $timestamp
   "X-Feature-Factory-Signature" = $signature
+  "X-Feature-Factory-Event-Id" = $EventId
 }
 
 $response = Invoke-RestMethod `

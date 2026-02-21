@@ -11,12 +11,47 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ApiToken = ""
+$AuthMode = ""
+$MockMode = $true
+$AuthHeaderEmail = "X-Forwarded-Email"
+$AuthHeaderGroups = "X-Forwarded-Groups"
+$AuthEmail = "smoke-test@example.local"
+$AuthGroups = "engineering,admins"
 
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
   if ($tokenLine) {
     $ApiToken = (($tokenLine.Line -split '=', 2)[1]).Trim()
   }
+  $authModeLine = Select-String -Path ".env" -Pattern '^AUTH_MODE=' -ErrorAction SilentlyContinue
+  if ($authModeLine) {
+    $AuthMode = (($authModeLine.Line -split '=', 2)[1]).Trim().ToLowerInvariant()
+  }
+  $mockModeLine = Select-String -Path ".env" -Pattern '^MOCK_MODE=' -ErrorAction SilentlyContinue
+  if ($mockModeLine) {
+    $mockValue = (($mockModeLine.Line -split '=', 2)[1]).Trim().ToLowerInvariant()
+    $MockMode = ($mockValue -eq "true" -or $mockValue -eq "1" -or $mockValue -eq "yes")
+  }
+  $emailHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_EMAIL=' -ErrorAction SilentlyContinue
+  if ($emailHeaderLine) {
+    $AuthHeaderEmail = (($emailHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+  $groupHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_GROUPS=' -ErrorAction SilentlyContinue
+  if ($groupHeaderLine) {
+    $AuthHeaderGroups = (($groupHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+}
+
+function New-AuthHeaders {
+  $headers = @{}
+  if ($ApiToken) {
+    $headers["X-FF-Token"] = $ApiToken
+  }
+  if ($AuthMode -eq "edge_sso") {
+    $headers[$AuthHeaderEmail] = $AuthEmail
+    $headers[$AuthHeaderGroups] = $AuthGroups
+  }
+  return $headers
 }
 
 function Assert-True {
@@ -39,15 +74,17 @@ function Invoke-Json {
   )
 
   if ($null -eq $Body) {
-    if ($ApiToken) {
-      return Invoke-RestMethod -Method $Method -Uri $Url -Headers @{ "X-FF-Token" = $ApiToken } -TimeoutSec 30
+    $headers = New-AuthHeaders
+    if ($headers.Count -gt 0) {
+      return Invoke-RestMethod -Method $Method -Uri $Url -Headers $headers -TimeoutSec 30
     }
     return Invoke-RestMethod -Method $Method -Uri $Url -TimeoutSec 30
   }
 
   $json = $Body | ConvertTo-Json -Depth 8
-  if ($ApiToken) {
-    return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -Headers @{ "X-FF-Token" = $ApiToken } -TimeoutSec 30
+  $headers = New-AuthHeaders
+  if ($headers.Count -gt 0) {
+    return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -Headers $headers -TimeoutSec 30
   }
   return Invoke-RestMethod -Method $Method -Uri $Url -Body $json -ContentType "application/json" -TimeoutSec 30
 }
@@ -99,27 +136,49 @@ Assert-True ($validFeature.status -eq "READY_FOR_BUILD") "Revalidation should ke
 Write-Host "Starting build..." -ForegroundColor Cyan
 $null = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($validFeature.id)/build"
 
-Write-Host "Polling for PREVIEW_READY..." -ForegroundColor Cyan
+if ($MockMode) {
+  Write-Host "Polling for PREVIEW_READY..." -ForegroundColor Cyan
+}
+else {
+  Write-Host "Polling for PR_OPENED (or PREVIEW_READY if callback arrives)..." -ForegroundColor Cyan
+}
 $deadline = (Get-Date).AddSeconds($PollSeconds)
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Seconds 2
   $validFeature = Invoke-Json -Method GET -Url "$BaseUrl/api/feature-requests/$($validFeature.id)"
-  if ($validFeature.status -eq "PREVIEW_READY") {
-    break
+  if ($MockMode) {
+    if ($validFeature.status -eq "PREVIEW_READY") {
+      break
+    }
+  }
+  else {
+    if ($validFeature.status -eq "PR_OPENED" -or $validFeature.status -eq "PREVIEW_READY") {
+      break
+    }
   }
   if ($validFeature.status -eq "FAILED_BUILD") {
     throw "Build failed unexpectedly: $($validFeature.last_error)"
   }
 }
 
-Assert-True ($validFeature.status -eq "PREVIEW_READY") "Feature did not reach PREVIEW_READY in time"
+if ($MockMode) {
+  Assert-True ($validFeature.status -eq "PREVIEW_READY") "Feature did not reach PREVIEW_READY in time"
+}
+else {
+  Assert-True (($validFeature.status -eq "PR_OPENED") -or ($validFeature.status -eq "PREVIEW_READY")) "Feature did not reach PR_OPENED/PREVIEW_READY in time"
+}
 Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_issue_url)) "github_issue_url missing"
-Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_pr_url)) "github_pr_url missing"
-Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.preview_url)) "preview_url missing"
+if ($MockMode) {
+  Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_pr_url)) "github_pr_url missing"
+  Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.preview_url)) "preview_url missing"
 
-Write-Host "Approving feature..." -ForegroundColor Cyan
-$approved = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($validFeature.id)/approve?approver=$Approver"
-Assert-True ($approved.status -eq "PRODUCT_APPROVED") "Approve should move to PRODUCT_APPROVED"
+  Write-Host "Approving feature..." -ForegroundColor Cyan
+  $approved = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($validFeature.id)/approve?approver=$Approver"
+  Assert-True ($approved.status -eq "PRODUCT_APPROVED") "Approve should move to PRODUCT_APPROVED"
+}
+else {
+  Write-Host "Skipping approval assertion in non-mock mode (requires preview_ready callback)." -ForegroundColor Yellow
+}
 
 Write-Host "Creating draft feature for clarification flow..." -ForegroundColor Cyan
 $draftReq = @{
@@ -179,19 +238,36 @@ Assert-True ($reuseFeature.status -eq "READY_FOR_BUILD") "Reuse request should b
 Write-Host "Starting reuse build..." -ForegroundColor Cyan
 $null = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($reuseFeature.id)/build"
 
-Write-Host "Polling reuse feature for PREVIEW_READY..." -ForegroundColor Cyan
+if ($MockMode) {
+  Write-Host "Polling reuse feature for PREVIEW_READY..." -ForegroundColor Cyan
+}
+else {
+  Write-Host "Polling reuse feature for PR_OPENED/PREVIEW_READY..." -ForegroundColor Cyan
+}
 $reuseDeadline = (Get-Date).AddSeconds($PollSeconds)
 while ((Get-Date) -lt $reuseDeadline) {
   Start-Sleep -Seconds 2
   $reuseFeature = Invoke-Json -Method GET -Url "$BaseUrl/api/feature-requests/$($reuseFeature.id)"
-  if ($reuseFeature.status -eq "PREVIEW_READY") {
-    break
+  if ($MockMode) {
+    if ($reuseFeature.status -eq "PREVIEW_READY") {
+      break
+    }
+  }
+  else {
+    if ($reuseFeature.status -eq "PR_OPENED" -or $reuseFeature.status -eq "PREVIEW_READY") {
+      break
+    }
   }
   if ($reuseFeature.status -eq "FAILED_BUILD") {
     throw "Reuse build failed unexpectedly: $($reuseFeature.last_error)"
   }
 }
-Assert-True ($reuseFeature.status -eq "PREVIEW_READY") "Reuse feature did not reach PREVIEW_READY in time"
+if ($MockMode) {
+  Assert-True ($reuseFeature.status -eq "PREVIEW_READY") "Reuse feature did not reach PREVIEW_READY in time"
+}
+else {
+  Assert-True (($reuseFeature.status -eq "PR_OPENED") -or ($reuseFeature.status -eq "PREVIEW_READY")) "Reuse feature did not reach PR_OPENED/PREVIEW_READY in time"
+}
 $workspaceEvent = ($reuseFeature.events | Where-Object { $_.event_type -eq "workspace_prepared" } | Select-Object -Last 1)
 Assert-True ($null -ne $workspaceEvent) "workspace_prepared event should exist"
 $preparedRefs = @($workspaceEvent.data.prepared_references)

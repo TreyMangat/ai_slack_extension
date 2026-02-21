@@ -9,17 +9,18 @@ from rich.console import Console
 from app.config import get_settings
 from app.db import db_session
 from app.models import FeatureRequest
+from app.observability import metrics
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
+from app.services.url_safety import normalize_external_url
 from app.services.workspace_service import (
     WorkspacePreparationResult,
-    cleanup_old_workspaces,
     prepare_workspace,
 )
-from app.state_machine import perform_action, validate_transition
+from app.state_machine import BUILDING, perform_action, validate_transition
 
 
 console = Console()
@@ -75,6 +76,15 @@ def _issue_body_from_feature(feature: FeatureRequest, workspace_plan: dict[str, 
     risk = ", ".join(spec.get("risk_flags") or []) or "(none)"
     source_repo_bullets = "\n".join([f"- {x}" for x in source_repos]) if source_repos else "- (none)"
     final_workspace_plan = workspace_plan or _workspace_plan(spec, feature.id)
+    optimized_prompt = str(spec.get("optimized_prompt", "")).strip()
+    optimized_prompt_section = ""
+    if optimized_prompt:
+        optimized_prompt_section = (
+            "\n## Optimized Build Prompt\n"
+            "```text\n"
+            f"{optimized_prompt}\n"
+            "```\n"
+        )
 
     return dedent(
         f"""
@@ -108,6 +118,7 @@ def _issue_body_from_feature(feature: FeatureRequest, workspace_plan: dict[str, 
         ```json
         {json.dumps(final_workspace_plan, indent=2)}
         ```
+        {optimized_prompt_section}
 
         ---
         ### Raw spec JSON
@@ -132,37 +143,19 @@ async def kickoff_build(feature_id: str) -> None:
             console.print(f"[red]Feature {feature_id} not found[/red]")
             return
 
-        # Transition to BUILDING
-        action_result = perform_action(feature.status, "start_build")
-        validate_transition(feature.status, action_result.new_status)
-        feature.status = action_result.new_status
+        metrics.inc("build_jobs_started_total", 1)
+
+        # API/UI should already transition to BUILDING before enqueue.
+        # Keep this fallback for compatibility with older queued jobs.
+        if feature.status != BUILDING:
+            action_result = perform_action(feature.status, "start_build")
+            validate_transition(feature.status, action_result.new_status)
+            feature.status = action_result.new_status
 
         log_event(db, feature, event_type="build_started", message="Build started")
 
         spec = feature.spec or {}
 
-        def _retention_resolver(fid: str) -> int:
-            row = db.get(FeatureRequest, fid)
-            if not row:
-                return max(settings.workspace_retention_hours_without_pr, 1)
-
-            status = str(row.status or "").strip().upper()
-            has_pr = bool(str(row.github_pr_url or "").strip())
-            if has_pr:
-                return max(settings.workspace_retention_hours_with_pr, 1)
-            if status in {"FAILED_SPEC", "FAILED_BUILD", "FAILED_PREVIEW", "NEEDS_INFO", "NEEDS_HUMAN"}:
-                return max(settings.workspace_retention_hours_failed, 1)
-            return max(settings.workspace_retention_hours_without_pr, 1)
-
-        cleanup_result = cleanup_old_workspaces(retention_resolver=_retention_resolver)
-        if cleanup_result.removed_paths or cleanup_result.errors:
-            log_event(
-                db,
-                feature,
-                event_type="workspace_cleanup",
-                message="Workspace retention cleanup run",
-                data=cleanup_result.to_event_data(),
-            )
         workspace_result = prepare_workspace(feature.id, spec)
         log_event(
             db,
@@ -193,7 +186,16 @@ async def kickoff_build(feature_id: str) -> None:
             action_result = perform_action(feature.status, "fail_build")
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
+            feature.active_build_job_id = ""
             log_event(db, feature, event_type="build_failed", message=message)
+            log_event(
+                db,
+                feature,
+                event_type="dead_letter_external_call",
+                message="Workspace preparation failed before external execution",
+                data={"stage": "workspace_prepare", "error": message},
+            )
+            metrics.inc("build_jobs_failed_total", 1)
             if feature.slack_channel_id and feature.slack_thread_ts:
                 slack.post_thread_message(
                     channel=feature.slack_channel_id,
@@ -212,40 +214,47 @@ async def kickoff_build(feature_id: str) -> None:
                 ),
             )
 
+        stage = "github_issue_create"
         try:
             issue = await github.create_issue(
                 title=feature.title,
                 body=_issue_body_from_feature(feature, workspace_plan=workspace_plan),
                 labels=["feature-factory"],
             )
-            feature.github_issue_url = issue.html_url
+            safe_issue_url = normalize_external_url(issue.html_url)
+            if safe_issue_url:
+                feature.github_issue_url = safe_issue_url
             log_event(
                 db,
                 feature,
                 event_type="github_issue_created",
                 message=f"Created GitHub issue #{issue.number}",
-                data={"issue_url": issue.html_url, "issue_number": issue.number},
+                data={"issue_url": safe_issue_url, "issue_number": issue.number},
             )
 
+            stage = "coderunner_kickoff"
             result = await coderunner.kickoff(
                 github=github,
                 issue_number=issue.number,
                 trigger_comment=settings.opencode_trigger_comment,
                 build_context=workspace_plan,
+                spec=spec,
+                feature_id=feature.id,
             )
 
             action_result = perform_action(feature.status, "opened_pr")
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
 
-            if result.github_pr_url:
-                feature.github_pr_url = result.github_pr_url
+            safe_pr_url = normalize_external_url(result.github_pr_url or "")
+            if safe_pr_url:
+                feature.github_pr_url = safe_pr_url
             log_event(
                 db,
                 feature,
                 event_type="pr_opened",
                 message="PR opened (or trigger sent)",
-                data={"pr_url": result.github_pr_url},
+                data={"pr_url": safe_pr_url},
             )
 
             if feature.slack_channel_id and feature.slack_thread_ts:
@@ -259,25 +268,27 @@ async def kickoff_build(feature_id: str) -> None:
                     ),
                 )
 
-            if result.preview_url:
-                feature.preview_url = result.preview_url
+            safe_preview_url = normalize_external_url(result.preview_url or "")
+            if safe_preview_url:
+                feature.preview_url = safe_preview_url
                 action_result = perform_action(feature.status, "preview_ready")
                 validate_transition(feature.status, action_result.new_status)
                 feature.status = action_result.new_status
+                feature.active_build_job_id = ""
 
                 log_event(
                     db,
                     feature,
                     event_type="preview_ready",
                     message="Preview ready",
-                    data={"preview_url": result.preview_url},
+                    data={"preview_url": safe_preview_url},
                 )
 
                 if feature.slack_channel_id and feature.slack_thread_ts:
                     slack.post_thread_message(
                         channel=feature.slack_channel_id,
                         thread_ts=feature.slack_thread_ts,
-                        text=f"Preview ready: {result.preview_url}",
+                        text=f"Preview ready: {safe_preview_url}",
                     )
 
                 if notify_reviewer_for_approval(feature, slack):
@@ -287,6 +298,10 @@ async def kickoff_build(feature_id: str) -> None:
                         event_type="reviewer_notified",
                         message="Reviewer/admin notified for approval",
                     )
+            else:
+                # Preview URL will be set later via signed integration callback.
+                feature.active_build_job_id = ""
+            metrics.inc("build_jobs_succeeded_total", 1)
 
         except Exception as e:
             feature.last_error = str(e)
@@ -296,6 +311,7 @@ async def kickoff_build(feature_id: str) -> None:
                 feature.status = action_result.new_status
             except Exception:
                 pass
+            feature.active_build_job_id = ""
 
             log_event(
                 db,
@@ -303,6 +319,14 @@ async def kickoff_build(feature_id: str) -> None:
                 event_type="build_failed",
                 message=f"Build failed: {e}",
             )
+            log_event(
+                db,
+                feature,
+                event_type="dead_letter_external_call",
+                message="External integration call exhausted retries",
+                data={"stage": stage, "error": str(e)},
+            )
+            metrics.inc("build_jobs_failed_total", 1)
 
             if feature.slack_channel_id and feature.slack_thread_ts:
                 slack.post_thread_message(

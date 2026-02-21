@@ -2,9 +2,9 @@
 
 This scaffold uses **Slack Bolt (Python)** with **Socket Mode**.
 The `/feature` flow is designed for non-technical users:
-- guided intake form (what/why/mode)
+- guided thread-based chat intake (no popup modal)
 - automatic clarification prompts if required fields are missing
-- **Add details** action to update and revalidate the same request
+- **Add details in chat** action to update and revalidate the same request
 
 ## Steps
 
@@ -19,10 +19,20 @@ The `/feature` flow is designed for non-technical users:
    - `chat:write`
    - `commands`
    - `channels:read`
+   - `channels:history`
    - `channels:join` (recommended)
    - `groups:read`
+   - `groups:history`
    - `im:read`
+   - `im:history`
    - `mpim:read`
+   - `mpim:history`
+
+7. Event subscriptions (bot events):
+   - `message.channels`
+   - `message.groups`
+   - `message.im`
+   - `message.mpim`
 
 6. Create a Slash Command:
    - `/feature`
@@ -47,11 +57,26 @@ Restart docker compose with the Slack profile:
 docker compose --profile slack up --build
 ```
 
+After changing scopes/event subscriptions, reinstall or re-authorize the app in your workspace.
+
+Validation helper:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check_slack_setup.ps1
+```
+
 Try it:
 
 ```text
 /feature Add a button to export invoices
 ```
 
+The bot will ask one question at a time in the thread, for example:
+- What do you want to build?
+- What problem are users facing?
+- Why is this needed now?
+- Attach request if applicable (links/files)
+- Do you know what project/repo this belongs to?
+
 If the request lands in `NEEDS_INFO`, the bot posts clarifying questions in thread.
-Use **Add details** on the request message to provide missing information.
+Use **Add details in chat** on the request message to provide missing information.

@@ -31,6 +31,9 @@ $json = $body | ConvertTo-Json -Depth 6
 
 Write-Host "Creating request..." -ForegroundColor Cyan
 $headers = @{}
+$authMode = ""
+$authHeaderEmail = "X-Forwarded-Email"
+$authHeaderGroups = "X-Forwarded-Groups"
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
   if ($tokenLine) {
@@ -39,6 +42,22 @@ if (Test-Path ".env") {
       $headers["X-FF-Token"] = $token
     }
   }
+  $authModeLine = Select-String -Path ".env" -Pattern '^AUTH_MODE=' -ErrorAction SilentlyContinue
+  if ($authModeLine) {
+    $authMode = (($authModeLine.Line -split '=', 2)[1]).Trim().ToLowerInvariant()
+  }
+  $emailHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_EMAIL=' -ErrorAction SilentlyContinue
+  if ($emailHeaderLine) {
+    $authHeaderEmail = (($emailHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+  $groupsHeaderLine = Select-String -Path ".env" -Pattern '^AUTH_HEADER_GROUPS=' -ErrorAction SilentlyContinue
+  if ($groupsHeaderLine) {
+    $authHeaderGroups = (($groupsHeaderLine.Line -split '=', 2)[1]).Trim()
+  }
+}
+if ($authMode -eq "edge_sso") {
+  $headers[$authHeaderEmail] = "local-user@example.local"
+  $headers[$authHeaderGroups] = "engineering,admins"
 }
 
 if ($headers.Count -gt 0) {
