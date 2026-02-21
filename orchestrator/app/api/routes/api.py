@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +42,7 @@ from app.services.feature_service import (
     transition_feature_to_building,
     update_feature_spec,
 )
+from app.services.invoice_export import SMOKE_INVOICES, export_invoices_csv, filter_invoices
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
@@ -231,6 +234,28 @@ def list_feature_requests(
         limit=limit,
         offset=offset,
         has_more=(offset + len(items)) < total,
+    )
+
+
+@router.get("/invoices/export", response_class=PlainTextResponse)
+def export_invoices(
+    customer: str = Query(default=""),
+    status: str = Query(default=""),
+    issued_from: date | None = Query(default=None),
+    issued_to: date | None = Query(default=None),
+):
+    filtered = filter_invoices(
+        SMOKE_INVOICES,
+        customer=customer,
+        status=status,
+        issued_from=issued_from,
+        issued_to=issued_to,
+    )
+    csv_content = export_invoices_csv(filtered)
+    return PlainTextResponse(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="invoices.csv"'},
     )
 
 
