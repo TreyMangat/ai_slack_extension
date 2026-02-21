@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -126,6 +127,9 @@ class Settings(BaseSettings):
     workspace_retention_hours_with_pr: int = Field(default=168, alias="WORKSPACE_RETENTION_HOURS_WITH_PR")
     workspace_retention_hours_without_pr: int = Field(default=24, alias="WORKSPACE_RETENTION_HOURS_WITHOUT_PR")
     workspace_retention_hours_failed: int = Field(default=12, alias="WORKSPACE_RETENTION_HOURS_FAILED")
+    callback_stale_alert_minutes: int = Field(default=30, alias="CALLBACK_STALE_ALERT_MINUTES")
+    callback_stale_alert_cooldown_minutes: int = Field(default=60, alias="CALLBACK_STALE_ALERT_COOLDOWN_MINUTES")
+    callback_stale_check_max_per_run: int = Field(default=50, alias="CALLBACK_STALE_CHECK_MAX_PER_RUN")
 
     def is_production(self) -> bool:
         return (self.app_env or "").strip().lower() in {"prod", "production"}
@@ -159,6 +163,37 @@ class Settings(BaseSettings):
         if failures:
             joined = "; ".join(failures)
             raise RuntimeError(f"Production security guardrail check failed: {joined}")
+
+    def validate_startup_prerequisites(self) -> None:
+        failures: list[str] = []
+        if self.github_enabled and self.github_auth_mode_normalized() == "app":
+            key_path = (self.github_app_private_key_path or "").strip()
+            inline_key = (self.github_app_private_key or "").strip()
+            if key_path:
+                if not Path(key_path).exists():
+                    failures.append(f"GITHUB_APP_PRIVATE_KEY_PATH not found in runtime container: {key_path}")
+            elif not inline_key:
+                failures.append("GitHub App auth requires GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    def runtime_diagnostics(self) -> dict[str, object]:
+        key_path = (self.github_app_private_key_path or "").strip()
+        key_file_exists = bool(key_path) and Path(key_path).exists()
+        return {
+            "app_env": (self.app_env or "").strip().lower() or "local",
+            "auth_mode": self.auth_mode_normalized() or "disabled",
+            "mock_mode": bool(self.mock_mode),
+            "coderunner_mode": self.coderunner_mode_normalized() or "opencode",
+            "docs_enabled": bool(self.docs_enabled()),
+            "enable_slack_bot": bool(self.enable_slack_bot),
+            "github_enabled": bool(self.github_enabled),
+            "github_auth_mode": self.github_auth_mode_normalized() or "token",
+            "github_app_private_key_configured": bool(key_path or (self.github_app_private_key or "").strip()),
+            "github_app_private_key_file_exists": bool(key_file_exists),
+            "workspace_enable_git_clone": bool(self.workspace_enable_git_clone),
+            "integration_webhook_configured": bool((self.integration_webhook_secret or "").strip()),
+        }
 
     def slack_allowed_channel_set(self) -> set[str]:
         return {c.strip() for c in self.slack_allowed_channels.split(",") if c.strip()}

@@ -7,6 +7,7 @@ This project is now stable for local testing, but these items are required for a
 - Local orchestration flow works in `MOCK_MODE=true`.
 - Queue, worker, and status transitions are verified by smoke tests.
 - Signed execution callback endpoint exists for external CI/OpenCode status updates.
+- Stale callback detector emits `callback_stale_alerted` events when builds remain in `PR_OPENED`.
 - Slack flow supports iterative clarifications (`NEEDS_INFO` -> `READY_FOR_BUILD`) via spec updates.
 - Reuse mode prepares isolated workspace snapshots and logs `workspace_prepared` events.
 - GitHub Actions now enforce a risk-aware preflight policy and head-SHA freshness checks before merge.
@@ -29,6 +30,9 @@ This project is now stable for local testing, but these items are required for a
   - `X-Feature-Factory-Timestamp`
   - `X-Feature-Factory-Signature`
   - `X-Feature-Factory-Event-Id` (required idempotency key)
+- Keep callback staleness thresholds tuned:
+  - `CALLBACK_STALE_ALERT_MINUTES`
+  - `CALLBACK_STALE_ALERT_COOLDOWN_MINUTES`
 - Rotate `INTEGRATION_WEBHOOK_SECRET` via secrets manager.
 - Enforce isolated workspace policy in the runner (clone/copy into sandbox; no direct pushes).
 - Ensure callback payloads include deterministic `event_id` values for replay-safe dedupe.

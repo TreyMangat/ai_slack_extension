@@ -91,3 +91,29 @@ Index(
     IntegrationCallbackReceipt.feature_id,
     IntegrationCallbackReceipt.received_at,
 )
+
+
+class SlackIntakeSession(Base):
+    __tablename__ = "slack_intake_sessions"
+
+    session_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    mode: Mapped[str] = mapped_column(String(16), default="create")
+    feature_id: Mapped[str] = mapped_column(String(36), default="")
+    user_id: Mapped[str] = mapped_column(String(64), default="")
+    channel_id: Mapped[str] = mapped_column(String(64), default="")
+    thread_ts: Mapped[str] = mapped_column(String(64), default="")
+    message_ts: Mapped[str] = mapped_column(String(64), default="")
+    queue: Mapped[list] = mapped_column(JSONB, default=list)
+    answers: Mapped[dict] = mapped_column(JSONB, default=dict)
+    asked_fields: Mapped[list] = mapped_column(JSONB, default=list)
+    base_spec: Mapped[dict] = mapped_column(JSONB, default=dict)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+Index("ix_slack_intake_sessions_updated_at", SlackIntakeSession.updated_at)

@@ -106,12 +106,21 @@ In a second PowerShell terminal:
 powershell -ExecutionPolicy Bypass -File .\scripts\smoke_test.ps1
 ```
 
+The smoke script now reads `/health/runtime` to detect the API's effective `MOCK_MODE`
+so checks stay accurate even when `.env` and running containers drift.
+
 This verifies the core API workflow end-to-end:
 - health check
 - spec validation
 - build enqueue + worker transition
 - preview readiness
 - product approval
+
+If you run local unit tests outside Docker, use Python 3.12:
+
+```powershell
+py -3.12 -m pytest -q
+```
 
 ### 7) (Optional) Run Alembic migration path locally
 

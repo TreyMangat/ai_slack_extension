@@ -17,6 +17,7 @@ $AuthHeaderEmail = "X-Forwarded-Email"
 $AuthHeaderGroups = "X-Forwarded-Groups"
 $AuthEmail = "smoke-test@example.local"
 $AuthGroups = "engineering,admins"
+$RuntimeMockMode = $null
 
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
@@ -93,6 +94,19 @@ Write-Host "Checking API health..." -ForegroundColor Cyan
 $health = Invoke-Json -Method GET -Url "$BaseUrl/health"
 Assert-True ($health.ok -eq $true) "Health endpoint did not return ok=true"
 
+try {
+  $runtime = Invoke-Json -Method GET -Url "$BaseUrl/health/runtime"
+  if ($runtime.ok -eq $true -and $runtime.runtime -and $runtime.runtime.mock_mode -ne $null) {
+    $RuntimeMockMode = [bool]$runtime.runtime.mock_mode
+    Write-Host "Detected runtime mock mode from API: $RuntimeMockMode" -ForegroundColor Cyan
+  }
+}
+catch {
+  Write-Warning "Could not query /health/runtime; falling back to .env MOCK_MODE detection."
+}
+
+$EffectiveMockMode = if ($RuntimeMockMode -ne $null) { $RuntimeMockMode } else { $MockMode }
+
 # If reviewer allowlist is configured locally, prefer the first reviewer user ID.
 if ($Approver -eq "smoke-test" -and (Test-Path ".env")) {
   $reviewerLine = Select-String -Path ".env" -Pattern '^REVIEWER_ALLOWED_USERS=' -ErrorAction SilentlyContinue
@@ -136,7 +150,7 @@ Assert-True ($validFeature.status -eq "READY_FOR_BUILD") "Revalidation should ke
 Write-Host "Starting build..." -ForegroundColor Cyan
 $null = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($validFeature.id)/build"
 
-if ($MockMode) {
+if ($EffectiveMockMode) {
   Write-Host "Polling for PREVIEW_READY..." -ForegroundColor Cyan
 }
 else {
@@ -146,7 +160,7 @@ $deadline = (Get-Date).AddSeconds($PollSeconds)
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Seconds 2
   $validFeature = Invoke-Json -Method GET -Url "$BaseUrl/api/feature-requests/$($validFeature.id)"
-  if ($MockMode) {
+  if ($EffectiveMockMode) {
     if ($validFeature.status -eq "PREVIEW_READY") {
       break
     }
@@ -161,14 +175,14 @@ while ((Get-Date) -lt $deadline) {
   }
 }
 
-if ($MockMode) {
+if ($EffectiveMockMode) {
   Assert-True ($validFeature.status -eq "PREVIEW_READY") "Feature did not reach PREVIEW_READY in time"
 }
 else {
   Assert-True (($validFeature.status -eq "PR_OPENED") -or ($validFeature.status -eq "PREVIEW_READY")) "Feature did not reach PR_OPENED/PREVIEW_READY in time"
 }
 Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_issue_url)) "github_issue_url missing"
-if ($MockMode) {
+if ($EffectiveMockMode) {
   Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_pr_url)) "github_pr_url missing"
   Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.preview_url)) "preview_url missing"
 
@@ -238,7 +252,7 @@ Assert-True ($reuseFeature.status -eq "READY_FOR_BUILD") "Reuse request should b
 Write-Host "Starting reuse build..." -ForegroundColor Cyan
 $null = Invoke-Json -Method POST -Url "$BaseUrl/api/feature-requests/$($reuseFeature.id)/build"
 
-if ($MockMode) {
+if ($EffectiveMockMode) {
   Write-Host "Polling reuse feature for PREVIEW_READY..." -ForegroundColor Cyan
 }
 else {
@@ -248,7 +262,7 @@ $reuseDeadline = (Get-Date).AddSeconds($PollSeconds)
 while ((Get-Date) -lt $reuseDeadline) {
   Start-Sleep -Seconds 2
   $reuseFeature = Invoke-Json -Method GET -Url "$BaseUrl/api/feature-requests/$($reuseFeature.id)"
-  if ($MockMode) {
+  if ($EffectiveMockMode) {
     if ($reuseFeature.status -eq "PREVIEW_READY") {
       break
     }
@@ -262,7 +276,7 @@ while ((Get-Date) -lt $reuseDeadline) {
     throw "Reuse build failed unexpectedly: $($reuseFeature.last_error)"
   }
 }
-if ($MockMode) {
+if ($EffectiveMockMode) {
   Assert-True ($reuseFeature.status -eq "PREVIEW_READY") "Reuse feature did not reach PREVIEW_READY in time"
 }
 else {

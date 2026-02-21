@@ -124,6 +124,18 @@ def _transition_feature(feature: FeatureRequest, action: str) -> None:
     feature.status = result.new_status
 
 
+def _assert_receipt_payload_match(*, existing: IntegrationCallbackReceipt, payload_hash: str) -> None:
+    if existing.payload_hash == payload_hash:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": "Idempotency key already used with different payload",
+            "idempotency_key": existing.idempotency_key,
+        },
+    )
+
+
 def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbackIn) -> None:
     event = payload.event
 
@@ -405,6 +417,7 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
     payload_hash = hashlib.sha256(raw_body).hexdigest()
     existing_receipt = db.get(IntegrationCallbackReceipt, idempotency_key)
     if existing_receipt:
+        _assert_receipt_payload_match(existing=existing_receipt, payload_hash=payload_hash)
         feature = db.get(FeatureRequest, existing_receipt.feature_id)
         if not feature:
             raise HTTPException(status_code=409, detail="Idempotency key already used for missing feature")
@@ -426,6 +439,9 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
         db.flush()
     except IntegrityError:
         db.rollback()
+        existing_receipt = db.get(IntegrationCallbackReceipt, idempotency_key)
+        if existing_receipt:
+            _assert_receipt_payload_match(existing=existing_receipt, payload_hash=payload_hash)
         feature = db.get(FeatureRequest, payload.feature_id)
         if not feature:
             raise HTTPException(status_code=409, detail="Duplicate callback with missing feature")

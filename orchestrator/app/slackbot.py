@@ -3,12 +3,16 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from rich.console import Console
+from sqlalchemy import delete
 
 from app.config import get_settings
+from app.db import db_session
+from app.models import SlackIntakeSession
 from app.services.reviewer_service import is_approver_allowed
 
 
@@ -137,23 +141,100 @@ def _cleanup_expired_sessions() -> None:
     expired = [k for k, s in ACTIVE_INTAKES.items() if now - s.started_at > SESSION_TTL_SECONDS]
     for key in expired:
         ACTIVE_INTAKES.pop(key, None)
+    try:
+        with db_session() as db:
+            db.execute(delete(SlackIntakeSession).where(SlackIntakeSession.expires_at <= datetime.now(timezone.utc)))
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]slack intake DB cleanup failed: {e}[/yellow]")
+
+
+def _session_from_record(record: SlackIntakeSession) -> IntakeSession:
+    queue = [str(x) for x in (record.queue or []) if str(x).strip()]
+    answers = dict(record.answers or {})
+    asked_fields = {str(x) for x in (record.asked_fields or []) if str(x).strip()}
+    base_spec = dict(record.base_spec or {})
+    started_at = (
+        float(record.started_at.timestamp())
+        if isinstance(record.started_at, datetime)
+        else time.time()
+    )
+    return IntakeSession(
+        mode=str(record.mode or "create"),
+        feature_id=str(record.feature_id or ""),
+        user_id=str(record.user_id or ""),
+        channel_id=str(record.channel_id or ""),
+        thread_ts=str(record.thread_ts or ""),
+        message_ts=str(record.message_ts or ""),
+        queue=queue,
+        answers=answers,
+        asked_fields=asked_fields,
+        base_spec=base_spec,
+        started_at=started_at,
+    )
 
 
 def _store_session(session: IntakeSession) -> None:
     _cleanup_expired_sessions()
     key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
     ACTIVE_INTAKES[key] = session
+    try:
+        with db_session() as db:
+            row = db.get(SlackIntakeSession, key)
+            if not row:
+                row = SlackIntakeSession(session_key=key)
+                db.add(row)
+            now = datetime.now(timezone.utc)
+            row.mode = session.mode
+            row.feature_id = session.feature_id
+            row.user_id = session.user_id
+            row.channel_id = session.channel_id
+            row.thread_ts = session.thread_ts
+            row.message_ts = session.message_ts
+            row.queue = list(session.queue)
+            row.answers = dict(session.answers)
+            row.asked_fields = sorted(session.asked_fields)
+            row.base_spec = dict(session.base_spec)
+            row.started_at = datetime.fromtimestamp(session.started_at, tz=timezone.utc)
+            row.updated_at = now
+            row.expires_at = now + timedelta(seconds=SESSION_TTL_SECONDS)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]slack intake DB persistence failed: {e}[/yellow]")
 
 
 def _get_session(*, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
     _cleanup_expired_sessions()
     key = _session_key(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
-    return ACTIVE_INTAKES.get(key)
+    cached = ACTIVE_INTAKES.get(key)
+    if cached:
+        return cached
+    try:
+        with db_session() as db:
+            record = db.get(SlackIntakeSession, key)
+            if not record:
+                return None
+            now = datetime.now(timezone.utc)
+            expires_at = record.expires_at
+            if isinstance(expires_at, datetime) and expires_at <= now:
+                db.delete(record)
+                return None
+            session = _session_from_record(record)
+            ACTIVE_INTAKES[key] = session
+            return session
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]slack intake DB read failed: {e}[/yellow]")
+        return None
 
 
 def _drop_session(session: IntakeSession) -> None:
     key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
     ACTIVE_INTAKES.pop(key, None)
+    try:
+        with db_session() as db:
+            row = db.get(SlackIntakeSession, key)
+            if row:
+                db.delete(row)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]slack intake DB delete failed: {e}[/yellow]")
 
 
 def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict[str, Any]]:

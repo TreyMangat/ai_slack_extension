@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
@@ -12,6 +15,7 @@ from app.observability import configure_json_logging, install_request_observabil
 def create_app() -> FastAPI:
     settings = get_settings()
     configure_json_logging()
+    logger = logging.getLogger("feature_factory.startup")
 
     app = FastAPI(
         title="Feature Factory",
@@ -25,6 +29,8 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _startup() -> None:
         settings.validate_runtime_guardrails()
+        settings.validate_startup_prerequisites()
+        logger.info("runtime_diagnostics %s", json.dumps(settings.runtime_diagnostics(), sort_keys=True))
         init_db()
 
     # Routes

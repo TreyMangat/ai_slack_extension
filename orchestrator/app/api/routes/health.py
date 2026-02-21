@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db import get_db
 from app.observability import metrics
 from app.queue import get_redis
@@ -42,3 +43,9 @@ def readiness(db: Session = Depends(get_db)):
 @router.get("/health/metrics")
 def health_metrics():
     return {"ok": True, "metrics": metrics.snapshot()}
+
+
+@router.get("/health/runtime")
+def health_runtime():
+    settings = get_settings()
+    return {"ok": True, "runtime": settings.runtime_diagnostics()}
