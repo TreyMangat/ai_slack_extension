@@ -337,14 +337,15 @@ def start_build(
     try:
         transition_feature_to_building(feature)
     except BuildAlreadyInProgressError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Build already in progress",
-                "feature_id": feature.id,
-                "job_id": e.job_id,
-            },
-        )
+        existing_job_id = e.job_id or (feature.active_build_job_id or "").strip()
+        return {
+            "ok": True,
+            "enqueued": False,
+            "feature_id": feature.id,
+            "job_id": existing_job_id,
+            "idempotent": True,
+            "message": "Build already in progress",
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
