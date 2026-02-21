@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -189,6 +191,62 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
     raise ValueError(f"Unsupported callback event: {event}")
 
 
+def _feature_query_conditions(*, user: AuthenticatedUser, status: str, mine: bool) -> tuple[list, bool]:
+    conditions = []
+    status_filter = status.strip()
+    if status_filter:
+        conditions.append(FeatureRequest.status == status_filter)
+
+    can_view_all = user_can_view_all_features(user)
+    if mine or not can_view_all:
+        identities = sorted(user.identity_candidates())
+        if not identities:
+            return [], False
+        conditions.append(FeatureRequest.requester_user_id.in_(identities))
+
+    return conditions, True
+
+
+def _render_feature_export_csv(rows: list[FeatureRequest]) -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["feature_id", "title", "status", "requester_user_id", "created_at"])
+    for feature in rows:
+        writer.writerow(
+            [
+                feature.id,
+                feature.title,
+                feature.status,
+                feature.requester_user_id,
+                feature.created_at.isoformat() if feature.created_at else "",
+            ]
+        )
+    return out.getvalue()
+
+
+@router.get("/feature-requests/export.csv")
+def export_feature_requests_csv(
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+    status: str = Query(default=""),
+    mine: bool = Query(default=True),
+):
+    conditions, allowed = _feature_query_conditions(user=user, status=status, mine=mine)
+    rows: list[FeatureRequest] = []
+    if allowed:
+        stmt = select(FeatureRequest)
+        if conditions:
+            stmt = stmt.where(*conditions)
+        rows = db.execute(stmt.order_by(FeatureRequest.created_at.desc())).scalars().all()
+
+    csv_payload = _render_feature_export_csv(rows)
+    return Response(
+        content=csv_payload,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="feature-requests.csv"'},
+    )
+
+
 @router.get("/feature-requests", response_model=FeatureRequestListOut)
 def list_feature_requests(
     db: Session = Depends(get_db),
@@ -199,17 +257,9 @@ def list_feature_requests(
     mine: bool = Query(default=True),
     include_events: bool = Query(default=False),
 ):
-    conditions = []
-    status_filter = status.strip()
-    if status_filter:
-        conditions.append(FeatureRequest.status == status_filter)
-
-    can_view_all = user_can_view_all_features(user)
-    if mine or not can_view_all:
-        identities = sorted(user.identity_candidates())
-        if not identities:
-            return FeatureRequestListOut(items=[], total=0, limit=limit, offset=offset, has_more=False)
-        conditions.append(FeatureRequest.requester_user_id.in_(identities))
+    conditions, allowed = _feature_query_conditions(user=user, status=status, mine=mine)
+    if not allowed:
+        return FeatureRequestListOut(items=[], total=0, limit=limit, offset=offset, has_more=False)
 
     total_stmt = select(func.count()).select_from(FeatureRequest)
     if conditions:
