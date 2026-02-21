@@ -31,6 +31,9 @@ class GitHubAdapter:
     async def create_pull_request(self, *, title: str, body: str, head: str, base: str) -> str:
         raise NotImplementedError
 
+    async def update_pull_request_body(self, *, pr_number: int, body: str) -> None:
+        raise NotImplementedError
+
 
 class MockGitHubAdapter(GitHubAdapter):
     async def create_issue(self, *, title: str, body: str, labels: list[str] | None = None) -> GitHubIssue:
@@ -50,6 +53,9 @@ class MockGitHubAdapter(GitHubAdapter):
             f"{title} (head={head}, base={base})"
         )
         return fake_url
+
+    async def update_pull_request_body(self, *, pr_number: int, body: str) -> None:
+        console.print(f"[bold cyan][MOCK GitHub][/bold cyan] update_pull_request_body #{pr_number}")
 
 
 class RealGitHubAdapter(GitHubAdapter):
@@ -78,13 +84,19 @@ class RealGitHubAdapter(GitHubAdapter):
             return code == 429 or code >= 500
         return False
 
-    async def _post_with_retry(self, *, url: str, payload: dict[str, Any]) -> httpx.Response:
+    async def _request_with_retry(
+        self,
+        *,
+        method: str,
+        url: str,
+        payload: dict[str, Any],
+    ) -> httpx.Response:
         delay = self.initial_backoff_seconds
         last_exc: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    response = await client.post(url, headers=self._headers(), json=payload)
+                    response = await client.request(method, url, headers=self._headers(), json=payload)
                 if response.status_code == 429 or response.status_code >= 500:
                     raise httpx.HTTPStatusError(
                         f"Retryable GitHub status {response.status_code}",
@@ -109,7 +121,7 @@ class RealGitHubAdapter(GitHubAdapter):
         if labels:
             payload["labels"] = labels
 
-        r = await self._post_with_retry(url=url, payload=payload)
+        r = await self._request_with_retry(method="POST", url=url, payload=payload)
         data = r.json()
         return GitHubIssue(number=int(data["number"]), html_url=str(data["html_url"]))
 
@@ -117,7 +129,7 @@ class RealGitHubAdapter(GitHubAdapter):
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}/issues/{issue_number}/comments"
         payload = {"body": body}
 
-        await self._post_with_retry(url=url, payload=payload)
+        await self._request_with_retry(method="POST", url=url, payload=payload)
 
     async def create_pull_request(self, *, title: str, body: str, head: str, base: str) -> str:
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}/pulls"
@@ -127,9 +139,14 @@ class RealGitHubAdapter(GitHubAdapter):
             "head": head,
             "base": base,
         }
-        r = await self._post_with_retry(url=url, payload=payload)
+        r = await self._request_with_retry(method="POST", url=url, payload=payload)
         data = r.json()
         return str(data.get("html_url", "")).strip()
+
+    async def update_pull_request_body(self, *, pr_number: int, body: str) -> None:
+        url = f"{self.api_base}/repos/{self.owner}/{self.repo}/pulls/{pr_number}"
+        payload = {"body": body}
+        await self._request_with_retry(method="PATCH", url=url, payload=payload)
 
 
 def get_github_adapter() -> GitHubAdapter:

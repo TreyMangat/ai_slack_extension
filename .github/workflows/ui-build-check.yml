@@ -1,0 +1,53 @@
+name: UI Build Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "web/**"
+      - "ui/**"
+      - "package.json"
+      - "package-lock.json"
+      - "npm-shrinkwrap.json"
+
+jobs:
+  ui-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build frontend targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for dir in web ui .; do
+            if [[ "$dir" == "." ]]; then
+              pkg="package.json"
+              label="repo-root"
+            else
+              pkg="$dir/package.json"
+              label="$dir"
+            fi
+            if [[ -f "$pkg" ]]; then
+              found=1
+              echo "Running frontend build checks in $label"
+              pushd "${dir}" >/dev/null
+              if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then
+                npm ci
+              else
+                npm install
+              fi
+              npm run build --if-present
+              popd >/dev/null
+            fi
+          done
+          if [[ "$found" -eq 0 ]]; then
+            echo "No package.json found in web/ui/root; skipping."
+          fi

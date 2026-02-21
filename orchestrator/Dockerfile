@@ -7,7 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # System deps (kept minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git nodejs npm ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN npm install -g n && n 22.12.0
+RUN npm install -g openclaw@latest
 RUN pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt /app/requirements.txt

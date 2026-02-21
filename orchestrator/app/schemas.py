@@ -28,6 +28,9 @@ class FeatureSpec(BaseModel):
 
     # Optional extras
     links: list[str] = Field(default_factory=list)
+    debug_build: bool = False
+    ui_feature: bool = False
+    ui_keywords: list[str] = Field(default_factory=list)
 
 
 class FeatureRequestCreate(BaseModel):
@@ -52,6 +55,9 @@ class FeatureSpecPatch(BaseModel):
     source_repos: list[str] | None = None
     risk_flags: list[str] | None = None
     links: list[str] | None = None
+    debug_build: bool | None = None
+    ui_feature: bool | None = None
+    ui_keywords: list[str] | None = None
 
 
 class FeatureSpecUpdateRequest(BaseModel):
@@ -127,7 +133,7 @@ class BuildRequest(BaseModel):
 class ExecutionCallbackIn(BaseModel):
     """Signed callback payload from external execution systems."""
 
-    feature_id: str
+    feature_id: str = ""
     event: Literal["pr_opened", "preview_ready", "build_failed", "preview_failed"]
     github_pr_url: str = ""
     preview_url: str = ""

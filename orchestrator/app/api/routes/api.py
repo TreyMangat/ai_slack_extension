@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -40,15 +41,21 @@ from app.services.feature_service import (
     transition_feature_to_building,
     update_feature_spec,
 )
+from app.services.github_adapter import get_github_adapter
+from app.services.pr_description import build_standard_pr_body
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
+from app.services.prompt_optimizer import detect_ui_feature
 from app.services.url_safety import normalize_external_url
 from app.state_machine import (
     FAILED_BUILD,
+    FAILED_SPEC,
     FAILED_PREVIEW,
     PREVIEW_READY,
     PR_OPENED,
     BUILDING,
+    NEEDS_INFO,
+    READY_FOR_BUILD,
     perform_action,
     validate_transition,
 )
@@ -56,6 +63,7 @@ from app.tasks.jobs import kickoff_build_job
 
 router = APIRouter()
 integration_router = APIRouter()
+PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
 
 
 def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> FeatureRequestOut:
@@ -136,6 +144,35 @@ def _assert_receipt_payload_match(*, existing: IntegrationCallbackReceipt, paylo
     )
 
 
+def _build_idempotent_payload(feature: FeatureRequest, *, job_id: str = "") -> dict[str, object]:
+    resolved_job_id = (job_id or feature.active_build_job_id or "").strip()
+    return {
+        "ok": True,
+        "enqueued": False,
+        "already_in_progress": True,
+        "feature_id": feature.id,
+        "job_id": resolved_job_id,
+        "status": feature.status,
+    }
+
+
+def _build_invalid_detail(feature: FeatureRequest) -> dict[str, object]:
+    spec = feature.spec or {}
+    validation = spec.get("_validation") or {}
+    missing = [str(x).strip() for x in (validation.get("missing") or []) if str(x).strip()]
+    detail: dict[str, object] = {
+        "message": f"Feature is not ready to build from status {feature.status}",
+        "feature_id": feature.id,
+        "status": feature.status,
+    }
+    if missing:
+        detail["missing"] = missing
+        detail["next_action"] = "Provide missing fields and retry build."
+    if feature.status in {NEEDS_INFO, FAILED_SPEC} and not missing:
+        detail["next_action"] = "Update spec details and revalidate before build."
+    return detail
+
+
 def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbackIn) -> None:
     event = payload.event
 
@@ -187,6 +224,119 @@ def _apply_execution_callback(feature: FeatureRequest, payload: ExecutionCallbac
         return
 
     raise ValueError(f"Unsupported callback event: {event}")
+
+
+def _callback_status_text(feature: FeatureRequest, payload: ExecutionCallbackIn) -> str:
+    if payload.event == "pr_opened":
+        return (
+            f"Status update for *{feature.title}*: `PR_OPENED`\n"
+            f"PR: {feature.github_pr_url or payload.github_pr_url or '(pending)'}"
+        )
+    if payload.event == "preview_ready":
+        return (
+            f"Status update for *{feature.title}*: `PREVIEW_READY`\n"
+            f"PR: {feature.github_pr_url or payload.github_pr_url or '(pending)'}\n"
+            f"Preview: {feature.preview_url or payload.preview_url or '(pending)'}"
+        )
+    if payload.event == "build_failed":
+        return (
+            f"Status update for *{feature.title}*: `FAILED_BUILD`\n"
+            f"Error: {payload.message or feature.last_error or 'External build failed.'}"
+        )
+    if payload.event == "preview_failed":
+        return (
+            f"Status update for *{feature.title}*: `FAILED_PREVIEW`\n"
+            f"Error: {payload.message or feature.last_error or 'External preview failed.'}"
+        )
+    return f"Status update for *{feature.title}*: `{feature.status}`"
+
+
+def _extract_pr_number(pr_url: str) -> int:
+    match = PR_NUMBER_RE.search((pr_url or "").strip())
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return 0
+
+
+def _extract_issue_number(issue_url: str) -> int:
+    text = (issue_url or "").strip().rstrip("/")
+    if not text:
+        return 0
+    tail = text.rsplit("/", 1)[-1]
+    if not tail.isdigit():
+        return 0
+    return int(tail)
+
+
+async def _sync_standard_pr_body(feature: FeatureRequest) -> None:
+    pr_url = (feature.github_pr_url or "").strip()
+    if not pr_url:
+        return
+
+    pr_number = _extract_pr_number(pr_url)
+    if pr_number <= 0:
+        return
+
+    settings = get_settings()
+    runner_metadata: dict[str, object] = {}
+    for event in sorted(feature.events, key=lambda x: x.created_at, reverse=True):
+        if event.event_type != "coderunner_completed":
+            continue
+        event_data = event.data or {}
+        maybe_meta = event_data.get("runner_metadata")
+        if isinstance(maybe_meta, dict):
+            runner_metadata = maybe_meta
+            break
+
+    summary = str(runner_metadata.get("assistant_summary") or "").strip()
+    if not summary:
+        summary = f"Automated implementation for {feature.title}."
+        if feature.preview_url:
+            summary = f"Automated implementation for {feature.title} with preview deployment."
+
+    verification_output = str(runner_metadata.get("verification_output") or "").strip()
+    if not verification_output:
+        verification_output = feature.last_error or ""
+
+    verification_command = str(runner_metadata.get("verification_command") or "").strip()
+    if not verification_command:
+        verification_command = (settings.llm_test_command or "").strip()
+
+    verification_warning = str(runner_metadata.get("verification_warning") or "").strip()
+    branch_name = str(runner_metadata.get("branch_name") or "").strip() or "(managed by external runner)"
+    runner_name = (
+        str(runner_metadata.get("execution_mode") or "").strip()
+        or str(runner_metadata.get("runner") or "").strip()
+        or "opencode-delegated"
+    )
+    runner_model = str(runner_metadata.get("model") or "").strip() or (settings.opencode_model or "").strip()
+
+    spec = dict(feature.spec or {})
+    ui_feature, _ui_keywords = detect_ui_feature(spec)
+    if bool(spec.get("ui_feature")) or ui_feature:
+        spec["ui_feature"] = True
+
+    body = build_standard_pr_body(
+        spec=spec,
+        feature_id=feature.id,
+        issue_number=_extract_issue_number(feature.github_issue_url),
+        branch_name=branch_name,
+        runner_name=runner_name,
+        runner_model=runner_model,
+        summary=summary,
+        verification_output=verification_output,
+        verification_command=verification_command,
+        verification_warning=verification_warning,
+        preview_url=feature.preview_url or "",
+        cloudflare_project_name=settings.cloudflare_pages_project_name,
+        cloudflare_production_branch=settings.cloudflare_pages_production_branch,
+        repo_path=None,
+    )
+    github = get_github_adapter()
+    await github.update_pull_request_body(pr_number=pr_number, body=body)
 
 
 @router.get("/feature-requests", response_model=FeatureRequestListOut)
@@ -334,19 +484,39 @@ def start_build(
     if user.auth_source != "api_token" or not actor_id:
         actor_id = user.actor_id
 
+    if feature.status == BUILDING:
+        payload_data = _build_idempotent_payload(feature)
+        log_event(
+            db,
+            feature,
+            event_type="build_enqueue_reused",
+            actor_type=build_payload.actor_type or "user",
+            actor_id=actor_id,
+            message=build_payload.message or "Build already running; reused existing job",
+            data={"job_id": payload_data.get("job_id", "")},
+        )
+        db.commit()
+        return payload_data
+    if feature.status != READY_FOR_BUILD:
+        raise HTTPException(status_code=400, detail=_build_invalid_detail(feature))
+
     try:
         transition_feature_to_building(feature)
     except BuildAlreadyInProgressError as e:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Build already in progress",
-                "feature_id": feature.id,
-                "job_id": e.job_id,
-            },
+        payload_data = _build_idempotent_payload(feature, job_id=e.job_id)
+        log_event(
+            db,
+            feature,
+            event_type="build_enqueue_reused",
+            actor_type=build_payload.actor_type or "user",
+            actor_id=actor_id,
+            message=build_payload.message or "Build already running; reused existing job",
+            data={"job_id": payload_data.get("job_id", "")},
         )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        db.commit()
+        return payload_data
+    except ValueError:
+        raise HTTPException(status_code=400, detail=_build_invalid_detail(feature))
 
     q = get_queue()
     try:
@@ -367,7 +537,14 @@ def start_build(
     )
     db.commit()
 
-    return {"ok": True, "enqueued": True, "feature_id": feature.id, "job_id": job.id}
+    return {
+        "ok": True,
+        "enqueued": True,
+        "already_in_progress": False,
+        "feature_id": feature.id,
+        "job_id": job.id,
+        "status": feature.status,
+    }
 
 
 @router.post("/feature-requests/{feature_id}/approve", response_model=FeatureRequestOut)
@@ -423,7 +600,40 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=409, detail="Idempotency key already used for missing feature")
         return _feature_to_out(feature)
 
-    feature = db.get(FeatureRequest, payload.feature_id)
+    feature = None
+    if (payload.feature_id or "").strip():
+        feature = db.get(FeatureRequest, payload.feature_id)
+    elif (payload.github_pr_url or "").strip():
+        normalized_pr = normalize_external_url(payload.github_pr_url)
+        if normalized_pr:
+            feature = (
+                db.execute(
+                    select(FeatureRequest)
+                    .where(FeatureRequest.github_pr_url == normalized_pr)
+                    .order_by(FeatureRequest.updated_at.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+    if feature is None and (payload.github_pr_url or "").strip():
+        # Best-effort fallback: match by issue number embedded in metadata.
+        issue_number = 0
+        try:
+            issue_number = int(str((payload.metadata or {}).get("issue_number") or "0") or "0")
+        except ValueError:
+            issue_number = 0
+        if issue_number > 0:
+            feature = (
+                db.execute(
+                    select(FeatureRequest)
+                    .where(FeatureRequest.github_issue_url.like(f"%/issues/{issue_number}"))
+                    .order_by(FeatureRequest.updated_at.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
     if not feature:
         raise HTTPException(status_code=404, detail="Feature not found")
 
@@ -469,8 +679,15 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
         },
     )
 
+    slack = get_slack_adapter()
+    if feature.slack_channel_id and feature.slack_thread_ts:
+        slack.post_thread_message(
+            channel=feature.slack_channel_id,
+            thread_ts=feature.slack_thread_ts,
+            text=_callback_status_text(feature, payload),
+        )
+
     if payload.event == "preview_ready":
-        slack = get_slack_adapter()
         if notify_reviewer_for_approval(feature, slack):
             log_event(
                 db,
@@ -479,6 +696,19 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
                 actor_type="system",
                 actor_id="integration",
                 message="Reviewer/admin notified for approval",
+            )
+
+    if payload.event in {"pr_opened", "preview_ready"} and feature.github_pr_url:
+        try:
+            await _sync_standard_pr_body(feature)
+        except Exception as e:  # noqa: BLE001
+            log_event(
+                db,
+                feature,
+                event_type="pr_body_sync_failed",
+                actor_type="system",
+                actor_id="integration",
+                message=f"Failed to sync standardized PR body: {e}",
             )
 
     db.commit()

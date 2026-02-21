@@ -60,7 +60,16 @@ jobs:
             - Make only issue-scoped changes.
             - Keep the patch production-safe and test-backed.
             - Run project tests and/or linters before finishing.
-            - Include concise release notes in the PR body.
+            - If request is UI-related (UI/page/frontend/button/layout/styling/component), ensure reviewers can click a preview from PR checks/deployments.
+            - If UI-related and no frontend scaffold exists, add a minimal Vite + React app under `web/` with scripts: `dev`, `build`, `preview`.
+            - For UI-related work, run `npm ci && npm run build` for the frontend before completion.
+            - PR body must include sections:
+              - What changed (2-4 bullets)
+              - Why / user request summary
+              - Acceptance criteria checklist
+              - How to test locally (exact commands)
+              - UI: preview instructions (where to click in PR checks) and screenshot/GIF note
+              - Non-UI: request/response or log output snippet
             - Do not merge to main.
 
             Trigger metadata:

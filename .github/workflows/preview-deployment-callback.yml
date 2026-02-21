@@ -1,0 +1,154 @@
+name: Preview Deployment Callback
+
+on:
+  deployment_status:
+
+permissions:
+  contents: read
+  deployments: read
+  pull-requests: read
+
+jobs:
+  notify-feature-factory:
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      secrets.FEATURE_FACTORY_CALLBACK_URL != '' &&
+      secrets.FEATURE_FACTORY_WEBHOOK_SECRET != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send preview_ready callback
+        env:
+          CALLBACK_URL: ${{ secrets.FEATURE_FACTORY_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.FEATURE_FACTORY_WEBHOOK_SECRET }}
+          EVENT_PATH: ${{ github.event_path }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+
+          event_path = os.environ.get("EVENT_PATH", "")
+          callback_url = os.environ.get("CALLBACK_URL", "").strip()
+          callback_secret = os.environ.get("CALLBACK_SECRET", "").strip()
+          repository = os.environ.get("REPOSITORY", "").strip()
+          github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+
+          if not event_path or not os.path.exists(event_path):
+              print("Missing deployment event payload.")
+              raise SystemExit(0)
+          if not callback_url or not callback_secret:
+              print("Missing callback configuration.")
+              raise SystemExit(0)
+
+          with open(event_path, "r", encoding="utf-8") as fh:
+              event = json.load(fh)
+
+          deployment = event.get("deployment") or {}
+          deployment_status = event.get("deployment_status") or {}
+          state = str(deployment_status.get("state") or "").strip().lower()
+          if state != "success":
+              print(f"Ignoring deployment status '{state}'.")
+              raise SystemExit(0)
+
+          preview_url = str(
+              deployment_status.get("environment_url")
+              or deployment_status.get("target_url")
+              or ""
+          ).strip()
+          if not preview_url:
+              print("No preview URL in deployment status.")
+              raise SystemExit(0)
+
+          sha = str(deployment.get("sha") or "").strip()
+          if not sha:
+              print("Deployment SHA missing.")
+              raise SystemExit(0)
+
+          pulls = []
+          pulls_url = f"https://api.github.com/repos/{repository}/commits/{sha}/pulls"
+          pulls_req = urllib.request.Request(
+              pulls_url,
+              headers={
+                  "Authorization": f"Bearer {github_token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(pulls_req, timeout=20) as resp:
+                  pulls = json.loads(resp.read().decode("utf-8"))
+          except Exception as exc:
+              print(f"Failed to resolve PR from commit SHA: {exc}")
+              raise SystemExit(0)
+
+          if not isinstance(pulls, list) or not pulls:
+              print("No PR associated with deployment commit.")
+              raise SystemExit(0)
+
+          pr = next((p for p in pulls if str(p.get("state") or "").lower() == "open"), pulls[0])
+          pr_url = str(pr.get("html_url") or "").strip()
+          pr_body = str(pr.get("body") or "").strip()
+          pr_number = int(pr.get("number") or 0)
+
+          feature_match = re.search(r"feature request id:\s*([0-9a-fA-F-]{36})", pr_body, re.IGNORECASE)
+          feature_id = feature_match.group(1) if feature_match else ""
+
+          deployment_id = str(deployment.get("id") or "0")
+          deployment_status_id = str(deployment_status.get("id") or "0")
+          event_id = f"deployment-{deployment_id}-{deployment_status_id}-preview_ready"
+
+          payload = {
+              "feature_id": feature_id,
+              "event": "preview_ready",
+              "github_pr_url": pr_url,
+              "preview_url": preview_url,
+              "message": f"Deployment status success for PR #{pr_number}",
+              "actor_id": "github-deployment-status",
+              "event_id": event_id,
+              "metadata": {
+                  "source": "github-deployment-status",
+                  "deployment_id": deployment_id,
+                  "deployment_status_id": deployment_status_id,
+                  "sha": sha,
+                  "pr_number": pr_number,
+                  "state": state,
+                  "environment_url": preview_url,
+              },
+          }
+
+          if callback_url.endswith("/"):
+              callback_url = callback_url[:-1]
+          if not callback_url.endswith("/api/integrations/execution-callback"):
+              callback_url = callback_url + "/api/integrations/execution-callback"
+
+          body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+          timestamp = str(int(time.time()))
+          signed_payload = f"{timestamp}.".encode("utf-8") + body
+          signature = hmac.new(
+              callback_secret.encode("utf-8"),
+              signed_payload,
+              hashlib.sha256,
+          ).hexdigest()
+
+          req = urllib.request.Request(
+              callback_url,
+              data=body,
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Feature-Factory-Timestamp": timestamp,
+                  "X-Feature-Factory-Signature": f"sha256={signature}",
+                  "X-Feature-Factory-Event-Id": event_id,
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              print(f"Callback HTTP {resp.status}")
+              print(resp.read().decode("utf-8", errors="replace"))
+          PY

@@ -25,6 +25,8 @@ $AuthHeaderEmail = "X-Forwarded-Email"
 $AuthHeaderGroups = "X-Forwarded-Groups"
 $AuthEmail = "real-mode-smoke@example.local"
 $AuthGroups = "engineering,admins"
+$RuntimeCoderunnerMode = ""
+$RuntimeOpencodeExecutionMode = ""
 
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
@@ -134,6 +136,24 @@ function Send-SignedCallback {
 Write-Host "Checking health..." -ForegroundColor Cyan
 $health = Invoke-Json -Method GET -Url "$BaseUrl/health"
 Assert-True ($health.ok -eq $true) "health endpoint must return ok=true"
+try {
+  $runtime = Invoke-Json -Method GET -Url "$BaseUrl/health/runtime"
+  if ($runtime.ok -eq $true -and $runtime.runtime) {
+    $RuntimeCoderunnerMode = [string]($runtime.runtime.coderunner_mode)
+    $RuntimeOpencodeExecutionMode = [string]($runtime.runtime.opencode_execution_mode)
+  }
+}
+catch {
+  Write-Warning "Could not query /health/runtime; using provided PollSeconds."
+}
+if (
+  $RuntimeCoderunnerMode -eq "opencode" -and
+  $RuntimeOpencodeExecutionMode -eq "local_openclaw" -and
+  $PollSeconds -lt 180
+) {
+  $PollSeconds = 180
+  Write-Host "Adjusted PollSeconds to $PollSeconds for local_openclaw runtime." -ForegroundColor Cyan
+}
 
 Write-Host "Creating feature request..." -ForegroundColor Cyan
 $createBody = @{

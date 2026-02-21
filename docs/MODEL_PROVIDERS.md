@@ -4,17 +4,37 @@
 
 - Default (`CODERUNNER_MODE=opencode`):
   - `MOCK_MODE=true`: no model call, deterministic mock PR/preview output.
-  - `MOCK_MODE=false`: creates a GitHub issue and posts an OpenCode trigger comment.
-  - model execution happens in your external runner/CI, which later calls:
-    - `POST /api/integrations/execution-callback`
+  - `MOCK_MODE=false` with `OPENCODE_EXECUTION_MODE=local_openclaw`:
+    - worker executes OpenClaw directly inside container
+    - worker commits/pushes branch and opens PR via GitHub App/token auth
+  - `MOCK_MODE=false` with `OPENCODE_EXECUTION_MODE=github_issue_comment`:
+    - worker posts OpenCode trigger issue comment
+    - model execution happens in external runner/CI, which later calls:
+      - `POST /api/integrations/execution-callback`
 - Optional (`CODERUNNER_MODE=native_llm`):
   - worker calls model APIs directly inside the container.
 
 ## OpenClaw / OpenCode provider mode (recommended)
 
-When `CODERUNNER_MODE=opencode`, this orchestrator delegates coding to your external OpenCode runner.
+When `CODERUNNER_MODE=opencode`, choose one execution mode:
 
-To run with OpenCode in GitHub Actions without `OPENAI_API_KEY`:
+1. Local no-key mode (recommended for local POC):
+   - `OPENCODE_EXECUTION_MODE=local_openclaw`
+   - `OPENCLAW_AUTH_DIR=/home/app/.openclaw`
+   - `OPENCLAW_AUTH_SEED_DIR=/run/secrets/openclaw`
+   - sync host auth to `./secrets/openclaw` with `scripts/sync_openclaw_auth.ps1`
+   - startup copies seed auth into writable runtime path inside container
+   - optional deterministic pipeline check: `OPENCODE_DEBUG_BUILD=true` (writes `DEBUG_CODEGEN.md` and opens PR without model call)
+   - UI requests automatically enforce frontend preview readiness:
+     - detect UI keywords in intake/spec
+     - require frontend build verification (`npm ci && npm run build`)
+     - generate PR body instructions for Cloudflare Pages preview checks
+
+2. Delegated CI mode:
+   - `OPENCODE_EXECUTION_MODE=github_issue_comment`
+   - external runner handles model execution and callbacks
+
+To run delegated OpenCode in GitHub Actions without `OPENAI_API_KEY`:
 
 1. Keep orchestrator in delegated mode:
    - `MOCK_MODE=false`

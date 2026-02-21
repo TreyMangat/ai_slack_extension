@@ -18,6 +18,8 @@ $AuthHeaderGroups = "X-Forwarded-Groups"
 $AuthEmail = "smoke-test@example.local"
 $AuthGroups = "engineering,admins"
 $RuntimeMockMode = $null
+$RuntimeCoderunnerMode = ""
+$RuntimeOpencodeExecutionMode = ""
 
 if (Test-Path ".env") {
   $tokenLine = Select-String -Path ".env" -Pattern '^API_AUTH_TOKEN=' -ErrorAction SilentlyContinue
@@ -98,6 +100,8 @@ try {
   $runtime = Invoke-Json -Method GET -Url "$BaseUrl/health/runtime"
   if ($runtime.ok -eq $true -and $runtime.runtime -and $runtime.runtime.mock_mode -ne $null) {
     $RuntimeMockMode = [bool]$runtime.runtime.mock_mode
+    $RuntimeCoderunnerMode = [string]($runtime.runtime.coderunner_mode)
+    $RuntimeOpencodeExecutionMode = [string]($runtime.runtime.opencode_execution_mode)
     Write-Host "Detected runtime mock mode from API: $RuntimeMockMode" -ForegroundColor Cyan
   }
 }
@@ -106,6 +110,15 @@ catch {
 }
 
 $EffectiveMockMode = if ($RuntimeMockMode -ne $null) { $RuntimeMockMode } else { $MockMode }
+if (
+  -not $EffectiveMockMode -and
+  $RuntimeCoderunnerMode -eq "opencode" -and
+  $RuntimeOpencodeExecutionMode -eq "local_openclaw" -and
+  $PollSeconds -lt 300
+) {
+  $PollSeconds = 300
+  Write-Host "Adjusted PollSeconds to $PollSeconds for local_openclaw runtime." -ForegroundColor Cyan
+}
 
 # If reviewer allowlist is configured locally, prefer the first reviewer user ID.
 if ($Approver -eq "smoke-test" -and (Test-Path ".env")) {

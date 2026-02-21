@@ -4,7 +4,8 @@
 #   powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1
 
 param(
-  [string]$ExpectedModel = "openai-codex/gpt-5.3-codex"
+  [string]$ExpectedModel = "openai-codex/gpt-5.3-codex",
+  [switch]$CheckContainer
 )
 
 Set-StrictMode -Version Latest
@@ -60,3 +61,20 @@ if ($probeExit -ne 0) {
 }
 
 Write-Host "OpenClaw local auth check passed." -ForegroundColor Green
+
+if ($CheckContainer) {
+  Write-Host "Checking OpenClaw inside worker container..." -ForegroundColor Cyan
+  $composeArgs = @("-f", "docker-compose.yml", "-f", "docker-compose.dev.yml")
+
+  docker compose @composeArgs exec -T worker openclaw --version
+  if ($LASTEXITCODE -ne 0) {
+    throw "OpenClaw CLI is not available in worker container."
+  }
+
+  docker compose @composeArgs exec -T worker openclaw agent --local --agent main --message "Reply with READY only." --json | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "OpenClaw auth smoke failed in worker container. Run scripts/sync_openclaw_auth.ps1 and restart compose."
+  }
+
+  Write-Host "OpenClaw container auth check passed." -ForegroundColor Green
+}

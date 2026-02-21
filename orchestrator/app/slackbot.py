@@ -20,26 +20,21 @@ console = Console()
 
 QUESTION_BY_FIELD: dict[str, str] = {
     "title": "What do you want to build?",
-    "problem": "What problem are users facing?",
+    "problem": "Describe what you want in one short paragraph (what to build + why).",
     "business_justification": "Why is this needed now?",
-    "links": "Attach request if applicable: paste links or drop files in this thread. Reply `skip` if none.",
+    "links": "Optional: share links/files in this thread, or reply `skip`.",
     "repo": "Do you know what project/repo this belongs to? Reply with `org/repo`, repo URL, or `unsure`.",
     "implementation_mode": "Should implementation start from scratch or reuse existing project patterns? Reply `scratch` or `reuse`.",
     "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
     "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
-    "acceptance_criteria": "How will we know this is done? Share acceptance criteria, one per line.",
+    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to use defaults.",
 }
 
 CREATE_FLOW_FIELDS = [
     "title",
     "problem",
-    "business_justification",
-    "links",
-    "repo",
-    "implementation_mode",
-    "source_repos",
-    "proposed_solution",
     "acceptance_criteria",
+    "links",
 ]
 
 UPDATE_FALLBACK_FIELDS = [
@@ -262,21 +257,27 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
             "text": {"type": "plain_text", "text": "Add details in chat"},
             "value": fid,
         },
-        {
-            "type": "button",
-            "action_id": "ff_run_build",
-            "text": {"type": "plain_text", "text": "Run build"},
-            "style": "primary",
-            "value": fid,
-        },
-        {
-            "type": "button",
-            "action_id": "ff_approve",
-            "text": {"type": "plain_text", "text": "Approve"},
-            "style": "danger",
-            "value": fid,
-        },
     ]
+    if status == "READY_FOR_BUILD":
+        actions.append(
+            {
+                "type": "button",
+                "action_id": "ff_run_build",
+                "text": {"type": "plain_text", "text": "Run build"},
+                "style": "primary",
+                "value": fid,
+            }
+        )
+    if status == "PREVIEW_READY":
+        actions.append(
+            {
+                "type": "button",
+                "action_id": "ff_approve",
+                "text": {"type": "plain_text", "text": "Approve"},
+                "style": "danger",
+                "value": fid,
+            }
+        )
 
     return [
         {
@@ -393,6 +394,7 @@ def _default_spec() -> dict[str, Any]:
         "source_repos": [],
         "risk_flags": [],
         "links": [],
+        "debug_build": False,
     }
 
 
@@ -501,8 +503,11 @@ def _capture_field_answer(session: IntakeSession, *, field: str, event: dict[str
 
     if field == "acceptance_criteria":
         criteria = _parse_lines(text)
+        if (not criteria and _is_skip(text)) or (not criteria and not text):
+            session.answers["acceptance_criteria"] = []
+            return True, "No explicit acceptance criteria provided. I will use defaults."
         if not criteria:
-            return False, "Please provide at least one acceptance criterion."
+            return False, "Please provide acceptance criteria lines or reply `skip`."
         session.answers["acceptance_criteria"] = criteria
         session.asked_fields.add("acceptance_criteria")
         return True, f"Captured {len(criteria)} acceptance criteria item(s)."
@@ -518,6 +523,21 @@ def _create_spec_from_session(session: IntakeSession) -> dict[str, Any]:
     spec["implementation_mode"] = mode
     spec["source_repos"] = [str(x).strip() for x in (spec.get("source_repos") or []) if str(x).strip()]
     spec["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
+    if not str(spec.get("business_justification") or "").strip():
+        problem = str(spec.get("problem") or "").strip()
+        spec["business_justification"] = (
+            f"Requested via Slack intake. Context: {problem[:200]}"
+            if problem
+            else "Requested via Slack intake."
+        )
+    criteria = [str(x).strip() for x in (spec.get("acceptance_criteria") or []) if str(x).strip()]
+    if not criteria:
+        title = str(spec.get("title") or "feature").strip()
+        criteria = [
+            f"`{title}` is implemented and accessible to end users.",
+            "Changes are committed and opened as a PR for review.",
+        ]
+    spec["acceptance_criteria"] = criteria
 
     if mode == "reuse_existing" and not spec["source_repos"] and spec.get("repo"):
         spec["source_repos"] = [str(spec["repo"]).strip()]
@@ -570,7 +590,7 @@ def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id
         channel=channel_id,
         thread_ts=thread_ts,
         text=(
-            "I will ask one question at a time in this thread.\n"
+            "I will ask 2-3 short questions in this thread and then start the build automatically.\n"
             "If I stop responding after your reply, update Slack app scopes/events per `docs/SETUP_SLACK.md` and reinstall."
         ),
     )
@@ -607,6 +627,57 @@ def _start_update_intake(client: Any, settings: Any, *, feature: dict[str, Any],
         ),
     )
     _ask_next_question(client, session)
+
+
+def _enqueue_build_for_feature(
+    settings: Any,
+    *,
+    feature_id: str,
+    actor_id: str,
+    actor_type: str,
+    message: str,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    headers = _api_headers(settings)
+    try:
+        r = httpx.post(
+            f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}/build",
+            json={"actor_type": actor_type, "actor_id": actor_id, "message": message},
+            timeout=30,
+            headers=headers,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"Failed to contact build endpoint: `{e}`", None
+
+    if r.status_code >= 400:
+        detail_text = ""
+        try:
+            payload = r.json()
+            detail = payload.get("detail")
+            if isinstance(detail, dict):
+                missing = [str(x).strip() for x in (detail.get("missing") or []) if str(x).strip()]
+                base_message = str(detail.get("message") or "").strip()
+                if missing:
+                    detail_text = f"{base_message} Missing: {', '.join(missing)}."
+                else:
+                    detail_text = base_message
+            else:
+                detail_text = str(detail or "").strip()
+        except Exception:  # noqa: BLE001
+            detail_text = (r.text or "").strip()
+        if not detail_text:
+            detail_text = f"HTTP {r.status_code}"
+        return False, f"Build was not accepted: {detail_text}", None
+
+    payload = r.json() if r.content else {}
+    if bool(payload.get("already_in_progress")):
+        job_id = str(payload.get("job_id") or "").strip() or "(pending assignment)"
+        status = str(payload.get("status") or "BUILDING")
+        return True, f"Build already running. Job: `{job_id}` | Status: `{status}`", payload
+    if bool(payload.get("enqueued")):
+        job_id = str(payload.get("job_id") or "").strip() or "(pending assignment)"
+        status = str(payload.get("status") or "BUILDING")
+        return True, f"Build started. Job: `{job_id}` | Status: `{status}`", payload
+    return True, "Build request accepted.", payload
 
 
 def _finalize_create_session(client: Any, settings: Any, session: IntakeSession) -> None:
@@ -659,6 +730,33 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
     )
     if feature.get("status") == "NEEDS_INFO":
         _post_clarification_prompt(client, session.channel_id, session.thread_ts, feature)
+        return
+
+    if feature.get("status") == "READY_FOR_BUILD":
+        ok, note, _payload = _enqueue_build_for_feature(
+            settings,
+            feature_id=str(feature.get("id") or ""),
+            actor_id=session.user_id,
+            actor_type="slack",
+            message="Build auto-started from Slack intake",
+        )
+        client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=note)
+        try:
+            refreshed = _fetch_feature(settings, str(feature.get("id") or ""))
+            _update_feature_message(
+                client,
+                refreshed,
+                channel_id=session.channel_id,
+                message_ts=session.message_ts,
+            )
+        except Exception:
+            pass
+        if not ok:
+            client.chat_postMessage(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts,
+                text="Use *Add details in chat* to fix missing fields, then run build again.",
+            )
 
 
 def _finalize_update_session(client: Any, settings: Any, session: IntakeSession) -> None:
@@ -880,18 +978,22 @@ def main() -> None:
             _post_clarification_prompt(client, channel_id, thread_ts, current)
             return
 
-        try:
-            headers = _api_headers(settings)
-            r = httpx.post(
-                f"{settings.orchestrator_internal_url}/api/feature-requests/{feature_id}/build",
-                json={"actor_type": "slack", "actor_id": user_id, "message": "Build requested from Slack"},
-                timeout=30,
-                headers=headers,
-            )
-            r.raise_for_status()
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="Build enqueued.")
-        except Exception as e:  # noqa: BLE001
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Failed to enqueue build: `{e}`")
+        ok, note, _payload = _enqueue_build_for_feature(
+            settings,
+            feature_id=feature_id,
+            actor_id=user_id,
+            actor_type="slack",
+            message="Build requested from Slack",
+        )
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
+        if ok:
+            try:
+                refreshed = _fetch_feature(settings, feature_id)
+                message_ts = body.get("message", {}).get("ts")
+                if message_ts:
+                    _update_feature_message(client, refreshed, channel_id=channel_id, message_ts=message_ts)
+            except Exception:
+                pass
 
     @app.action("ff_approve")
     def handle_approve(ack, body, client, logger):

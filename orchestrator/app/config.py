@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import shutil
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,6 +85,19 @@ class Settings(BaseSettings):
     # - opencode: trigger external OpenCode workflow via issue comment (default)
     # - native_llm: run in-container LLM coding loop (experimental)
     coderunner_mode: str = Field(default="opencode", alias="CODERUNNER_MODE")
+    # opencode execution strategy:
+    # - github_issue_comment: delegated mode; trigger external workflow by issue comment
+    # - local_openclaw: run OpenClaw locally inside worker container, then commit + open PR
+    opencode_execution_mode: str = Field(default="local_openclaw", alias="OPENCODE_EXECUTION_MODE")
+    openclaw_auth_dir: str = Field(default="/home/app/.openclaw", alias="OPENCLAW_AUTH_DIR")
+    openclaw_auth_seed_dir: str = Field(default="/run/secrets/openclaw", alias="OPENCLAW_AUTH_SEED_DIR")
+    opencode_model: str = Field(default="openai-codex/gpt-5.3-codex", alias="OPENCODE_MODEL")
+    opencode_timeout_seconds: int = Field(default=1800, alias="OPENCODE_TIMEOUT_SECONDS")
+    opencode_keep_temp_agents: bool = Field(default=False, alias="OPENCODE_KEEP_TEMP_AGENTS")
+    opencode_debug_build: bool = Field(default=False, alias="OPENCODE_DEBUG_BUILD")
+    preview_provider: str = Field(default="cloudflare_pages", alias="PREVIEW_PROVIDER")
+    cloudflare_pages_project_name: str = Field(default="", alias="CLOUDFLARE_PAGES_PROJECT_NAME")
+    cloudflare_pages_production_branch: str = Field(default="main", alias="CLOUDFLARE_PAGES_PRODUCTION_BRANCH")
 
     # Native LLM runner settings (used when CODERUNNER_MODE=native_llm and MOCK_MODE=false)
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
@@ -174,17 +188,46 @@ class Settings(BaseSettings):
                     failures.append(f"GITHUB_APP_PRIVATE_KEY_PATH not found in runtime container: {key_path}")
             elif not inline_key:
                 failures.append("GitHub App auth requires GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY")
+        if (
+            not self.mock_mode
+            and self.coderunner_mode_normalized() == "opencode"
+            and self.opencode_execution_mode_normalized() == "local_openclaw"
+        ):
+            if shutil.which("openclaw") is None:
+                failures.append(
+                    "OpenClaw executable not found in runtime container PATH while "
+                    "CODERUNNER_MODE=opencode and OPENCODE_EXECUTION_MODE=local_openclaw"
+                )
+            auth_dir = Path((self.openclaw_auth_dir or "").strip() or "/home/app/.openclaw")
+            seed_dir = Path((self.openclaw_auth_seed_dir or "").strip() or "/run/secrets/openclaw")
+            auth_candidates = list(auth_dir.glob("agents/*/agent/auth*.json")) if auth_dir.exists() else []
+            seed_candidates = list(seed_dir.glob("agents/*/agent/auth*.json")) if seed_dir.exists() else []
+            if not auth_candidates and not seed_candidates:
+                failures.append(
+                    "OpenClaw auth files are missing from both runtime and seed locations: "
+                    f"{auth_dir} and {seed_dir}. "
+                    "Run scripts/sync_openclaw_auth.ps1 then restart containers."
+                )
         if failures:
             raise RuntimeError("; ".join(failures))
 
     def runtime_diagnostics(self) -> dict[str, object]:
         key_path = (self.github_app_private_key_path or "").strip()
         key_file_exists = bool(key_path) and Path(key_path).exists()
+        auth_dir = Path((self.openclaw_auth_dir or "").strip() or "/home/app/.openclaw")
+        seed_dir = Path((self.openclaw_auth_seed_dir or "").strip() or "/run/secrets/openclaw")
+        auth_candidates = list(auth_dir.glob("agents/*/agent/auth*.json")) if auth_dir.exists() else []
+        seed_candidates = list(seed_dir.glob("agents/*/agent/auth*.json")) if seed_dir.exists() else []
         return {
             "app_env": (self.app_env or "").strip().lower() or "local",
             "auth_mode": self.auth_mode_normalized() or "disabled",
             "mock_mode": bool(self.mock_mode),
             "coderunner_mode": self.coderunner_mode_normalized() or "opencode",
+            "opencode_execution_mode": self.opencode_execution_mode_normalized() or "local_openclaw",
+            "opencode_debug_build": bool(self.opencode_debug_build),
+            "preview_provider": self.preview_provider_normalized() or "cloudflare_pages",
+            "cloudflare_pages_project_name": (self.cloudflare_pages_project_name or "").strip(),
+            "cloudflare_pages_production_branch": (self.cloudflare_pages_production_branch or "").strip() or "main",
             "docs_enabled": bool(self.docs_enabled()),
             "enable_slack_bot": bool(self.enable_slack_bot),
             "github_enabled": bool(self.github_enabled),
@@ -193,6 +236,13 @@ class Settings(BaseSettings):
             "github_app_private_key_file_exists": bool(key_file_exists),
             "workspace_enable_git_clone": bool(self.workspace_enable_git_clone),
             "integration_webhook_configured": bool((self.integration_webhook_secret or "").strip()),
+            "openclaw_auth_dir": str(auth_dir),
+            "openclaw_auth_dir_exists": bool(auth_dir.exists()),
+            "openclaw_auth_files_detected": len(auth_candidates),
+            "openclaw_auth_seed_dir": str(seed_dir),
+            "openclaw_auth_seed_dir_exists": bool(seed_dir.exists()),
+            "openclaw_auth_seed_files_detected": len(seed_candidates),
+            "openclaw_cli_available": bool(shutil.which("openclaw")),
         }
 
     def slack_allowed_channel_set(self) -> set[str]:
@@ -219,6 +269,12 @@ class Settings(BaseSettings):
 
     def coderunner_mode_normalized(self) -> str:
         return (self.coderunner_mode or "").strip().lower()
+
+    def opencode_execution_mode_normalized(self) -> str:
+        return (self.opencode_execution_mode or "").strip().lower()
+
+    def preview_provider_normalized(self) -> str:
+        return (self.preview_provider or "").strip().lower()
 
     def service_auth_group_set(self) -> set[str]:
         return {g.lower() for g in self._parse_csv(self.service_auth_groups)}

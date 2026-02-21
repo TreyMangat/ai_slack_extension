@@ -10,6 +10,7 @@ from app.api.router import api_router
 from app.config import get_settings
 from app.db import init_db
 from app.observability import configure_json_logging, install_request_observability
+from app.services.openclaw_runtime import stage_openclaw_auth_if_needed
 
 
 def create_app() -> FastAPI:
@@ -28,6 +29,8 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _startup() -> None:
+        staged = stage_openclaw_auth_if_needed(settings)
+        logger.info("openclaw_auth_stage %s", json.dumps(staged, sort_keys=True))
         settings.validate_runtime_guardrails()
         settings.validate_startup_prerequisites()
         logger.info("runtime_diagnostics %s", json.dumps(settings.runtime_diagnostics(), sort_keys=True))

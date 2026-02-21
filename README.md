@@ -16,9 +16,9 @@ It is designed so you can:
 - Keep the orchestrator future-proof (clear adapters + state machine)
 
 The Slack intake is novice-oriented:
-- asks for problem + why now
-- captures whether to build from scratch or reuse existing repo patterns
-- captures source repos for safe reference cloning
+- asks only for title + short description (+ optional acceptance criteria and links)
+- defaults missing fields automatically for local POC speed
+- auto-starts build when the request is valid (no extra confirmation step)
 - posts clarifying questions when details are missing
 - supports iterative updates through an **Add details in chat** action
 - routes preview/PR output to reviewer/admin approval
@@ -251,7 +251,7 @@ Then in Slack, run:
 /feature Add a button to export invoices
 ```
 
-The bot will continue intake in thread (chat-first, no popup modal).
+The bot will continue intake in thread (chat-first, no popup modal), then auto-start build once required fields are captured.
 
 If thread replies are ignored, validate scopes/events:
 
@@ -294,6 +294,18 @@ Verify:
 powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1
 ```
 
+Sync host OpenClaw auth into Docker-mounted secrets:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\sync_openclaw_auth.ps1
+```
+
+Optional container-level verification:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1 -CheckContainer
+```
+
 ### 2) Choose GitHub auth mode
 
 For local testing:
@@ -309,7 +321,12 @@ For production:
 
 ### 2b) Choose code runner mode
 
-- `CODERUNNER_MODE=opencode` (default): triggers external runner and expects signed callbacks.
+- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=local_openclaw` (recommended for local Codex OAuth):
+  - worker clones repo, executes OpenClaw in-container, runs tests, commits, pushes branch, opens PR.
+  - no provider API key needed when OpenClaw OAuth auth is synced to `./secrets/openclaw`.
+  - optional pipeline probe: set `OPENCODE_DEBUG_BUILD=true` to create a deterministic PR that adds `DEBUG_CODEGEN.md` instead of calling a model.
+- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=github_issue_comment`:
+  - posts `/oc` trigger comment and expects external runner callbacks.
 - `CODERUNNER_MODE=native_llm` (experimental): the worker clones target repo, asks LLM for patch, runs tests, pushes branch, opens PR.
 
 For `native_llm`, also set:
@@ -321,9 +338,16 @@ For `native_llm`, also set:
 
 For OpenClaw/OpenCode delegated mode (`CODERUNNER_MODE=opencode`):
 - keep `MOCK_MODE=false`
-- the GitHub workflow default model is `github-copilot/gpt-4.1` (no OpenAI key required)
-- override with repo variable `OPENCODE_MODEL` if needed
-- note: interactive OAuth is local-only; GitHub Actions runners cannot complete OAuth prompts.
+- local OpenClaw path:
+  - `OPENCODE_EXECUTION_MODE=local_openclaw`
+  - `OPENCLAW_AUTH_DIR=/home/app/.openclaw`
+  - `OPENCLAW_AUTH_SEED_DIR=/run/secrets/openclaw`
+  - sync auth with `scripts/sync_openclaw_auth.ps1` (startup copies seed auth to writable runtime path).
+- delegated GitHub Actions path:
+  - `OPENCODE_EXECUTION_MODE=github_issue_comment`
+  - workflow default model is `github-copilot/gpt-4.1` (no OpenAI key required)
+  - override with repo variable `OPENCODE_MODEL` if needed
+  - interactive OAuth is local-only; GitHub Actions runners cannot complete OAuth prompts.
   - for GitHub Actions, use non-interactive auth:
     - preferred no-key path: `COPILOT_GITHUB_TOKEN` (or built-in `GITHUB_TOKEN`)
     - API-key path: provider key such as `OPENAI_API_KEY`
@@ -349,7 +373,9 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 Now, when you run a build, the worker will:
 - Create a GitHub issue
-- Post the `/oc ...` trigger comment
+- Then either:
+  - run OpenClaw locally (`OPENCODE_EXECUTION_MODE=local_openclaw`) and open a PR directly, or
+  - post the `/oc ...` trigger comment (`OPENCODE_EXECUTION_MODE=github_issue_comment`) for external runner flow
 
 OpenCode workflow secrets/variables in the target repo:
 - `COPILOT_GITHUB_TOKEN` (recommended if using `github-copilot/*` models; falls back to Actions `GITHUB_TOKEN`)
@@ -357,6 +383,13 @@ OpenCode workflow secrets/variables in the target repo:
 - `FEATURE_FACTORY_CALLBACK_URL` (optional, full URL or base URL of orchestrator)
 - `FEATURE_FACTORY_WEBHOOK_SECRET` (optional, must match `INTEGRATION_WEBHOOK_SECRET`; set together with callback URL)
 - `OPENCODE_MODEL` repo variable (optional override of default model)
+
+Preview deployment metadata (recommended for UI requests):
+- `PREVIEW_PROVIDER=cloudflare_pages`
+- `CLOUDFLARE_PAGES_PROJECT_NAME=<project>`
+- `CLOUDFLARE_PAGES_PRODUCTION_BRANCH=main`
+
+See `docs/PREVIEW_DEPLOYS.md` for one-time Cloudflare Pages setup and PR preview callback automation.
 
 If your external runner can call back, use:
 - `POST /api/integrations/execution-callback`
@@ -426,6 +459,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
 - Track finalized deployment assumptions in `PRODUCTION_INPUTS.md`
 - Use `docs/code-factory.md` for risk-aware PR gating and review-agent operations
 - Use `docs/MODEL_PROVIDERS.md` for multi-provider runner strategy (OpenAI/Claude/Gemini)
+- Use `docs/OPENCLAW_AUTH.md` for container auth mounting and no-key Codex OAuth flow
+- Use `docs/PREVIEW_DEPLOYS.md` for PR preview deployment setup (Cloudflare Pages recommended)
 - Replace mock adapters with real deployments:
   - preview environments (Vercel/Netlify/K8s)
   - stricter policy gates

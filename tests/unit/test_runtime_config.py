@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import app.config as config_mod
 from app.config import Settings, get_settings
 
 
@@ -39,4 +40,20 @@ def test_runtime_diagnostics_reports_modes(monkeypatch: pytest.MonkeyPatch) -> N
     runtime = settings.runtime_diagnostics()
     assert runtime["mock_mode"] is False
     assert runtime["coderunner_mode"] == "opencode"
+    assert runtime["opencode_execution_mode"] == "local_openclaw"
     assert runtime["auth_mode"] == "disabled"
+
+
+def test_validate_startup_prerequisites_rejects_missing_openclaw_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://feature:feature@db:5432/feature_factory")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("MOCK_MODE", "false")
+    monkeypatch.setenv("CODERUNNER_MODE", "opencode")
+    monkeypatch.setenv("OPENCODE_EXECUTION_MODE", "local_openclaw")
+    monkeypatch.setenv("OPENCLAW_AUTH_DIR", "/tmp/does-not-exist-openclaw-auth")
+    monkeypatch.setattr(config_mod.shutil, "which", lambda _: "/usr/bin/openclaw")
+
+    settings = Settings()
+    with pytest.raises(RuntimeError):
+        settings.validate_startup_prerequisites()

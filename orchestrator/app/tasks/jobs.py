@@ -13,6 +13,7 @@ from app.observability import metrics
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
+from app.services.prompt_optimizer import detect_ui_feature
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
@@ -24,6 +25,13 @@ from app.state_machine import BUILDING, perform_action, validate_transition
 
 
 console = Console()
+
+
+def _truncate_for_event(value: Any, *, max_chars: int = 4000) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
 
 
 def _workspace_plan(
@@ -66,15 +74,23 @@ def _workspace_plan(
 
 
 def _issue_body_from_feature(feature: FeatureRequest, workspace_plan: dict[str, Any] | None = None) -> str:
+    settings = get_settings()
     spec = feature.spec or {}
     ac = spec.get("acceptance_criteria") or []
     non_goals = spec.get("non_goals") or []
     source_repos = spec.get("source_repos") or []
+    ui_feature, ui_keywords = detect_ui_feature(spec)
+    if bool(spec.get("ui_feature")):
+        ui_feature = True
 
     ac_bullets = "\n".join([f"- {x}" for x in ac]) if ac else "- (none provided)"
     ng_bullets = "\n".join([f"- {x}" for x in non_goals]) if non_goals else "- (none)"
     risk = ", ".join(spec.get("risk_flags") or []) or "(none)"
     source_repo_bullets = "\n".join([f"- {x}" for x in source_repos]) if source_repos else "- (none)"
+    ui_keywords_bullets = "\n".join([f"- {x}" for x in ui_keywords]) if ui_keywords else "- (none)"
+    preview_provider = settings.preview_provider_normalized() or "cloudflare_pages"
+    cloudflare_project = (settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
+    cloudflare_prod_branch = (settings.cloudflare_pages_production_branch or "").strip() or "main"
     final_workspace_plan = workspace_plan or _workspace_plan(spec, feature.id)
     optimized_prompt = str(spec.get("optimized_prompt", "")).strip()
     optimized_prompt_section = ""
@@ -113,6 +129,17 @@ def _issue_body_from_feature(feature: FeatureRequest, workspace_plan: dict[str, 
         {ng_bullets}
 
         **Risk flags:** {risk}
+
+        **UI feature:** {str(ui_feature).lower()}
+
+        **UI keyword matches:**
+        {ui_keywords_bullets}
+
+        **Preview provider:** {preview_provider}
+
+        **Cloudflare Pages project (if configured):** {cloudflare_project}
+
+        **Cloudflare Pages production branch:** {cloudflare_prod_branch}
 
         ## Safe Workspace Plan
         ```json
@@ -233,6 +260,27 @@ async def kickoff_build(feature_id: str) -> None:
             )
 
             stage = "coderunner_kickoff"
+            optimized_prompt = _truncate_for_event(spec.get("optimized_prompt", ""), max_chars=6000)
+            log_event(
+                db,
+                feature,
+                event_type="coderunner_invoked",
+                message="Dispatching request to code runner",
+                data={
+                    "coderunner_mode": settings.coderunner_mode_normalized(),
+                    "opencode_execution_mode": settings.opencode_execution_mode_normalized(),
+                    "implementation_mode": mode,
+                    "repo": spec.get("repo", ""),
+                    "source_repos": spec.get("source_repos") or [],
+                    "acceptance_criteria": spec.get("acceptance_criteria") or [],
+                    "links": spec.get("links") or [],
+                    "ui_feature": bool(spec.get("ui_feature")),
+                    "ui_keywords": spec.get("ui_keywords") or [],
+                    "optimized_prompt": optimized_prompt,
+                    "github_issue_number": issue.number,
+                },
+            )
+
             result = await coderunner.kickoff(
                 github=github,
                 issue_number=issue.number,
@@ -240,6 +288,18 @@ async def kickoff_build(feature_id: str) -> None:
                 build_context=workspace_plan,
                 spec=spec,
                 feature_id=feature.id,
+            )
+            runner_metadata = result.runner_metadata if isinstance(result.runner_metadata, dict) else {}
+            log_event(
+                db,
+                feature,
+                event_type="coderunner_completed",
+                message="Code runner completed",
+                data={
+                    "github_pr_url": result.github_pr_url or "",
+                    "preview_url": result.preview_url or "",
+                    "runner_metadata": runner_metadata,
+                },
             )
 
             action_result = perform_action(feature.status, "opened_pr")
@@ -258,6 +318,14 @@ async def kickoff_build(feature_id: str) -> None:
             )
 
             if feature.slack_channel_id and feature.slack_thread_ts:
+                runner_line = ""
+                if runner_metadata:
+                    provider = str(runner_metadata.get("provider") or "").strip()
+                    model = str(runner_metadata.get("model") or "").strip()
+                    execution_mode = str(runner_metadata.get("execution_mode") or "").strip()
+                    parts = [x for x in [execution_mode, provider, model] if x]
+                    if parts:
+                        runner_line = f"\nRunner: `{ ' | '.join(parts) }`"
                 slack.post_thread_message(
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
@@ -265,8 +333,19 @@ async def kickoff_build(feature_id: str) -> None:
                         f"PR step complete for *{feature.title}*\n"
                         f"Issue: {feature.github_issue_url or '(none)'}\n"
                         f"PR: {feature.github_pr_url or '(pending from OpenCode)'}"
+                        f"{runner_line}"
                     ),
                 )
+                if bool(spec.get("ui_feature")):
+                    cloudflare_project = (settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
+                    slack.post_thread_message(
+                        channel=feature.slack_channel_id,
+                        thread_ts=feature.slack_thread_ts,
+                        text=(
+                            "UI request detected. To view preview, open the PR Checks tab and click the "
+                            f"Cloudflare Pages deployment. Project: `{cloudflare_project}`."
+                        ),
+                    )
 
             safe_preview_url = normalize_external_url(result.preview_url or "")
             if safe_preview_url:
