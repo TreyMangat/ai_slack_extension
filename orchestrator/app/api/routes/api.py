@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -9,6 +11,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.responses import Response
 
 from app.config import get_settings
 from app.db import get_db
@@ -89,6 +92,52 @@ def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> 
             for e in sorted(feature.events, key=lambda x: x.created_at)
         ],
     )
+
+
+def _build_feature_filters(*, user: AuthenticatedUser, status: str, mine: bool) -> tuple[list, bool]:
+    conditions: list = []
+    status_filter = status.strip()
+    if status_filter:
+        conditions.append(FeatureRequest.status == status_filter)
+
+    can_view_all = user_can_view_all_features(user)
+    if mine or not can_view_all:
+        identities = sorted(user.identity_candidates())
+        if not identities:
+            return [], True
+        conditions.append(FeatureRequest.requester_user_id.in_(identities))
+
+    return conditions, False
+
+
+def _serialize_feature_requests_csv(features: list[FeatureRequest]) -> str:
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow([
+        "id",
+        "created_at",
+        "updated_at",
+        "status",
+        "title",
+        "requester_user_id",
+        "repo",
+        "implementation_mode",
+    ])
+    for feature in features:
+        spec = feature.spec or {}
+        writer.writerow(
+            [
+                feature.id,
+                feature.created_at.isoformat() if feature.created_at else "",
+                feature.updated_at.isoformat() if feature.updated_at else "",
+                feature.status,
+                feature.title,
+                feature.requester_user_id,
+                spec.get("repo", ""),
+                spec.get("implementation_mode", ""),
+            ]
+        )
+    return out.getvalue()
 
 
 def _verify_execution_callback_signature(request: Request, raw_body: bytes) -> None:
@@ -199,17 +248,9 @@ def list_feature_requests(
     mine: bool = Query(default=True),
     include_events: bool = Query(default=False),
 ):
-    conditions = []
-    status_filter = status.strip()
-    if status_filter:
-        conditions.append(FeatureRequest.status == status_filter)
-
-    can_view_all = user_can_view_all_features(user)
-    if mine or not can_view_all:
-        identities = sorted(user.identity_candidates())
-        if not identities:
-            return FeatureRequestListOut(items=[], total=0, limit=limit, offset=offset, has_more=False)
-        conditions.append(FeatureRequest.requester_user_id.in_(identities))
+    conditions, should_return_empty = _build_feature_filters(user=user, status=status, mine=mine)
+    if should_return_empty:
+        return FeatureRequestListOut(items=[], total=0, limit=limit, offset=offset, has_more=False)
 
     total_stmt = select(func.count()).select_from(FeatureRequest)
     if conditions:
@@ -231,6 +272,30 @@ def list_feature_requests(
         limit=limit,
         offset=offset,
         has_more=(offset + len(items)) < total,
+    )
+
+
+@router.get("/feature-requests/export")
+def export_feature_requests(
+    db: Session = Depends(get_db),
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+    status: str = Query(default=""),
+    mine: bool = Query(default=True),
+):
+    conditions, should_return_empty = _build_feature_filters(user=user, status=status, mine=mine)
+    if should_return_empty:
+        csv_body = _serialize_feature_requests_csv([])
+    else:
+        stmt = select(FeatureRequest)
+        if conditions:
+            stmt = stmt.where(*conditions)
+        rows = db.execute(stmt.order_by(FeatureRequest.created_at.desc())).scalars().all()
+        csv_body = _serialize_feature_requests_csv(rows)
+
+    return Response(
+        content=csv_body,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=feature-requests.csv"},
     )
 
 
