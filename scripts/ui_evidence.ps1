@@ -104,7 +104,7 @@ if ($homeHeaders.Count -gt 0) {
   $homePage = Invoke-WebRequest -Uri "$BaseUrl/" -TimeoutSec 30 -UseBasicParsing
 }
 Assert-True ($homePage.StatusCode -eq 200) "Home page must return 200"
-Assert-True ($homePage.Content -match "Feature Factory") "Home page content should include 'Feature Factory'"
+Assert-True ($homePage.Content -match "PRFactory|Feature Factory") "Home page content should include product title"
 $flows += @{
   id = "home_page_renders"
   status = "passed"

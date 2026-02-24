@@ -33,6 +33,7 @@ Use `.env.example` as the base and set production values.
 
 Required values for Modal:
 - `APP_ENV=prod`
+- `APP_DISPLAY_NAME=PRFactory`
 - `RUN_MIGRATIONS=false` (recommended for low-cost steady-state; run migrations manually during release)
 - `MOCK_MODE=false`
 - `GITHUB_ENABLED=true`
@@ -71,7 +72,9 @@ Slack on Modal (optional):
   - `SLACK_MODE=http`
   - `SLACK_BOT_TOKEN=xoxb-...`
   - `SLACK_SIGNING_SECRET=...`
-  - Set Slack Request URL to: `<BASE_URL>/api/slack/events`
+  - `SLACK_APP_ID=A...`
+  - `SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...` (App Configuration Token from `https://api.slack.com/apps`)
+  - Request URL + slash command URLs are synced automatically to `<BASE_URL>/api/slack/events`
 - Socket mode:
   - `ENABLE_SLACK_BOT=true`
   - `SLACK_MODE=socket`
@@ -131,16 +134,19 @@ The helper script:
 - maps `NEONURL -> DATABASE_URL` and `UPSTASH_REDIS_URL -> REDIS_URL` when needed
 - enforces `sslmode=require` for Neon URLs and `rediss://` for Upstash URLs
 - enforces production-safe env defaults
+- clears hardcoded Slack/GitHub allowlists and static repo targeting values for portable multi-user use
 - loads GitHub App private key from local PEM when needed
 - bundles `secrets/openclaw` into the Modal image when using `opencode/local_openclaw`
+- auto-syncs Slack manifest URLs/events/commands (unless `-SkipSlackManifestSync`)
 - deploys via Python 3.12 and verifies `/health`, `/health/ready`, and `/health/runtime`
 
 ## 5) Configure Slack (Optional)
 
 If using Slack on Modal:
-1. In Slack app settings, use Events API / Slash command request URL pointing to your Modal API.
-2. Keep `SLACK_MODE=http`.
-3. Do not run the separate `slackbot` Socket Mode process in Modal for this mode.
+1. Keep `SLACK_MODE=http`.
+2. Set `SLACK_APP_ID` and `SLACK_APP_CONFIG_TOKEN` in `.env`.
+3. Run deploy helper (it will sync Events/Interactivity/Slash-command URLs automatically).
+4. Do not run the separate `slackbot` Socket Mode process in Modal for this mode.
 
 ## 6) GitHub App Install/User Flow
 

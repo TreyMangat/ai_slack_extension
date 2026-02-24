@@ -1,4 +1,4 @@
-# Feature Factory (Local + Modal scaffold)
+# PRFactory (Local + Modal scaffold)
 
 This project is a **local-first** (Docker Compose) scaffold for the workflow you described:
 
@@ -212,21 +212,28 @@ Recommended bot scopes (minimum viable):
 - `mpim:history`
 
 Event subscriptions (bot events):
+- `member_joined_channel`
 - `message.channels`
 - `message.groups`
 - `message.im`
 - `message.mpim`
 
-Add a Slash Command:
-- `/feature`
+Add slash commands:
+- `/prfactory`
+- `/feature` (legacy alias)
+- `/prfactory-github`
 
 ### 2) Put tokens in `.env`
 
 Set:
 - `ENABLE_SLACK_BOT=true`
+- `SLACK_MODE=http` (for Modal/cloud)
 - `SLACK_BOT_TOKEN=...`
-- `SLACK_APP_TOKEN=...`
+- `SLACK_SIGNING_SECRET=...`
+- `SLACK_APP_ID=...`
+- `SLACK_APP_CONFIG_TOKEN=...` (App Configuration Token from `https://api.slack.com/apps`, usually `xoxe.xoxp-...`)
 - `REVIEWER_ALLOWED_USERS=U0123ABC,U0456DEF` (recommended)
+- `SLACK_APP_TOKEN=...` (only required for local `SLACK_MODE=socket`)
 
 (Optional but recommended)
 - `SLACK_ALLOWED_CHANNELS=C0123ABC,C0456DEF`
@@ -248,14 +255,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 ```
 
 Modal/cloud (HTTP mode):
-- Set `SLACK_MODE=http`
-- Configure Slack request URL to `<BASE_URL>/api/slack/events`
+- Keep `SLACK_MODE=http`
+- Run `py -3.12 .\scripts\sync_slack_manifest.py --env-file .env` to auto-sync URLs/events/commands
 - Do not run the separate socket-mode `slackbot` process
+
+Scope notes:
+- `SLACK_APP_CONFIG_TOKEN` configures the app (not channel-specific).
+- `SLACK_BOT_TOKEN` covers the entire installed workspace.
+- Any channel can use the bot after invite (no allowlist in production deploy script).
 
 Then in Slack, run:
 
 ```
-/feature Add a button to export invoices
+/prfactory Add a button to export invoices
 ```
 
 The bot will continue intake in thread (chat-first, no popup modal), then auto-start build once required fields are captured.
@@ -318,6 +330,7 @@ Required app permissions:
 
 For 24/7 hosting on Modal, follow:
 - `docs/SETUP_MODAL.md`
+- For exact coworker onboarding + invite flow, use `docs/ONBOARDING_PRFACTORY.md`
 
 ---
 

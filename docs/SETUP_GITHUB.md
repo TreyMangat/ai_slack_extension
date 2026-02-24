@@ -40,6 +40,7 @@ Fallback:
 - configure `GITHUB_REPO_OWNER` and `GITHUB_REPO_NAME`
 
 If app is not installed on the requested repo, build fails with install/login guidance URL.
+In Slack, users can also run `/prfactory-github` to get the install/login link.
 
 ## 3) Required GitHub App permissions
 

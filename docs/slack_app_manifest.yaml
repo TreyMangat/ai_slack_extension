@@ -1,16 +1,27 @@
 display_information:
-  name: Feature Factory
-  description: Slack intake bot for feature requests
+  name: PRFactory
+  description: Slack bot for AI-assisted PR automation
   background_color: "#1f2937"
 features:
   bot_user:
-    display_name: Feature Factory
+    display_name: PRFactory
     always_online: false
   slash_commands:
-    - command: /feature
-      description: Create a feature request
+    - command: /prfactory
+      description: Create a PR request
       usage_hint: Add invoice export
       should_escape: false
+      url: https://example.com/api/slack/events
+    - command: /feature
+      description: Legacy alias for /prfactory
+      usage_hint: Add invoice export
+      should_escape: false
+      url: https://example.com/api/slack/events
+    - command: /prfactory-github
+      description: GitHub app install instructions
+      usage_hint: Connect GitHub
+      should_escape: false
+      url: https://example.com/api/slack/events
 oauth_config:
   scopes:
     bot:
@@ -27,12 +38,16 @@ oauth_config:
       - mpim:history
 settings:
   event_subscriptions:
+    request_url: https://example.com/api/slack/events
     bot_events:
       - member_joined_channel
       - message.channels
       - message.groups
       - message.im
       - message.mpim
+  interactivity:
+    is_enabled: true
+    request_url: https://example.com/api/slack/events
   org_deploy_enabled: false
-  socket_mode_enabled: true
+  socket_mode_enabled: false
   token_rotation_enabled: false

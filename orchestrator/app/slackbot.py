@@ -33,6 +33,7 @@ QUESTION_BY_FIELD: dict[str, str] = {
 CREATE_FLOW_FIELDS = [
     "title",
     "problem",
+    "repo",
     "acceptance_criteria",
     "links",
 ]
@@ -49,6 +50,9 @@ UPDATE_FALLBACK_FIELDS = [
 SESSION_TTL_SECONDS = 2 * 60 * 60
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 SKIP_TOKENS = {"skip", "n/a", "na", "none", "no", "not sure", "unsure", "unknown", "idk"}
+PRIMARY_SLASH_COMMAND = "/prfactory"
+LEGACY_SLASH_COMMAND = "/feature"
+GITHUB_HELP_SLASH_COMMAND = "/prfactory-github"
 
 
 @dataclass
@@ -328,11 +332,19 @@ def _post_clarification_prompt(client: Any, channel_id: str, thread_ts: str, fea
 
 
 def _intro_message(settings: Any) -> str:
+    app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
+    install_url = settings.github_app_install_url_resolved()
+    github_line = (
+        f"- connect GitHub: {install_url}"
+        if install_url
+        else "- connect GitHub with `/prfactory-github` (ask admin to set app install URL if missing)"
+    )
     return (
-        "Hi! I am Feature Factory. Use `/feature <what you want built>` in this channel and I will:\n"
+        f"Hi! I am {app_name}. Use `{PRIMARY_SLASH_COMMAND} <what you want built>` in this channel and I will:\n"
         "- collect details in-thread,\n"
         "- create a tracked feature request,\n"
         "- and start a build that opens a PR for review.\n"
+        f"{github_line}\n"
         f"Dashboard: {settings.base_url}"
     )
 
@@ -354,9 +366,17 @@ def _post_intro_messages(
     if not inviter_id:
         return
 
+    app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
+    install_url = settings.github_app_install_url_resolved()
+    github_help_line = (
+        f"Connect GitHub App here: {install_url}"
+        if install_url
+        else "Use `/prfactory-github` for GitHub setup guidance."
+    )
     dm_text = (
-        "Thanks for adding Feature Factory.\n"
-        "Anyone in that channel can now use `/feature` to request work and track build/PR progress."
+        f"Thanks for adding {app_name}.\n"
+        f"Anyone in that channel can now use `{PRIMARY_SLASH_COMMAND}` or `{LEGACY_SLASH_COMMAND}` to request work.\n"
+        f"{github_help_line}"
     )
     try:
         client.chat_postMessage(channel=inviter_id, text=dm_text)
@@ -435,11 +455,17 @@ def _default_spec() -> dict[str, Any]:
     }
 
 
-def _build_create_queue(*, has_title: bool) -> list[str]:
+def _build_create_queue(*, has_title: bool, require_repo: bool) -> list[str]:
     queue = list(CREATE_FLOW_FIELDS)
     if has_title:
         queue.remove("title")
+    if not require_repo and "repo" in queue:
+        queue.remove("repo")
     return queue
+
+
+def _repo_required_for_slack_intake(settings: Any) -> bool:
+    return bool(settings.github_enabled) and not bool(settings.mock_mode)
 
 
 def _build_update_queue(feature: dict[str, Any]) -> list[str]:
@@ -479,7 +505,13 @@ def _ask_next_question(client: Any, session: IntakeSession) -> None:
     client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=prompt)
 
 
-def _capture_field_answer(session: IntakeSession, *, field: str, event: dict[str, Any]) -> tuple[bool, str]:
+def _capture_field_answer(
+    session: IntakeSession,
+    *,
+    field: str,
+    event: dict[str, Any],
+    require_repo: bool = False,
+) -> tuple[bool, str]:
     text = str(event.get("text") or "").strip()
     file_links = _extract_file_links(event)
 
@@ -501,6 +533,8 @@ def _capture_field_answer(session: IntakeSession, *, field: str, event: dict[str
 
     if field == "repo":
         if not text or _is_skip(text):
+            if require_repo:
+                return False, "Target repo is required. Reply with `org/repo`."
             session.answers["repo"] = ""
             return True, "Repo left unspecified."
         session.answers["repo"] = text.splitlines()[0].strip()
@@ -601,6 +635,7 @@ def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id
     if seed_title:
         answers["title"] = seed_title[:200]
 
+    require_repo = _repo_required_for_slack_intake(settings)
     session = IntakeSession(
         mode="create",
         feature_id="",
@@ -608,7 +643,7 @@ def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id
         channel_id=channel_id,
         thread_ts=thread_ts,
         message_ts=thread_ts,
-        queue=_build_create_queue(has_title=bool(seed_title)),
+        queue=_build_create_queue(has_title=bool(seed_title), require_repo=require_repo),
         answers=answers,
     )
     if seed_title:
@@ -627,10 +662,23 @@ def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id
         channel=channel_id,
         thread_ts=thread_ts,
         text=(
-            "I will ask 2-3 short questions in this thread and then start the build automatically.\n"
+            "I will ask a few short questions in this thread and then start the build automatically.\n"
             "If I stop responding after your reply, update Slack app scopes/events per `docs/SETUP_SLACK.md` and reinstall."
         ),
     )
+    if require_repo:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="For production builds, please provide the target repo as `org/repo` when asked.",
+        )
+        install_url = settings.github_app_install_url_resolved()
+        if install_url:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=f"Before your first build, connect GitHub App access here: {install_url}",
+            )
 
     _ask_next_question(client, session)
 
@@ -895,8 +943,7 @@ def create_slack_bolt_app(settings: Any):
             logger=logger,
         )
 
-    @app.command("/feature")
-    def handle_feature(ack, body, client, logger):
+    def _handle_create_command(ack, body, client, logger) -> None:
         ack()
         channel_id = body.get("channel_id")
         user_id = body.get("user_id")
@@ -915,6 +962,34 @@ def create_slack_bolt_app(settings: Any):
 
         _ensure_bot_in_channel(client, channel_id, logger)
         _start_create_intake(client, settings, channel_id=channel_id, user_id=user_id, seed_title=text)
+
+    @app.command(PRIMARY_SLASH_COMMAND)
+    def handle_prfactory(ack, body, client, logger):
+        _handle_create_command(ack, body, client, logger)
+
+    @app.command(LEGACY_SLASH_COMMAND)
+    def handle_feature_alias(ack, body, client, logger):
+        _handle_create_command(ack, body, client, logger)
+
+    @app.command(GITHUB_HELP_SLASH_COMMAND)
+    def handle_github_setup(ack, body, client):
+        ack()
+        channel_id = body.get("channel_id")
+        user_id = body.get("user_id")
+        install_url = settings.github_app_install_url_resolved()
+        if install_url:
+            text = (
+                f"GitHub connect for {(settings.app_display_name or 'PRFactory').strip() or 'PRFactory'}:\n"
+                f"1. Open {install_url}\n"
+                "2. Select your repo(s) for app access\n"
+                f"3. Run `{PRIMARY_SLASH_COMMAND} <request>` and include `repo=org/repo` if needed"
+            )
+        else:
+            text = (
+                "GitHub install URL is not configured yet. Ask the admin to set `GITHUB_APP_SLUG` "
+                "or `GITHUB_APP_INSTALL_URL` in runtime config."
+            )
+        client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
 
     @app.event("message")
     def handle_message_events(event, client, logger):
@@ -957,7 +1032,7 @@ def create_slack_bolt_app(settings: Any):
             client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text="Intake cancelled. Use `/feature` to start again.",
+                text=f"Intake cancelled. Use `{PRIMARY_SLASH_COMMAND}` to start again.",
             )
             return
 
@@ -966,7 +1041,8 @@ def create_slack_bolt_app(settings: Any):
             _drop_session(session)
             return
 
-        ok, note = _capture_field_answer(session, field=field, event=event)
+        require_repo = session.mode == "create" and _repo_required_for_slack_intake(settings)
+        ok, note = _capture_field_answer(session, field=field, event=event, require_repo=require_repo)
         if not ok:
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
             _ask_next_question(client, session)

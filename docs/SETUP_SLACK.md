@@ -1,92 +1,93 @@
-# Slack setup (Socket or HTTP mode)
+# Slack Setup (Socket or HTTP Mode)
 
-This scaffold uses **Slack Bolt (Python)** with either:
-- `SLACK_MODE=socket` (separate bot process)
-- `SLACK_MODE=http` (events served by FastAPI at `/api/slack/events`, recommended for Modal/cloud)
-The `/feature` flow is designed for non-technical users:
-- guided thread-based chat intake (no popup modal)
-- automatic clarification prompts if required fields are missing
-- **Add details in chat** action to update and revalidate the same request
+PRFactory uses Slack Bolt (Python) with:
+- `SLACK_MODE=socket` for local/dev bot process
+- `SLACK_MODE=http` for cloud/Modal (`/api/slack/events`, recommended)
 
-## Steps
+Primary user command:
+- `/prfactory <request>`
 
-0. (Optional) Import the manifest template in `docs/slack_app_manifest.yaml`
-1. Create a Slack app
-2. Enable Socket Mode
-3. Create an App Token:
-   - Starts with `xapp-...`
-   - Add scope: `connections:write`
-4. Add a Bot user and install the app into your workspace
-5. OAuth scopes (minimum viable):
-   - `chat:write`
-   - `commands`
-   - `channels:read`
-   - `channels:history`
-   - `channels:join` (recommended)
-   - `groups:read`
-   - `groups:history`
-   - `im:read`
-   - `im:history`
-   - `mpim:read`
-   - `mpim:history`
+Compatibility/utility commands:
+- `/feature <request>` (legacy alias)
+- `/prfactory-github` (GitHub app install/login guidance)
 
-7. Event subscriptions (bot events):
-   - `member_joined_channel` (recommended: posts onboarding message when bot is invited)
-   - `message.channels`
-   - `message.groups`
-   - `message.im`
-   - `message.mpim`
+## 1) Create Slack app + scopes
 
-6. Create a Slash Command:
-   - `/feature`
+1. Create a Slack app.
+2. Add bot OAuth scopes:
+- `chat:write`
+- `commands`
+- `channels:read`
+- `channels:history`
+- `channels:join`
+- `groups:read`
+- `groups:history`
+- `im:read`
+- `im:history`
+- `mpim:read`
+- `mpim:history`
+3. Add bot events:
+- `member_joined_channel`
+- `message.channels`
+- `message.groups`
+- `message.im`
+- `message.mpim`
+4. Add slash commands:
+- `/prfactory`
+- `/feature`
+- `/prfactory-github`
 
-## Configure `.env`
+## 2) Configure `.env`
 
-Set:
+Required:
 - `ENABLE_SLACK_BOT=true`
-- `SLACK_MODE=socket|http`
+- `SLACK_MODE=http` (Modal/cloud)
 - `SLACK_BOT_TOKEN=xoxb-...`
-- `SLACK_APP_TOKEN=xapp-...` (required for `SLACK_MODE=socket`)
-- `REVIEWER_ALLOWED_USERS=U0123ABC,U0456DEF` (recommended)
+- `SLACK_SIGNING_SECRET=...`
+- `SLACK_APP_ID=A...`
+- `SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...` (App Configuration Token from `https://api.slack.com/apps`)
 
-Optional restrictions:
-- `SLACK_ALLOWED_CHANNELS=C0123ABC,C0456DEF`
-- `SLACK_ALLOWED_USERS=U0123ABC,U0456DEF`
-- `SLACK_REQUIRE_MENTION=true`
-- `REVIEWER_CHANNEL_ID=C09REVIEW`
+Optional:
+- `SLACK_APP_TOKEN=xapp-...` (only for socket mode)
+- `REVIEWER_ALLOWED_USERS=...`
+- `SLACK_ALLOWED_CHANNELS=...`
+- `SLACK_ALLOWED_USERS=...`
 
-Socket mode restart (docker compose with Slack profile):
+## 3) Remove manual URL/event edits
+
+Run:
 
 ```powershell
-docker compose --profile slack up --build
+py -3.12 .\scripts\sync_slack_manifest.py --env-file .env
 ```
 
-HTTP mode (FastAPI-served endpoint):
-- set `SLACK_MODE=http`
-- set Slack Request URL to: `<BASE_URL>/api/slack/events`
-- do not run the separate socket-mode `slackbot` worker for this mode
-- when the bot is invited to a channel, it posts a short onboarding message and DMs the inviter
+This updates Slack manifest settings automatically:
+- Events request URL -> `<BASE_URL>/api/slack/events`
+- Interactivity request URL -> `<BASE_URL>/api/slack/events`
+- Slash command URLs -> `<BASE_URL>/api/slack/events`
+- Required bot events and command aliases
 
-After changing scopes/event subscriptions, reinstall or re-authorize the app in your workspace.
+The Modal production deploy script runs this automatically unless you pass `-SkipSlackManifestSync`.
 
-Validation helper:
+## 4) Token scope and multi-user behavior
+
+- `SLACK_APP_CONFIG_TOKEN` is not channel-specific. It manages app configuration for your Slack app.
+- `SLACK_BOT_TOKEN` works for the whole workspace where the app is installed.
+- In the same workspace, anyone can use PRFactory in any channel where the bot is invited.
+- Different workspaces require separate app installation (and, for fully automatic multi-workspace support, a full Slack OAuth install flow).
+
+## 5) Validate
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\check_slack_setup.ps1
 ```
 
-Try it:
+Try:
 
 ```text
-/feature Add a button to export invoices
+/prfactory Add a button to export invoices
+/prfactory-github
 ```
 
-The bot will ask one question at a time in the thread, for example:
-- What do you want to build?
-- What problem are users facing?
-- Why is this needed now?
-- Attach request if applicable (links/files)
-- Do you know what project/repo this belongs to?
-
-If the request lands in `NEEDS_INFO`, the bot posts clarifying questions in thread.
-Use **Add details in chat** on the request message to provide missing information.
+When the bot is invited to a channel, it posts a short onboarding message and DMs the inviter with GitHub setup guidance.
+In non-mock production mode, the intake flow requires a target `org/repo` before build starts.

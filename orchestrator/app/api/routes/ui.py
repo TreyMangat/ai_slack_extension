@@ -6,6 +6,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.db import get_db
 from app.models import FeatureRequest
 from app.queue import get_queue
@@ -31,6 +32,7 @@ from app.tasks.jobs import kickoff_build_job
 router = APIRouter()
 
 templates = Jinja2Templates(directory="app/templates")
+templates.env.globals["app_display_name"] = (get_settings().app_display_name or "PRFactory").strip() or "PRFactory"
 
 
 @router.get("/", response_class=HTMLResponse)

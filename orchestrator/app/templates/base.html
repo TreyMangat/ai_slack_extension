@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{% block title %}Feature Factory{% endblock %}</title>
+  <title>{% block title %}{{ app_display_name }}{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/styles.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="container">
       <div class="brand">
-        <a href="/">Feature Factory</a>
-        <span class="tag">local-first scaffold</span>
+        <a href="/">{{ app_display_name }}</a>
+        <span class="tag">Slack-first PR automation</span>
       </div>
       <nav class="nav">
         <a href="/docs" class="muted" style="display:none;">Docs</a>
@@ -25,7 +25,7 @@
 
   <footer class="footer">
     <div class="container">
-      <span class="muted">MOCK_MODE-friendly | FastAPI + Postgres + Redis</span>
+      <span class="muted">{{ app_display_name }} | FastAPI + Postgres + Redis</span>
     </div>
   </footer>
 </body>

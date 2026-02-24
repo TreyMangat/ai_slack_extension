@@ -9,6 +9,7 @@
 #   -ModalAppPath .\modal_app.py
 #   -SkipSecretSync
 #   -SkipDeploy
+#   -SkipSlackManifestSync
 
 param(
   [string]$EnvFile = ".env",
@@ -16,7 +17,8 @@ param(
   [string]$ModalAppPath = ".\modal_app.py",
   [string]$BaseUrl = "",
   [switch]$SkipSecretSync,
-  [switch]$SkipDeploy
+  [switch]$SkipDeploy,
+  [switch]$SkipSlackManifestSync
 )
 
 Set-StrictMode -Version Latest
@@ -392,6 +394,17 @@ if ($githubEnabled) {
     }
     $config["GITHUB_APP_PRIVATE_KEY_PATH"] = ""
   }
+
+  if (-not [string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "GITHUB_REPO_OWNER")) -or -not [string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "GITHUB_REPO_NAME"))) {
+    Write-Host "Clearing GITHUB_REPO_OWNER/GITHUB_REPO_NAME to avoid hardcoded repo targeting." -ForegroundColor Yellow
+  }
+  $config["GITHUB_REPO_OWNER"] = ""
+  $config["GITHUB_REPO_NAME"] = ""
+
+  if (-not [string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "GITHUB_APP_INSTALLATION_ID"))) {
+    Write-Host "Clearing GITHUB_APP_INSTALLATION_ID to enforce dynamic per-repo installation lookup." -ForegroundColor Yellow
+  }
+  $config["GITHUB_APP_INSTALLATION_ID"] = ""
 }
 
 $coderunnerMode = Get-MapValue -Map $config -Key "CODERUNNER_MODE" -Default "opencode"
@@ -455,9 +468,17 @@ if ($slackEnabled) {
   }
   $config["SLACK_ALLOWED_CHANNELS"] = ""
   $config["SLACK_ALLOWED_USERS"] = ""
+  if (-not [string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "REVIEWER_ALLOWED_USERS"))) {
+    Write-Host "Clearing REVIEWER_ALLOWED_USERS to avoid hardcoded reviewer IDs." -ForegroundColor Yellow
+  }
+  $config["REVIEWER_ALLOWED_USERS"] = ""
   Require-NonEmptyKeys -Map $config -Keys @("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET")
   Test-SlackBotToken -Token (Get-MapValue -Map $config -Key "SLACK_BOT_TOKEN")
   Write-Host "Validated SLACK_BOT_TOKEN via Slack auth.test." -ForegroundColor Green
+
+  if (-not $SkipSlackManifestSync) {
+    Require-NonEmptyKeys -Map $config -Keys @("SLACK_APP_ID", "SLACK_APP_CONFIG_TOKEN")
+  }
 }
 
 Require-NonEmptyKeys -Map $config -Keys @(
@@ -483,7 +504,11 @@ $tempNeonSecretJson = Join-Path $env:TEMP ("feature-factory-neon-secret-" + [gui
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 try {
   $payload = @{}
+  $excludedRuntimeSecretKeys = @("SLACK_APP_CONFIG_TOKEN")
   foreach ($key in $config.Keys) {
+    if ($excludedRuntimeSecretKeys -contains $key) {
+      continue
+    }
     if (Is-ValidEnvKey -Key $key) {
       $payload[$key] = [string]$config[$key]
     }
@@ -591,6 +616,13 @@ try {
         if ($status -ne 405) {
           throw "Expected GET $probeUrl to return 405 when Slack events route exists, got status $status."
         }
+      }
+    }
+    if ($slackEnabled -and $slackMode -eq "http" -and -not $SkipSlackManifestSync) {
+      Write-Host "Syncing Slack manifest URLs/events/commands..." -ForegroundColor Cyan
+      & py -3.12 .\scripts\sync_slack_manifest.py --env-file $resolvedEnvFile --base-url $resolvedBaseUrl
+      if ($LASTEXITCODE -ne 0) {
+        throw "Slack manifest sync failed. Re-run with -SkipSlackManifestSync for manual Slack configuration."
       }
     }
   }

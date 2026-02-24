@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = Field(default="local", alias="APP_ENV")
+    app_display_name: str = Field(default="PRFactory", alias="APP_DISPLAY_NAME")
     mock_mode: bool = Field(default=True, alias="MOCK_MODE")
     enforce_production_security: bool = Field(default=True, alias="ENFORCE_PRODUCTION_SECURITY")
     enable_api_docs: bool = Field(default=True, alias="ENABLE_API_DOCS")
@@ -106,10 +107,10 @@ class Settings(BaseSettings):
     llm_repo_file_max_chars: int = Field(default=5000, alias="LLM_REPO_FILE_MAX_CHARS")
     llm_install_command: str = Field(default="", alias="LLM_INSTALL_COMMAND")
     llm_test_command: str = Field(default="pytest -q", alias="LLM_TEST_COMMAND")
-    llm_push_branch_prefix: str = Field(default="feature-factory", alias="LLM_PUSH_BRANCH_PREFIX")
-    llm_commit_author_name: str = Field(default="feature-factory-bot", alias="LLM_COMMIT_AUTHOR_NAME")
+    llm_push_branch_prefix: str = Field(default="prfactory", alias="LLM_PUSH_BRANCH_PREFIX")
+    llm_commit_author_name: str = Field(default="prfactory-bot", alias="LLM_COMMIT_AUTHOR_NAME")
     llm_commit_author_email: str = Field(
-        default="feature-factory-bot@local.invalid",
+        default="prfactory-bot@local.invalid",
         alias="LLM_COMMIT_AUTHOR_EMAIL",
     )
 
@@ -216,6 +217,7 @@ class Settings(BaseSettings):
         seed_candidates = list(seed_dir.glob("agents/*/agent/auth*.json")) if seed_dir.exists() else []
         return {
             "app_env": (self.app_env or "").strip().lower() or "local",
+            "app_display_name": (self.app_display_name or "").strip() or "PRFactory",
             "auth_mode": self.auth_mode_normalized() or "disabled",
             "mock_mode": bool(self.mock_mode),
             "coderunner_mode": self.coderunner_mode_normalized() or "opencode",
