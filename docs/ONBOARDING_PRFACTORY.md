@@ -22,16 +22,24 @@ INTEGRATION_WEBHOOK_SECRET=<strong-random-token>
 
 ENABLE_SLACK_BOT=true
 SLACK_MODE=http
-SLACK_BOT_TOKEN=xoxb-...
 SLACK_SIGNING_SECRET=...
+ENABLE_SLACK_OAUTH=true
+SLACK_CLIENT_ID=...
+SLACK_CLIENT_SECRET=...
 SLACK_APP_ID=A...
 SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...
+SLACK_OAUTH_INSTALL_PATH=/api/slack/install
+SLACK_OAUTH_CALLBACK_PATH=/api/slack/oauth/callback
 
 GITHUB_ENABLED=true
 GITHUB_AUTH_MODE=app
 GITHUB_APP_ID=...
 GITHUB_APP_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----
 GITHUB_APP_SLUG=<your-github-app-slug>
+ENABLE_GITHUB_USER_OAUTH=true
+GITHUB_OAUTH_CLIENT_ID=...
+GITHUB_OAUTH_CLIENT_SECRET=...
+GITHUB_USER_OAUTH_REQUIRED=true
 ```
 
 Keep these empty for multi-user portability:
@@ -57,7 +65,7 @@ This deploy path automatically:
 
 - syncs Modal secrets
 - clears hardcoded Slack/GitHub allowlists/static repo settings
-- syncs Slack manifest URLs/events/commands
+- syncs Slack manifest URLs/events/commands/oauth-callback
 
 ## 3) Slack app settings (must exist)
 
@@ -77,6 +85,7 @@ Bot scopes:
 
 Bot events:
 
+- `app_home_opened`
 - `member_joined_channel`
 - `message.channels`
 - `message.groups`
@@ -100,12 +109,29 @@ Same workspace flow:
 
 3. Coworker runs:
 
-- `/prfactory-github` (connect GitHub app to repo if needed)
 - `/prfactory <request>`
 
 4. When asked, coworker provides `repo=org/repo` (required for non-mock builds).
 
-Different workspace:
+Different workspace (self-serve install):
 
-- Current setup is single-workspace install per app.
-- To support external workspaces self-serve, you need Slack OAuth distribution flow (separate feature).
+1. Share install URL: `https://<your-modal-url>/api/slack/install`
+2. Coworker clicks **Add to Slack** and selects their workspace.
+3. After install, they invite bot in a channel:
+- `/invite @PRFactory`
+4. They run:
+- `/prfactory <request>`
+
+Notes:
+- `/prfactory-github` still works, but PRFactory now also posts user-specific GitHub connect links in onboarding and intake prompts.
+- This flow supports multiple workspaces because each install stores a workspace-specific bot token.
+- Each Slack user connects their own GitHub account for builds (no shared GitHub identity in-channel).
+
+## 5) App ID, Team ID, and install links
+
+- App ID: Slack app settings -> **Basic Information** -> **App Credentials** (`SLACK_APP_ID`).
+- Team ID (for a specific workspace): run `auth.test` with that workspace bot token, or inspect Slack workspace metadata.
+
+Link options:
+- One-size-fits-all cross-workspace install link: `https://<your-modal-url>/api/slack/install`
+- Workspace-targeted app redirect link: `https://slack.com/app_redirect?app=<SLACK_APP_ID>&team=<TEAM_ID>`

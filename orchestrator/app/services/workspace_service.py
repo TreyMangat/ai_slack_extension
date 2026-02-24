@@ -262,7 +262,7 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
     clone_token = ""
     if settings.workspace_enable_git_clone and settings.github_enabled:
         try:
-            clone_token = get_github_token_provider().get_token()
+            clone_token = get_github_token_provider().get_token(allow_user_oauth=False)
         except Exception as e:  # noqa: BLE001
             errors.append(f"could not acquire GitHub auth token for clone: {e}")
 

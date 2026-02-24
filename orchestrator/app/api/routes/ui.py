@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FeatureRequest
+from app.models import FeatureRequest, FeatureRun
 from app.queue import get_queue
 from app.security import (
     AuthenticatedUser,
@@ -151,6 +151,23 @@ def build_from_ui(
         raise HTTPException(status_code=503, detail=f"Failed to enqueue build: {e}")
 
     feature.active_build_job_id = job.id
+    spec = dict(feature.spec or {})
+    spec["_last_build_actor_id"] = _user.actor_id
+    feature.spec = spec
+    db.add(
+        FeatureRun(
+            feature_id=feature.id,
+            status="QUEUED",
+            runner_type=(get_settings().coderunner_mode_normalized() or "opencode"),
+            runner_run_id=job.id,
+            actor_id=_user.actor_id,
+            issue_url=feature.github_issue_url or "",
+            pr_url=feature.github_pr_url or "",
+            preview_url=feature.preview_url or "",
+            artifacts={},
+            error_text="",
+        )
+    )
     db.commit()
     return RedirectResponse(url=f"/features/{feature.id}", status_code=303)
 

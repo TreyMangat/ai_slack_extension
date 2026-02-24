@@ -46,12 +46,17 @@ def notify_reviewer_for_approval(feature: FeatureRequest, slack: SlackAdapter) -
 
     # If a reviewer channel is configured, notify there.
     if settings.reviewer_channel_id:
-        slack.post_channel_message(channel=settings.reviewer_channel_id, text=text)
+        slack.post_channel_message(channel=settings.reviewer_channel_id, text=text, team_id=feature.slack_team_id)
         return True
 
     # Otherwise, notify in the feature thread if available.
     if feature.slack_channel_id and feature.slack_thread_ts:
-        slack.post_thread_message(channel=feature.slack_channel_id, thread_ts=feature.slack_thread_ts, text=text)
+        slack.post_thread_message(
+            channel=feature.slack_channel_id,
+            thread_ts=feature.slack_thread_ts,
+            text=text,
+            team_id=feature.slack_team_id,
+        )
         return True
 
     return False

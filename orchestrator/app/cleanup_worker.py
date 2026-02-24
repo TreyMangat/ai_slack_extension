@@ -113,6 +113,7 @@ def run_stale_callback_alerts_once() -> None:
                             f"Build status is still `{feature.status}` for *{feature.title}*.\n"
                             f"No preview callback received in {stale_minutes}+ minutes."
                         ),
+                        team_id=feature.slack_team_id,
                     )
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[yellow]failed to post stale callback alert to Slack: {e}[/yellow]")

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from rich.console import Console
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import db_session
-from app.models import FeatureRequest
+from app.models import FeatureRequest, FeatureRun
 from app.observability import metrics
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
@@ -32,9 +34,27 @@ def _truncate_for_event(value: Any, *, max_chars: int = 4000) -> str:
     return text[: max_chars - 3] + "..."
 
 
+def _mode_strategy_label(mode: str) -> str:
+    normalized = (mode or "").strip() or "new_feature"
+    if normalized == "reuse_existing":
+        return "reuse reference snapshots"
+    return "target repo only"
+
+
+def _feature_reference(feature: FeatureRequest) -> str:
+    raw_title = str(feature.title or "").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in raw_title)
+    slug = "-".join([part for part in slug.split("-") if part][:3]) or "request"
+    short = str(feature.id or "")[:8]
+    return f"{slug}-{short}" if short else slug
+
+
 def _workspace_plan(
     spec: dict[str, Any],
     feature_id: str,
+    *,
+    github_actor_id: str = "",
+    slack_team_id: str = "",
     workspace: WorkspacePreparationResult | None = None,
 ) -> dict[str, Any]:
     mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
@@ -50,6 +70,8 @@ def _workspace_plan(
             "implement and test changes",
             "open PR for reviewer/admin approval",
         ],
+        "github_actor_id": (github_actor_id or "").strip(),
+        "slack_team_id": (slack_team_id or "").strip(),
     }
     if workspace:
         plan["workspace_snapshot"] = {
@@ -84,6 +106,40 @@ async def kickoff_build(feature_id: str) -> None:
             console.print(f"[red]Feature {feature_id} not found[/red]")
             return
 
+        active_job_id = (feature.active_build_job_id or "").strip()
+        feature_run = None
+        if active_job_id:
+            feature_run = (
+                db.execute(
+                    select(FeatureRun)
+                    .where(FeatureRun.feature_id == feature.id)
+                    .where(FeatureRun.runner_run_id == active_job_id)
+                    .order_by(FeatureRun.created_at.desc())
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+        if not feature_run:
+            feature_run = FeatureRun(
+                feature_id=feature.id,
+                status="RUNNING",
+                runner_type=settings.coderunner_mode_normalized() or "opencode",
+                runner_run_id=active_job_id,
+                actor_id=str((feature.spec or {}).get("_last_build_actor_id") or feature.requester_user_id or "").strip(),
+                issue_url=feature.github_issue_url or "",
+                pr_url=feature.github_pr_url or "",
+                preview_url=feature.preview_url or "",
+                artifacts={},
+                error_text="",
+                started_at=datetime.utcnow(),
+            )
+            db.add(feature_run)
+        else:
+            feature_run.status = "RUNNING"
+            feature_run.started_at = feature_run.started_at or datetime.utcnow()
+            feature_run.error_text = ""
+
         metrics.inc("build_jobs_started_total", 1)
 
         # API/UI should already transition to BUILDING before enqueue.
@@ -96,6 +152,7 @@ async def kickoff_build(feature_id: str) -> None:
         log_event(db, feature, event_type="build_started", message="Build started")
 
         spec = feature.spec or {}
+        github_actor_id = str(spec.get("_last_build_actor_id") or feature.requester_user_id or "").strip()
 
         workspace_result = prepare_workspace(feature.id, spec)
         log_event(
@@ -106,7 +163,13 @@ async def kickoff_build(feature_id: str) -> None:
             data=workspace_result.to_event_data(),
         )
 
-        workspace_plan = _workspace_plan(spec, feature.id, workspace=workspace_result)
+        workspace_plan = _workspace_plan(
+            spec,
+            feature.id,
+            github_actor_id=github_actor_id,
+            slack_team_id=(feature.slack_team_id or "").strip(),
+            workspace=workspace_result,
+        )
         log_event(
             db,
             feature,
@@ -128,6 +191,9 @@ async def kickoff_build(feature_id: str) -> None:
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
             feature.active_build_job_id = ""
+            feature_run.status = "FAILED"
+            feature_run.error_text = message
+            feature_run.finished_at = datetime.utcnow()
             log_event(db, feature, event_type="build_failed", message=message)
             log_event(
                 db,
@@ -142,6 +208,7 @@ async def kickoff_build(feature_id: str) -> None:
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
                     text=f"Build failed for *{feature.title}*: `{message}`",
+                    team_id=feature.slack_team_id,
                 )
             return
 
@@ -152,6 +219,9 @@ async def kickoff_build(feature_id: str) -> None:
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
             feature.active_build_job_id = ""
+            feature_run.status = "FAILED"
+            feature_run.error_text = message
+            feature_run.finished_at = datetime.utcnow()
             log_event(db, feature, event_type="build_failed", message=message)
             metrics.inc("build_jobs_failed_total", 1)
             if feature.slack_channel_id and feature.slack_thread_ts:
@@ -159,6 +229,7 @@ async def kickoff_build(feature_id: str) -> None:
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
                     text=f"Build failed for *{feature.title}*: `{message}`",
+                    team_id=feature.slack_team_id,
                 )
             return
 
@@ -172,6 +243,9 @@ async def kickoff_build(feature_id: str) -> None:
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
             feature.active_build_job_id = ""
+            feature_run.status = "FAILED"
+            feature_run.error_text = message
+            feature_run.finished_at = datetime.utcnow()
             log_event(db, feature, event_type="build_failed", message=message)
             metrics.inc("build_jobs_failed_total", 1)
             if feature.slack_channel_id and feature.slack_thread_ts:
@@ -181,23 +255,37 @@ async def kickoff_build(feature_id: str) -> None:
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
                     text=f"Build failed for *{feature.title}*: `{message}`{install_hint}",
+                    team_id=feature.slack_team_id,
                 )
             return
 
         if feature.slack_channel_id and feature.slack_thread_ts:
+            feature_ref = _feature_reference(feature)
+            message_parts = [
+                f"Started build for *{feature.title}* (id: `{feature.id}`)",
+                f"ref: `{feature_ref}`",
+                f"mode: `{mode}` ({_mode_strategy_label(mode)})",
+            ]
+            if source_repo_count > 0 or mode == "reuse_existing":
+                message_parts.append(f"prepared references: {prepared_count}/{source_repo_count}")
+            if target_repo:
+                message_parts.append(f"repo: `{target_repo}`")
             slack.post_thread_message(
                 channel=feature.slack_channel_id,
                 thread_ts=feature.slack_thread_ts,
-                text=(
-                    f"Started build for *{feature.title}* (id: `{feature.id}`) | mode: `{mode}` | "
-                    f"prepared references: {prepared_count}/{source_repo_count}"
-                    + (f" | repo: `{target_repo}`" if target_repo else "")
-                ),
+                text=" | ".join(message_parts),
+                team_id=feature.slack_team_id,
             )
 
         stage = "github_adapter_init"
         try:
-            github = get_github_adapter(owner=owner, repo=repo, strict=(not settings.mock_mode and settings.github_enabled))
+            github = get_github_adapter(
+                owner=owner,
+                repo=repo,
+                strict=(not settings.mock_mode and settings.github_enabled),
+                actor_id=github_actor_id,
+                team_id=(feature.slack_team_id or "").strip(),
+            )
             if target_repo:
                 log_event(
                     db,
@@ -249,6 +337,11 @@ async def kickoff_build(feature_id: str) -> None:
                     "runner_metadata": runner_metadata,
                 },
             )
+            feature_run.issue_url = feature.github_issue_url or ""
+            feature_run.pr_url = result.github_pr_url or feature.github_pr_url or ""
+            feature_run.preview_url = result.preview_url or feature.preview_url or ""
+            feature_run.artifacts = {"runner_metadata": runner_metadata}
+            feature_run.error_text = ""
 
             action_result = perform_action(feature.status, "opened_pr")
             validate_transition(feature.status, action_result.new_status)
@@ -283,6 +376,7 @@ async def kickoff_build(feature_id: str) -> None:
                         f"PR: {feature.github_pr_url or '(pending)'}"
                         f"{runner_line}"
                     ),
+                    team_id=feature.slack_team_id,
                 )
                 if bool(spec.get("ui_feature")):
                     cloudflare_project = (settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
@@ -293,6 +387,7 @@ async def kickoff_build(feature_id: str) -> None:
                             "UI request detected. To view preview, open the PR Checks tab and click the "
                             f"Cloudflare Pages deployment. Project: `{cloudflare_project}`."
                         ),
+                        team_id=feature.slack_team_id,
                     )
 
             safe_preview_url = normalize_external_url(result.preview_url or "")
@@ -316,6 +411,7 @@ async def kickoff_build(feature_id: str) -> None:
                         channel=feature.slack_channel_id,
                         thread_ts=feature.slack_thread_ts,
                         text=f"Preview ready: {safe_preview_url}",
+                        team_id=feature.slack_team_id,
                     )
 
                 if notify_reviewer_for_approval(feature, slack):
@@ -328,6 +424,10 @@ async def kickoff_build(feature_id: str) -> None:
             else:
                 # Preview URL will be set later via signed integration callback.
                 feature.active_build_job_id = ""
+            feature_run.status = "SUCCEEDED"
+            feature_run.pr_url = feature.github_pr_url or feature_run.pr_url
+            feature_run.preview_url = feature.preview_url or feature_run.preview_url
+            feature_run.finished_at = datetime.utcnow()
             metrics.inc("build_jobs_succeeded_total", 1)
 
         except Exception as e:
@@ -339,6 +439,9 @@ async def kickoff_build(feature_id: str) -> None:
             except Exception:
                 pass
             feature.active_build_job_id = ""
+            feature_run.status = "FAILED"
+            feature_run.error_text = str(e)
+            feature_run.finished_at = datetime.utcnow()
 
             log_event(
                 db,
@@ -356,10 +459,21 @@ async def kickoff_build(feature_id: str) -> None:
             metrics.inc("build_jobs_failed_total", 1)
 
             if feature.slack_channel_id and feature.slack_thread_ts:
+                error_text = str(e)
+                guidance = ""
+                if "produced no repository changes" in error_text.lower():
+                    resolved_repo = target_repo or "(none)"
+                    resolved_base = str(spec.get("base_branch") or "").strip() or "(default branch)"
+                    guidance = (
+                        "\nLikely causes: request details were too vague, wrong repo selected, or wrong base branch.\n"
+                        f"Resolved target: repo `{resolved_repo}`, base `{resolved_base}`.\n"
+                        "Use *Add details in chat* to specify exact files/behavior, then retry build."
+                    )
                 slack.post_thread_message(
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
-                    text=f"Build failed for *{feature.title}*: `{e}`",
+                    text=f"Build failed for *{feature.title}*: {error_text}{guidance}",
+                    team_id=feature.slack_team_id,
                 )
 
 

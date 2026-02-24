@@ -34,6 +34,8 @@
       <ul>
         <li>Mode: <code>{{ feature.spec.get('implementation_mode', 'new_feature') }}</code></li>
         <li>Primary repo: <code>{{ feature.spec.get('repo', '(none)') }}</code></li>
+        <li>Spec version: <code>{{ feature.spec.get('_meta', {}).get('version', 1) }}</code></li>
+        <li>Spec completion score: <code>{{ feature.spec.get('_validation', {}).get('completion', {}).get('score', 0) }}/100</code></li>
       </ul>
 
       <h3>Source repos (reference-only snapshots)</h3>
@@ -71,6 +73,39 @@
         <li>Repo: <code>{{ feature.spec.get('repo', '(none)') }}</code></li>
         <li>PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank" rel="noopener noreferrer">{{ feature.github_pr_url }}</a>{% else %}<span class="muted">(none / pending)</span>{% endif %}</li>
         <li>Preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank" rel="noopener noreferrer">{{ feature.preview_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+      </ul>
+
+      <h3>Review checklist</h3>
+      <ul>
+        <li>Spec validated: <code>{{ feature.spec.get('_validation', {}).get('is_valid', false) }}</code></li>
+        <li>Acceptance criteria count: <code>{{ feature.spec.get('acceptance_criteria', [])|length }}</code></li>
+        <li>Latest PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank" rel="noopener noreferrer">open</a>{% else %}<span class="muted">pending</span>{% endif %}</li>
+        <li>Latest preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank" rel="noopener noreferrer">open</a>{% else %}<span class="muted">pending</span>{% endif %}</li>
+      </ul>
+
+      <h3>Run history</h3>
+      <ul class="timeline">
+        {% for run in feature.runs | sort(attribute='created_at', reverse=True) %}
+          <li>
+            <div class="small muted">{{ run.created_at }}</div>
+            <div>
+              <strong>{{ run.status }}</strong>
+              {% if run.runner_run_id %} | job: <code>{{ run.runner_run_id }}</code>{% endif %}
+              {% if run.actor_id %} | actor: <code>{{ run.actor_id }}</code>{% endif %}
+            </div>
+            <div class="small">
+              {% if run.pr_url %}PR: <a href="{{ run.pr_url }}" target="_blank" rel="noopener noreferrer">open</a>{% else %}PR: <span class="muted">pending</span>{% endif %}
+              |
+              {% if run.preview_url %}Preview: <a href="{{ run.preview_url }}" target="_blank" rel="noopener noreferrer">open</a>{% else %}Preview: <span class="muted">pending</span>{% endif %}
+            </div>
+            {% if run.error_text %}
+              <div class="small"><code>{{ run.error_text }}</code></div>
+            {% endif %}
+          </li>
+        {% endfor %}
+        {% if feature.runs|length == 0 %}
+          <li class="muted">(no runs yet)</li>
+        {% endif %}
       </ul>
 
       <div class="row">
@@ -121,7 +156,7 @@
         <label>
           Build mode
           <select name="implementation_mode">
-            <option value="new_feature" {% if feature.spec.get('implementation_mode', 'new_feature') == 'new_feature' %}selected{% endif %}>Build from scratch</option>
+            <option value="new_feature" {% if feature.spec.get('implementation_mode', 'new_feature') == 'new_feature' %}selected{% endif %}>Build in target repo (default)</option>
             <option value="reuse_existing" {% if feature.spec.get('implementation_mode', 'new_feature') == 'reuse_existing' %}selected{% endif %}>Reuse existing repo patterns</option>
           </select>
         </label>

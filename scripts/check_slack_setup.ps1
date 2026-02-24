@@ -30,6 +30,10 @@ function Get-EnvValue {
 }
 
 $slackMode = (Get-EnvValue -Key "SLACK_MODE" -Default "socket").Trim().ToLowerInvariant()
+$slackOauthEnabled = (Get-EnvValue -Key "ENABLE_SLACK_OAUTH" -Default "false").Trim().ToLowerInvariant()
+$oauthEnabled = @("1", "true", "yes", "on") -contains $slackOauthEnabled
+$slackClientId = (Get-EnvValue -Key "SLACK_CLIENT_ID").Trim()
+$slackClientSecret = (Get-EnvValue -Key "SLACK_CLIENT_SECRET").Trim()
 $botToken = (Get-EnvValue -Key "SLACK_BOT_TOKEN").Trim()
 $appToken = (Get-EnvValue -Key "SLACK_APP_TOKEN").Trim()
 $signingSecret = (Get-EnvValue -Key "SLACK_SIGNING_SECRET").Trim()
@@ -38,14 +42,26 @@ $appId = (Get-EnvValue -Key "SLACK_APP_ID").Trim()
 $channelRaw = (Get-EnvValue -Key "SLACK_ALLOWED_CHANNELS").Trim()
 $channelId = ($channelRaw -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)
 
-if ([string]::IsNullOrWhiteSpace($botToken)) {
-  throw "SLACK_BOT_TOKEN is empty in .env"
+if (-not $oauthEnabled -and [string]::IsNullOrWhiteSpace($botToken)) {
+  throw "SLACK_BOT_TOKEN is empty in .env (required when ENABLE_SLACK_OAUTH=false)"
 }
 
-Write-Host "Checking bot auth..." -ForegroundColor Cyan
-$auth = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/auth.test" -Headers @{ Authorization = "Bearer $botToken" }
-if (-not $auth.ok) { throw "auth.test failed: $($auth.error)" }
-Write-Host "bot auth ok: team=$($auth.team) user=$($auth.user)" -ForegroundColor Green
+if ([string]::IsNullOrWhiteSpace($botToken)) {
+  Write-Warning "SLACK_BOT_TOKEN is empty; bot auth check skipped (OAuth-only mode)."
+}
+else {
+  Write-Host "Checking bot auth..." -ForegroundColor Cyan
+  $auth = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/auth.test" -Headers @{ Authorization = "Bearer $botToken" }
+  if (-not $auth.ok) { throw "auth.test failed: $($auth.error)" }
+  Write-Host "bot auth ok: team=$($auth.team) user=$($auth.user)" -ForegroundColor Green
+}
+
+if ($oauthEnabled) {
+  if ([string]::IsNullOrWhiteSpace($slackClientId) -or [string]::IsNullOrWhiteSpace($slackClientSecret)) {
+    throw "ENABLE_SLACK_OAUTH=true but SLACK_CLIENT_ID/SLACK_CLIENT_SECRET are missing."
+  }
+  Write-Host "OAuth mode detected. Client ID/secret present." -ForegroundColor Green
+}
 
 if ($slackMode -eq "socket") {
   if ([string]::IsNullOrWhiteSpace($appToken)) {
@@ -82,8 +98,8 @@ else {
   throw "Unsupported SLACK_MODE '$slackMode'. Expected 'socket' or 'http'."
 }
 
-if ([string]::IsNullOrWhiteSpace($channelId)) {
-  Write-Warning "SLACK_ALLOWED_CHANNELS is empty; skipping conversations.history scope check."
+if ([string]::IsNullOrWhiteSpace($channelId) -or [string]::IsNullOrWhiteSpace($botToken)) {
+  Write-Warning "Skipping conversations.history scope check (need both SLACK_ALLOWED_CHANNELS and SLACK_BOT_TOKEN)."
   exit 0
 }
 

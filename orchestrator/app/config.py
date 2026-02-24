@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import shutil
+from urllib.parse import urlencode
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,6 +56,23 @@ class Settings(BaseSettings):
     slack_bot_token: str = Field(default="", alias="SLACK_BOT_TOKEN")
     slack_app_token: str = Field(default="", alias="SLACK_APP_TOKEN")
     slack_signing_secret: str = Field(default="", alias="SLACK_SIGNING_SECRET")
+    enable_slack_oauth: bool = Field(default=False, alias="ENABLE_SLACK_OAUTH")
+    slack_client_id: str = Field(default="", alias="SLACK_CLIENT_ID")
+    slack_client_secret: str = Field(default="", alias="SLACK_CLIENT_SECRET")
+    slack_oauth_scopes: str = Field(
+        default=(
+            "chat:write,commands,channels:read,channels:history,channels:join,"
+            "groups:read,groups:history,im:read,im:history,mpim:read,mpim:history"
+        ),
+        alias="SLACK_OAUTH_SCOPES",
+    )
+    slack_oauth_user_scopes: str = Field(default="", alias="SLACK_OAUTH_USER_SCOPES")
+    slack_oauth_install_path: str = Field(default="/api/slack/install", alias="SLACK_OAUTH_INSTALL_PATH")
+    slack_oauth_callback_path: str = Field(default="/api/slack/oauth/callback", alias="SLACK_OAUTH_CALLBACK_PATH")
+    slack_oauth_redirect_uri: str = Field(default="", alias="SLACK_OAUTH_REDIRECT_URI")
+    slack_oauth_state_expiration_seconds: int = Field(default=600, alias="SLACK_OAUTH_STATE_EXPIRATION_SECONDS")
+    slack_app_id: str = Field(default="", alias="SLACK_APP_ID")
+    slack_team_id: str = Field(default="", alias="SLACK_TEAM_ID")
     slack_default_channel: str = Field(default="", alias="SLACK_DEFAULT_CHANNEL")
 
     slack_allowed_channels: str = Field(default="", alias="SLACK_ALLOWED_CHANNELS")
@@ -78,6 +96,19 @@ class Settings(BaseSettings):
     github_repo_name: str = Field(default="", alias="GITHUB_REPO_NAME")
     github_api_base: str = Field(default="https://api.github.com", alias="GITHUB_API_BASE")
     github_default_branch: str = Field(default="main", alias="GITHUB_DEFAULT_BRANCH")
+    enable_github_user_oauth: bool = Field(default=False, alias="ENABLE_GITHUB_USER_OAUTH")
+    github_oauth_client_id: str = Field(default="", alias="GITHUB_OAUTH_CLIENT_ID")
+    github_oauth_client_secret: str = Field(default="", alias="GITHUB_OAUTH_CLIENT_SECRET")
+    github_oauth_scopes: str = Field(default="repo,read:user", alias="GITHUB_OAUTH_SCOPES")
+    github_oauth_install_path: str = Field(default="/api/github/install", alias="GITHUB_OAUTH_INSTALL_PATH")
+    github_oauth_callback_path: str = Field(default="/api/github/oauth/callback", alias="GITHUB_OAUTH_CALLBACK_PATH")
+    github_oauth_redirect_uri: str = Field(default="", alias="GITHUB_OAUTH_REDIRECT_URI")
+    github_oauth_state_expiration_seconds: int = Field(default=600, alias="GITHUB_OAUTH_STATE_EXPIRATION_SECONDS")
+    github_user_oauth_required: bool = Field(default=True, alias="GITHUB_USER_OAUTH_REQUIRED")
+    github_user_token_encryption_key: str = Field(default="", alias="GITHUB_USER_TOKEN_ENCRYPTION_KEY")
+
+    # Slack intake behavior
+    slack_intake_minimal: bool = Field(default=True, alias="SLACK_INTAKE_MINIMAL")
 
     # Code runner strategy:
     # - opencode: run OpenClaw inside worker and open PR directly
@@ -185,6 +216,24 @@ class Settings(BaseSettings):
                     failures.append(f"GITHUB_APP_PRIVATE_KEY_PATH not found in runtime container: {key_path}")
             elif not inline_key:
                 failures.append("GitHub App auth requires GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY")
+        if self.github_user_oauth_enabled():
+            if not (self.github_oauth_client_id or "").strip():
+                failures.append("GitHub user OAuth requires GITHUB_OAUTH_CLIENT_ID")
+            if not (self.github_oauth_client_secret or "").strip():
+                failures.append("GitHub user OAuth requires GITHUB_OAUTH_CLIENT_SECRET")
+        if self.enable_slack_bot and self.slack_mode_normalized() == "http":
+            if not (self.slack_signing_secret or "").strip():
+                failures.append("ENABLE_SLACK_BOT=true and SLACK_MODE=http require SLACK_SIGNING_SECRET")
+            if self.slack_oauth_enabled():
+                if not (self.slack_client_id or "").strip():
+                    failures.append("Slack OAuth requires SLACK_CLIENT_ID")
+                if not (self.slack_client_secret or "").strip():
+                    failures.append("Slack OAuth requires SLACK_CLIENT_SECRET")
+            elif not (self.slack_bot_token or "").strip():
+                failures.append(
+                    "ENABLE_SLACK_BOT=true and SLACK_MODE=http require SLACK_BOT_TOKEN "
+                    "unless Slack OAuth distribution is enabled"
+                )
         if (
             not self.mock_mode
             and self.coderunner_mode_normalized() == "opencode"
@@ -228,12 +277,18 @@ class Settings(BaseSettings):
             "cloudflare_pages_production_branch": (self.cloudflare_pages_production_branch or "").strip() or "main",
             "docs_enabled": bool(self.docs_enabled()),
             "enable_slack_bot": bool(self.enable_slack_bot),
+            "slack_oauth_enabled": bool(self.slack_oauth_enabled()),
+            "slack_oauth_install_url": self.slack_oauth_install_url_resolved(),
+            "slack_app_redirect_url": self.slack_app_redirect_url_resolved(),
             "github_enabled": bool(self.github_enabled),
             "github_auth_mode": self.github_auth_mode_normalized() or "token",
             "github_app_slug": (self.github_app_slug or "").strip(),
             "github_app_install_url": self.github_app_install_url_resolved(),
             "github_app_private_key_configured": bool(key_path or (self.github_app_private_key or "").strip()),
             "github_app_private_key_file_exists": bool(key_file_exists),
+            "github_user_oauth_enabled": bool(self.github_user_oauth_enabled()),
+            "github_user_oauth_required": bool(self.github_user_oauth_required_effective()),
+            "github_oauth_install_url": self.github_oauth_install_url_resolved(),
             "workspace_enable_git_clone": bool(self.workspace_enable_git_clone),
             "integration_webhook_configured": bool((self.integration_webhook_secret or "").strip()),
             "openclaw_auth_dir": str(auth_dir),
@@ -279,6 +334,57 @@ class Settings(BaseSettings):
     def preview_provider_normalized(self) -> str:
         return (self.preview_provider or "").strip().lower()
 
+    @staticmethod
+    def _normalize_route_path(value: str, *, default_path: str) -> str:
+        candidate = (value or "").strip()
+        if not candidate:
+            candidate = default_path
+        if not candidate.startswith("/"):
+            candidate = "/" + candidate
+        return candidate
+
+    def slack_oauth_enabled(self) -> bool:
+        if self.enable_slack_oauth:
+            return True
+        return bool((self.slack_client_id or "").strip() and (self.slack_client_secret or "").strip())
+
+    def slack_oauth_install_path_normalized(self) -> str:
+        return self._normalize_route_path(self.slack_oauth_install_path, default_path="/api/slack/install")
+
+    def slack_oauth_callback_path_normalized(self) -> str:
+        return self._normalize_route_path(self.slack_oauth_callback_path, default_path="/api/slack/oauth/callback")
+
+    def slack_oauth_scopes_list(self) -> list[str]:
+        return self._parse_csv(self.slack_oauth_scopes)
+
+    def slack_oauth_user_scopes_list(self) -> list[str]:
+        return self._parse_csv(self.slack_oauth_user_scopes)
+
+    def slack_oauth_redirect_uri_resolved(self) -> str:
+        explicit = (self.slack_oauth_redirect_uri or "").strip()
+        if explicit:
+            return explicit
+        base = (self.base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        return f"{base}{self.slack_oauth_callback_path_normalized()}"
+
+    def slack_oauth_install_url_resolved(self) -> str:
+        base = (self.base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        return f"{base}{self.slack_oauth_install_path_normalized()}"
+
+    def slack_app_redirect_url_resolved(self) -> str:
+        app_id = (self.slack_app_id or "").strip()
+        if not app_id:
+            return ""
+        params = {"app": app_id}
+        team_id = (self.slack_team_id or "").strip()
+        if team_id:
+            params["team"] = team_id
+        return "https://slack.com/app_redirect?" + urlencode(params)
+
     def service_auth_group_set(self) -> set[str]:
         return {g.lower() for g in self._parse_csv(self.service_auth_groups)}
 
@@ -299,6 +405,55 @@ class Settings(BaseSettings):
         if slug:
             return f"https://github.com/apps/{slug}/installations/new"
         return ""
+
+    def github_user_oauth_enabled(self) -> bool:
+        if self.enable_github_user_oauth:
+            return True
+        return bool((self.github_oauth_client_id or "").strip() and (self.github_oauth_client_secret or "").strip())
+
+    def github_user_oauth_required_effective(self) -> bool:
+        if not self.github_user_oauth_enabled():
+            return False
+        return bool(self.github_user_oauth_required)
+
+    def github_oauth_scopes_list(self) -> list[str]:
+        return self._parse_csv(self.github_oauth_scopes)
+
+    def github_oauth_install_path_normalized(self) -> str:
+        return self._normalize_route_path(self.github_oauth_install_path, default_path="/api/github/install")
+
+    def github_oauth_callback_path_normalized(self) -> str:
+        return self._normalize_route_path(self.github_oauth_callback_path, default_path="/api/github/oauth/callback")
+
+    def github_oauth_redirect_uri_resolved(self) -> str:
+        explicit = (self.github_oauth_redirect_uri or "").strip()
+        if explicit:
+            return explicit
+        base = (self.base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        return f"{base}{self.github_oauth_callback_path_normalized()}"
+
+    def github_oauth_install_url_resolved(self) -> str:
+        base = (self.base_url or "").strip().rstrip("/")
+        if not base:
+            return ""
+        return f"{base}{self.github_oauth_install_path_normalized()}"
+
+    def github_oauth_install_url_for_user(self, *, slack_user_id: str, slack_team_id: str = "", next_url: str = "") -> str:
+        base = self.github_oauth_install_url_resolved()
+        if not base:
+            return ""
+        params: dict[str, str] = {}
+        if (slack_user_id or "").strip():
+            params["slack_user_id"] = slack_user_id.strip()
+        if (slack_team_id or "").strip():
+            params["slack_team_id"] = slack_team_id.strip()
+        if (next_url or "").strip():
+            params["next"] = next_url.strip()
+        if not params:
+            return base
+        return f"{base}?{urlencode(params)}"
 
 
 @lru_cache

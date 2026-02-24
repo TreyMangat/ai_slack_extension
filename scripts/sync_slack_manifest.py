@@ -10,7 +10,9 @@ from urllib import error, request
 
 DEFAULT_DISPLAY_NAME = "PRFactory"
 EVENTS_ENDPOINT_SUFFIX = "/api/slack/events"
+DEFAULT_OAUTH_CALLBACK_PATH = "/api/slack/oauth/callback"
 REQUIRED_BOT_EVENTS = [
+    "app_home_opened",
     "member_joined_channel",
     "message.channels",
     "message.groups",
@@ -62,6 +64,13 @@ def _env_or_arg(*, value: str, env: dict[str, str], key: str) -> str:
 
 def _events_url(base_url: str) -> str:
     return base_url.rstrip("/") + EVENTS_ENDPOINT_SUFFIX
+
+
+def _oauth_callback_url(base_url: str, callback_path: str) -> str:
+    path = (callback_path or "").strip() or DEFAULT_OAUTH_CALLBACK_PATH
+    if not path.startswith("/"):
+        path = "/" + path
+    return base_url.rstrip("/") + path
 
 
 def _slack_api_call(*, token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +151,13 @@ def _ensure_slash_commands(existing: list[dict[str, Any]], *, request_url: str) 
     return output
 
 
-def _patched_manifest(*, manifest: dict[str, Any], request_url: str, display_name: str) -> dict[str, Any]:
+def _patched_manifest(
+    *,
+    manifest: dict[str, Any],
+    request_url: str,
+    oauth_callback_url: str,
+    display_name: str,
+) -> dict[str, Any]:
     patched = dict(manifest)
 
     display_information = dict(patched.get("display_information") or {})
@@ -163,6 +178,10 @@ def _patched_manifest(*, manifest: dict[str, Any], request_url: str, display_nam
     )
     patched["features"] = features
 
+    oauth_config = dict(patched.get("oauth_config") or {})
+    oauth_config["redirect_urls"] = [oauth_callback_url]
+    patched["oauth_config"] = oauth_config
+
     settings = dict(patched.get("settings") or {})
     event_subscriptions = dict(settings.get("event_subscriptions") or {})
     event_subscriptions["request_url"] = request_url
@@ -175,6 +194,7 @@ def _patched_manifest(*, manifest: dict[str, Any], request_url: str, display_nam
     interactivity["is_enabled"] = True
     interactivity["request_url"] = request_url
     settings["interactivity"] = interactivity
+    settings["socket_mode_enabled"] = False
     patched["settings"] = settings
     return patched
 
@@ -192,6 +212,11 @@ def _parse_args() -> argparse.Namespace:
         help="Slack App Configuration token (xoxe.xoxp-..., falls back to SLACK_APP_CONFIG_TOKEN).",
     )
     parser.add_argument("--display-name", default="", help="Slack app display name (default PRFactory).")
+    parser.add_argument(
+        "--oauth-callback-path",
+        default="",
+        help="OAuth callback path (defaults to SLACK_OAUTH_CALLBACK_PATH or /api/slack/oauth/callback).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print patched manifest JSON and exit.")
     return parser.parse_args()
 
@@ -204,6 +229,11 @@ def main() -> int:
     app_id = _env_or_arg(value=args.app_id, env=env, key="SLACK_APP_ID")
     config_token = _env_or_arg(value=args.config_token, env=env, key="SLACK_APP_CONFIG_TOKEN")
     display_name = _env_or_arg(value=args.display_name, env=env, key="APP_DISPLAY_NAME") or DEFAULT_DISPLAY_NAME
+    callback_path = _env_or_arg(
+        value=args.oauth_callback_path,
+        env=env,
+        key="SLACK_OAUTH_CALLBACK_PATH",
+    ) or DEFAULT_OAUTH_CALLBACK_PATH
 
     missing: list[str] = []
     if not base_url:
@@ -220,6 +250,7 @@ def main() -> int:
         )
 
     request_url = _events_url(base_url)
+    oauth_callback_url = _oauth_callback_url(base_url, callback_path)
     export_resp = _slack_api_call(
         token=config_token,
         method="apps.manifest.export",
@@ -229,7 +260,12 @@ def main() -> int:
     if not isinstance(manifest, dict):
         raise RuntimeError("Slack API apps.manifest.export did not return a valid manifest object.")
 
-    patched = _patched_manifest(manifest=manifest, request_url=request_url, display_name=display_name)
+    patched = _patched_manifest(
+        manifest=manifest,
+        request_url=request_url,
+        oauth_callback_url=oauth_callback_url,
+        display_name=display_name,
+    )
     _slack_api_call(token=config_token, method="apps.manifest.validate", payload={"manifest": patched})
 
     if args.dry_run:
@@ -244,6 +280,7 @@ def main() -> int:
     print(f"Slack manifest synced for app {app_id}.")
     print(f"Events URL: {request_url}")
     print(f"Slash commands URL: {request_url}")
+    print(f"OAuth callback URL: {oauth_callback_url}")
     print("If scopes changed, reinstall/re-authorize the Slack app in your workspace.")
     return 0
 

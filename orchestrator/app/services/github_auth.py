@@ -9,6 +9,7 @@ import httpx
 import jwt
 
 from app.config import Settings, get_settings
+from app.services.github_user_oauth import build_github_user_connect_url, resolve_github_user_access_token
 
 
 class GitHubAuthError(RuntimeError):
@@ -149,7 +150,35 @@ class GitHubTokenProvider:
             self._cached_by_installation[normalized_installation_id] = (token, expires_at)
             return token
 
-    def get_token(self, *, owner: str = "", repo: str = "") -> str:
+    def get_token(
+        self,
+        *,
+        owner: str = "",
+        repo: str = "",
+        actor_id: str = "",
+        team_id: str = "",
+        allow_user_oauth: bool = True,
+    ) -> str:
+        normalized_actor = (actor_id or "").strip()
+        normalized_team = (team_id or "").strip()
+        if allow_user_oauth and self.settings.github_user_oauth_enabled():
+            if normalized_actor:
+                user_token = resolve_github_user_access_token(
+                    slack_user_id=normalized_actor,
+                    slack_team_id=normalized_team,
+                )
+                if user_token:
+                    return user_token
+            if self.settings.github_user_oauth_required_effective():
+                connect_url = build_github_user_connect_url(
+                    slack_user_id=normalized_actor,
+                    slack_team_id=normalized_team,
+                )
+                message = "No GitHub user OAuth token is connected for this Slack user."
+                if connect_url:
+                    message += f" Connect here: {connect_url}"
+                raise GitHubAuthError(message)
+
         mode = self._mode()
         if mode in {"", "token", "pat"}:
             return self._token_from_pat()

@@ -23,6 +23,8 @@ features:
       should_escape: false
       url: https://example.com/api/slack/events
 oauth_config:
+  redirect_urls:
+    - https://example.com/api/slack/oauth/callback
   scopes:
     bot:
       - chat:write
@@ -40,6 +42,7 @@ settings:
   event_subscriptions:
     request_url: https://example.com/api/slack/events
     bot_events:
+      - app_home_opened
       - member_joined_channel
       - message.channels
       - message.groups

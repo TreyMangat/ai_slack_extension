@@ -159,9 +159,9 @@ def main() -> int:
 
     try:
         if repo_configured:
-            installation_token = provider.get_token(owner=repo_owner, repo=repo_name)
+            installation_token = provider.get_token(owner=repo_owner, repo=repo_name, allow_user_oauth=False)
         elif resolved_installation_id:
-            installation_token = provider.get_token()
+            installation_token = provider.get_token(allow_user_oauth=False)
         else:
             warnings.append(
                 "Cannot mint an installation token without target repo or GITHUB_APP_INSTALLATION_ID"

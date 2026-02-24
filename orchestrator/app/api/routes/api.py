@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import re
 import time
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import ValidationError
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FeatureRequest, IntegrationCallbackReceipt
+from app.models import FeatureRequest, FeatureRun, IntegrationCallbackReceipt
 from app.queue import get_queue
 from app.security import (
     AuthenticatedUser,
@@ -75,6 +76,7 @@ def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> 
         status=feature.status,
         title=feature.title,
         requester_user_id=feature.requester_user_id,
+        slack_team_id=feature.slack_team_id,
         slack_channel_id=feature.slack_channel_id,
         slack_thread_ts=feature.slack_thread_ts,
         spec=feature.spec,
@@ -96,6 +98,25 @@ def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> 
                 "data": e.data,
             }
             for e in sorted(feature.events, key=lambda x: x.created_at)
+        ],
+        runs=[] if not include_events else [
+            {
+                "id": r.id,
+                "status": r.status,
+                "runner_type": r.runner_type,
+                "runner_run_id": r.runner_run_id,
+                "actor_id": r.actor_id,
+                "issue_url": r.issue_url,
+                "pr_url": r.pr_url,
+                "preview_url": r.preview_url,
+                "artifacts": r.artifacts or {},
+                "error_text": r.error_text,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+            }
+            for r in sorted(feature.runs, key=lambda x: x.created_at)
         ],
     )
 
@@ -272,6 +293,19 @@ def _extract_issue_number(issue_url: str) -> int:
     return int(tail)
 
 
+def _latest_run_for_feature(db: Session, feature_id: str) -> FeatureRun | None:
+    return (
+        db.execute(
+            select(FeatureRun)
+            .where(FeatureRun.feature_id == feature_id)
+            .order_by(FeatureRun.created_at.desc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+
+
 async def _sync_standard_pr_body(feature: FeatureRequest) -> None:
     pr_url = (feature.github_pr_url or "").strip()
     if not pr_url:
@@ -337,7 +371,13 @@ async def _sync_standard_pr_body(feature: FeatureRequest) -> None:
         repo_path=None,
     )
     owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
-    github = get_github_adapter(owner=owner, repo=repo, strict=True)
+    github = get_github_adapter(
+        owner=owner,
+        repo=repo,
+        strict=True,
+        actor_id=(feature.requester_user_id or "").strip(),
+        team_id=(feature.slack_team_id or "").strip(),
+    )
     await github.update_pull_request_body(pr_number=pr_number, body=body)
 
 
@@ -488,6 +528,8 @@ def start_build(
 
     settings = get_settings()
     spec = feature.spec or {}
+    github_actor_id = actor_id or (feature.requester_user_id or "").strip()
+    github_team_id = (feature.slack_team_id or "").strip()
     if not settings.mock_mode:
         if not settings.github_enabled:
             raise HTTPException(
@@ -508,7 +550,13 @@ def start_build(
                 detail["install_url"] = install_url
             raise HTTPException(status_code=400, detail=detail)
         try:
-            get_github_adapter(owner=owner, repo=repo, strict=True)
+            get_github_adapter(
+                owner=owner,
+                repo=repo,
+                strict=True,
+                actor_id=github_actor_id,
+                team_id=github_team_id,
+            )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -554,6 +602,23 @@ def start_build(
         raise HTTPException(status_code=503, detail=f"Failed to enqueue build: {e}")
 
     feature.active_build_job_id = job.id
+    next_spec = dict(feature.spec or {})
+    next_spec["_last_build_actor_id"] = github_actor_id
+    feature.spec = next_spec
+    db.add(
+        FeatureRun(
+            feature_id=feature.id,
+            status="QUEUED",
+            runner_type=settings.coderunner_mode_normalized() or "opencode",
+            runner_run_id=job.id,
+            actor_id=github_actor_id,
+            issue_url=feature.github_issue_url or "",
+            pr_url=feature.github_pr_url or "",
+            preview_url=feature.preview_url or "",
+            artifacts={},
+            error_text="",
+        )
+    )
     log_event(
         db,
         feature,
@@ -691,6 +756,22 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
+    latest_run = _latest_run_for_feature(db, feature.id)
+    if latest_run is not None:
+        latest_run.issue_url = feature.github_issue_url or latest_run.issue_url
+        if payload.github_pr_url:
+            latest_run.pr_url = feature.github_pr_url or payload.github_pr_url
+        if payload.preview_url:
+            latest_run.preview_url = feature.preview_url or payload.preview_url
+        if payload.event in {"pr_opened", "preview_ready"}:
+            latest_run.status = "SUCCEEDED"
+            latest_run.error_text = ""
+            latest_run.finished_at = datetime.utcnow()
+        elif payload.event in {"build_failed", "preview_failed"}:
+            latest_run.status = "FAILED"
+            latest_run.error_text = payload.message or feature.last_error or "External callback reported failure"
+            latest_run.finished_at = datetime.utcnow()
+
     log_event(
         db,
         feature,
@@ -713,6 +794,7 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
             channel=feature.slack_channel_id,
             thread_ts=feature.slack_thread_ts,
             text=_callback_status_text(feature, payload),
+            team_id=feature.slack_team_id,
         )
 
     if payload.event == "preview_ready":

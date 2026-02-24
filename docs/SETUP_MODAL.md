@@ -70,11 +70,16 @@ Slack on Modal (optional):
 - HTTP mode:
   - `ENABLE_SLACK_BOT=true`
   - `SLACK_MODE=http`
-  - `SLACK_BOT_TOKEN=xoxb-...`
   - `SLACK_SIGNING_SECRET=...`
+  - `ENABLE_SLACK_OAUTH=true`
+  - `SLACK_CLIENT_ID=...`
+  - `SLACK_CLIENT_SECRET=...`
   - `SLACK_APP_ID=A...`
   - `SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...` (App Configuration Token from `https://api.slack.com/apps`)
-  - Request URL + slash command URLs are synced automatically to `<BASE_URL>/api/slack/events`
+  - optional fallback for one workspace: `SLACK_BOT_TOKEN=xoxb-...`
+  - request URL + slash command URLs are synced automatically to `<BASE_URL>/api/slack/events`
+  - OAuth callback URL is synced automatically to `<BASE_URL>/api/slack/oauth/callback`
+  - add bot event `app_home_opened` for one-time setup DM
 - Socket mode:
   - `ENABLE_SLACK_BOT=true`
   - `SLACK_MODE=socket`
@@ -129,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUr
 ```
 
 The helper script:
-- syncs `feature-factory-env` and `slack-secret` from `.env`
+- syncs `feature-factory-env` from `.env` and `slack-secret` only when `SLACK_BOT_TOKEN` is present
 - syncs provider-specific secrets `NeonURL` and `feature-factory-redis`
 - maps `NEONURL -> DATABASE_URL` and `UPSTASH_REDIS_URL -> REDIS_URL` when needed
 - enforces `sslmode=require` for Neon URLs and `rediss://` for Upstash URLs
@@ -144,9 +149,10 @@ The helper script:
 
 If using Slack on Modal:
 1. Keep `SLACK_MODE=http`.
-2. Set `SLACK_APP_ID` and `SLACK_APP_CONFIG_TOKEN` in `.env`.
-3. Run deploy helper (it will sync Events/Interactivity/Slash-command URLs automatically).
-4. Do not run the separate `slackbot` Socket Mode process in Modal for this mode.
+2. Set `ENABLE_SLACK_OAUTH=true`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_APP_ID`, and `SLACK_APP_CONFIG_TOKEN` in `.env`.
+3. Run deploy helper (it syncs Events/Interactivity/Slash-command URLs and OAuth callback URL automatically).
+4. Share install link with external workspaces: `<BASE_URL>/api/slack/install`.
+5. Do not run the separate `slackbot` Socket Mode process in Modal for this mode.
 
 ## 6) GitHub App Install/User Flow
 
@@ -158,6 +164,16 @@ At build time:
 - opens PR directly
 
 If app is not installed on a repo, build fails with install guidance (using `GITHUB_APP_INSTALL_URL` or slug-derived URL).
+
+Per-user GitHub identity (recommended for shared channels):
+- `ENABLE_GITHUB_USER_OAUTH=true`
+- `GITHUB_OAUTH_CLIENT_ID=...`
+- `GITHUB_OAUTH_CLIENT_SECRET=...`
+- `GITHUB_USER_OAUTH_REQUIRED=true`
+- optional: `GITHUB_USER_TOKEN_ENCRYPTION_KEY=...`
+
+With this enabled, each Slack user connects their own GitHub account through:
+- `<BASE_URL>/api/github/install?slack_user_id=<U...>&slack_team_id=<T...>`
 
 ## 7) Verify
 

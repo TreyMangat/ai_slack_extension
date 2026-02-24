@@ -16,7 +16,7 @@ It is designed so you can:
 - Keep the orchestrator future-proof (clear adapters + state machine)
 
 The Slack intake is novice-oriented:
-- asks only for title + short description (+ optional acceptance criteria and links)
+- asks only for what to build + target repo in the default flow
 - defaults missing fields automatically for local POC speed
 - auto-starts build when the request is valid (no extra confirmation step)
 - posts clarifying questions when details are missing
@@ -212,6 +212,7 @@ Recommended bot scopes (minimum viable):
 - `mpim:history`
 
 Event subscriptions (bot events):
+- `app_home_opened`
 - `member_joined_channel`
 - `message.channels`
 - `message.groups`
@@ -228,16 +229,16 @@ Add slash commands:
 Set:
 - `ENABLE_SLACK_BOT=true`
 - `SLACK_MODE=http` (for Modal/cloud)
-- `SLACK_BOT_TOKEN=...`
 - `SLACK_SIGNING_SECRET=...`
+- `ENABLE_SLACK_OAUTH=true`
+- `SLACK_CLIENT_ID=...`
+- `SLACK_CLIENT_SECRET=...`
 - `SLACK_APP_ID=...`
 - `SLACK_APP_CONFIG_TOKEN=...` (App Configuration Token from `https://api.slack.com/apps`, usually `xoxe.xoxp-...`)
-- `REVIEWER_ALLOWED_USERS=U0123ABC,U0456DEF` (recommended)
+- `SLACK_BOT_TOKEN=...` (optional single-workspace fallback)
 - `SLACK_APP_TOKEN=...` (only required for local `SLACK_MODE=socket`)
 
-(Optional but recommended)
-- `SLACK_ALLOWED_CHANNELS=C0123ABC,C0456DEF`
-- `SLACK_ALLOWED_USERS=U0123ABC,U0456DEF`
+(Optional)
 - `REVIEWER_CHANNEL_ID=C09REVIEW`
 
 ### 3) Choose runtime mode
@@ -256,12 +257,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 
 Modal/cloud (HTTP mode):
 - Keep `SLACK_MODE=http`
-- Run `py -3.12 .\scripts\sync_slack_manifest.py --env-file .env` to auto-sync URLs/events/commands
+- Run `py -3.12 .\scripts\sync_slack_manifest.py --env-file .env` to auto-sync URLs/events/commands/callback
 - Do not run the separate socket-mode `slackbot` process
+- Share install URL for external workspaces: `<BASE_URL>/api/slack/install`
 
 Scope notes:
 - `SLACK_APP_CONFIG_TOKEN` configures the app (not channel-specific).
-- `SLACK_BOT_TOKEN` covers the entire installed workspace.
+- In OAuth mode, each installed workspace gets its own bot token.
 - Any channel can use the bot after invite (no allowlist in production deploy script).
 
 Then in Slack, run:
@@ -293,11 +295,21 @@ Local testing:
 - `GITHUB_AUTH_MODE=token`
 - `GITHUB_TOKEN=<PAT with repo scope>`
 
-Production/multi-user:
+Production repository access:
 - `GITHUB_AUTH_MODE=app`
 - `GITHUB_APP_ID=...`
 - `GITHUB_APP_PRIVATE_KEY_PATH=...` (or `GITHUB_APP_PRIVATE_KEY=...`)
 - `GITHUB_APP_SLUG=...` (recommended, used for install/login guidance)
+
+Per-user GitHub identity (recommended for shared Slack channels):
+- `ENABLE_GITHUB_USER_OAUTH=true`
+- `GITHUB_OAUTH_CLIENT_ID=...`
+- `GITHUB_OAUTH_CLIENT_SECRET=...`
+- `GITHUB_USER_OAUTH_REQUIRED=true`
+- optional: `GITHUB_USER_TOKEN_ENCRYPTION_KEY=...` (otherwise derived from `SECRET_KEY`)
+
+With the settings above, each Slack user must connect their own GitHub account before build.
+PRFactory no longer uses one shared GitHub identity for all users in the same Slack workspace/channel.
 
 ### 2) Configure target repo strategy
 

@@ -9,7 +9,7 @@ from app.schemas import FeatureRequestCreate, FeatureSpecUpdateRequest
 from app.services.event_logger import log_event
 from app.services.prompt_optimizer import attach_optimized_prompt
 from app.services.reviewer_service import ensure_approver_allowed
-from app.services.spec_validator import validate_spec
+from app.services.spec_validator import spec_completion_report, validate_spec
 from app.services.url_safety import normalize_external_url_list
 from app.state_machine import (
     BUILDING,
@@ -34,7 +34,13 @@ class BuildAlreadyInProgressError(ValueError):
 
 def _set_validation_metadata(feature: FeatureRequest, *, is_valid: bool, missing: list[str], warnings: list[str]) -> None:
     spec = dict(feature.spec or {})
-    spec["_validation"] = {"is_valid": is_valid, "missing": missing, "warnings": warnings}
+    completion = spec_completion_report(spec)
+    spec["_validation"] = {
+        "is_valid": is_valid,
+        "missing": missing,
+        "warnings": warnings,
+        "completion": completion,
+    }
     feature.spec = spec
 
 
@@ -53,11 +59,16 @@ def create_feature_request(db: Session, payload: FeatureRequestCreate) -> Featur
     spec_data = payload.spec.model_dump()
     spec_data["links"] = normalize_external_url_list(spec_data.get("links") or [])
     spec_data = attach_optimized_prompt(spec_data)
+    spec_meta = dict(spec_data.get("_meta") or {})
+    spec_meta["version"] = int(spec_meta.get("version") or 1)
+    spec_meta["last_updated_by"] = payload.requester_user_id or "system"
+    spec_data["_meta"] = spec_meta
 
     feature = FeatureRequest(
         status=NEW,
         title=payload.spec.title,
         requester_user_id=payload.requester_user_id or "",
+        slack_team_id=payload.slack_team_id or "",
         slack_channel_id=payload.slack_channel_id or "",
         slack_thread_ts=payload.slack_thread_ts or "",
         slack_message_ts=payload.slack_message_ts or "",
@@ -147,6 +158,12 @@ def update_feature_spec(db: Session, feature: FeatureRequest, payload: FeatureSp
     next_spec.update(normalized_patch)
     next_spec["links"] = normalize_external_url_list(next_spec.get("links") or [])
     next_spec = attach_optimized_prompt(next_spec)
+    meta = dict(next_spec.get("_meta") or {})
+    prior_version = int(meta.get("version") or 1)
+    meta["version"] = prior_version + 1
+    meta["last_updated_by"] = payload.actor_id or "system"
+    meta["last_updated_fields"] = sorted(normalized_patch.keys())
+    next_spec["_meta"] = meta
     feature.spec = next_spec
     feature.title = str(next_spec.get("title", "")).strip()[:200]
 

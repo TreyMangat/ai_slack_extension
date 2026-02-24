@@ -53,6 +53,50 @@ function Read-DotEnv {
   return $map
 }
 
+function Set-DotEnvValue {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Key,
+    [Parameter(Mandatory = $true)][string]$Value
+  )
+
+  if (-not (Is-ValidEnvKey -Key $Key)) {
+    throw "Invalid env key for update: $Key"
+  }
+
+  $lines = @()
+  if (Test-Path $Path) {
+    $lines = Get-Content $Path
+  }
+
+  $updated = $false
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    $line = [string]$lines[$i]
+    $trimmed = $line.Trim()
+    if (-not $trimmed -or $trimmed.StartsWith("#")) {
+      continue
+    }
+    $eq = $line.IndexOf("=")
+    if ($eq -lt 1) {
+      continue
+    }
+    $existingKey = $line.Substring(0, $eq).Trim()
+    if ($existingKey -ne $Key) {
+      continue
+    }
+    $lines[$i] = "$Key=$Value"
+    $updated = $true
+    break
+  }
+
+  if (-not $updated) {
+    $lines += "$Key=$Value"
+  }
+
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllLines($Path, $lines, $utf8NoBom)
+}
+
 function Is-Truthy {
   param([string]$Value)
 
@@ -259,6 +303,121 @@ function Invoke-WithRetry {
   }
 }
 
+function Get-StatusCodeFromException {
+  param([Parameter(Mandatory = $true)]$ExceptionObject)
+
+  if ($null -eq $ExceptionObject) {
+    return -1
+  }
+
+  $exceptionProps = $ExceptionObject.PSObject.Properties.Name
+  if ($exceptionProps -contains "Response") {
+    $response = $ExceptionObject.Response
+    if ($null -ne $response) {
+      $responseProps = $response.PSObject.Properties.Name
+      if ($responseProps -contains "StatusCode") {
+        $statusObj = $response.StatusCode
+        if ($null -ne $statusObj) {
+          if ($statusObj -is [int]) {
+            return [int]$statusObj
+          }
+          $statusProps = $statusObj.PSObject.Properties.Name
+          if ($statusProps -contains "value__") {
+            return [int]$statusObj.value__
+          }
+          try {
+            return [int]$statusObj
+          }
+          catch {
+            # Fall through to message parsing.
+          }
+        }
+      }
+    }
+  }
+
+  $message = [string]$ExceptionObject.Message
+  if ($message -match "\b([1-5][0-9][0-9])\b") {
+    return [int]$matches[1]
+  }
+  return -1
+}
+
+function Get-HttpStatusCode {
+  param(
+    [Parameter(Mandatory = $true)][string]$Url,
+    [bool]$AllowRedirect = $true
+  )
+
+  try {
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop | Out-Null
+  }
+  catch {
+    # Fall back to Invoke-WebRequest path below.
+  }
+
+  $httpClientAvailable = $true
+  try {
+    [void][System.Net.Http.HttpClient]
+  }
+  catch {
+    $httpClientAvailable = $false
+  }
+
+  if (-not $httpClientAvailable) {
+    try {
+      $maxRedirects = if ($AllowRedirect) { 10 } else { 0 }
+      $response = Invoke-WebRequest -Uri $Url -Method Get -MaximumRedirection $maxRedirects -TimeoutSec 30 -ErrorAction Stop
+      return [int]$response.StatusCode
+    }
+    catch {
+      $status = Get-StatusCodeFromException -ExceptionObject $_.Exception
+      if ($status -gt 0) {
+        return $status
+      }
+      $message = [string]$_.Exception.Message
+      if ($message.ToLowerInvariant().Contains("maximum redirection count has been exceeded")) {
+        return 302
+      }
+      throw
+    }
+  }
+
+  $handler = New-Object System.Net.Http.HttpClientHandler
+  $handler.AllowAutoRedirect = $AllowRedirect
+  $client = New-Object System.Net.Http.HttpClient($handler)
+  $request = $null
+  $response = $null
+  try {
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+    $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $Url)
+    $response = $client.SendAsync($request).GetAwaiter().GetResult()
+    return [int]$response.StatusCode
+  }
+  catch {
+    $status = Get-StatusCodeFromException -ExceptionObject $_.Exception
+    if ($status -gt 0) {
+      return $status
+    }
+    $message = [string]$_.Exception.Message
+    if ($message.ToLowerInvariant().Contains("maximum redirection count has been exceeded")) {
+      # Some PowerShell builds surface redirect responses this way when redirects are disabled.
+      return 302
+    }
+    throw
+  }
+  finally {
+    if ($null -ne $response) {
+      $response.Dispose()
+    }
+    if ($null -ne $request) {
+      $request.Dispose()
+    }
+    $client.Dispose()
+    $handler.Dispose()
+  }
+}
+
 $repoRoot = (Resolve-Path ".").Path
 $resolvedEnvFile = Resolve-RepoPath -PathValue $EnvFile -RepoRoot $repoRoot
 if (-not (Test-Path $resolvedEnvFile)) {
@@ -266,6 +425,7 @@ if (-not (Test-Path $resolvedEnvFile)) {
 }
 
 $config = Read-DotEnv -Path $resolvedEnvFile
+$generatedEnvValues = @{}
 
 # Production posture + cost controls.
 $config["APP_ENV"] = "prod"
@@ -278,12 +438,27 @@ if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "ENABLE_SLACK_B
 if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "SLACK_MODE"))) {
   $config["SLACK_MODE"] = "http"
 }
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "ENABLE_SLACK_OAUTH"))) {
+  $config["ENABLE_SLACK_OAUTH"] = "false"
+}
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "SLACK_OAUTH_INSTALL_PATH"))) {
+  $config["SLACK_OAUTH_INSTALL_PATH"] = "/api/slack/install"
+}
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "SLACK_OAUTH_CALLBACK_PATH"))) {
+  $config["SLACK_OAUTH_CALLBACK_PATH"] = "/api/slack/oauth/callback"
+}
 $config["MODAL_API_MIN_CONTAINERS"] = "0"
 $config["MODAL_API_MAX_CONTAINERS"] = "1"
 $config["MODAL_API_ALLOW_CONCURRENT_INPUTS"] = "8"
 $config["MODAL_QUEUE_DRAIN_SECONDS"] = "180"
 $config["MODAL_CLEANUP_INTERVAL_MINUTES"] = "120"
 $config["MODAL_SKIP_WORKER_WHEN_QUEUE_EMPTY"] = "true"
+$config["WORKSPACE_RETENTION_HOURS"] = "12"
+$config["WORKSPACE_RETENTION_HOURS_WITH_PR"] = "72"
+$config["WORKSPACE_RETENTION_HOURS_WITHOUT_PR"] = "12"
+$config["WORKSPACE_RETENTION_HOURS_FAILED"] = "6"
+$config["WORKSPACE_CLEANUP_INTERVAL_MINUTES"] = "30"
+$config["OPENCODE_KEEP_TEMP_AGENTS"] = "false"
 $config["MODAL_ENV_SECRET_NAME"] = $ModalSecretName
 $config["DISABLE_AUTOMERGE"] = "true"
 
@@ -323,6 +498,23 @@ $resolvedBaseUrl = $resolvedBaseUrl.Trim()
 if ([string]::IsNullOrWhiteSpace($resolvedBaseUrl)) {
   throw "BASE_URL must be set to the public Modal URL (for example https://<workspace>--feature-factory-api.modal.run)."
 }
+try {
+  $baseUri = [Uri]$resolvedBaseUrl
+}
+catch {
+  throw "BASE_URL is not a valid absolute URL: $resolvedBaseUrl"
+}
+if (-not $baseUri.IsAbsoluteUri) {
+  throw "BASE_URL must be an absolute URL: $resolvedBaseUrl"
+}
+$normalizedBaseUrl = ("{0}://{1}" -f $baseUri.Scheme, $baseUri.Authority).TrimEnd("/")
+if ($baseUri.AbsolutePath -ne "/" -or -not [string]::IsNullOrWhiteSpace($baseUri.Query) -or -not [string]::IsNullOrWhiteSpace($baseUri.Fragment)) {
+  Write-Host "BASE_URL should be the origin only. Normalizing '$resolvedBaseUrl' -> '$normalizedBaseUrl'." -ForegroundColor Yellow
+}
+$resolvedBaseUrl = $normalizedBaseUrl
+if ($resolvedBaseUrl -ne (Get-MapValue -Map $config -Key "BASE_URL")) {
+  $config["BASE_URL"] = $resolvedBaseUrl
+}
 if ($resolvedBaseUrl -match "localhost|127\.0\.0\.1") {
   throw "BASE_URL cannot be localhost for production deployment: $resolvedBaseUrl"
 }
@@ -344,16 +536,19 @@ if ($authMode -in @("", "disabled", "none")) {
 }
 if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "API_AUTH_TOKEN"))) {
   $config["API_AUTH_TOKEN"] = New-RandomHexToken -NumBytes 32
+  $generatedEnvValues["API_AUTH_TOKEN"] = $config["API_AUTH_TOKEN"]
   Write-Host "Generated API_AUTH_TOKEN for production service calls." -ForegroundColor Yellow
 }
 $secretKey = Get-MapValue -Map $config -Key "SECRET_KEY"
 if ([string]::IsNullOrWhiteSpace($secretKey) -or @("dev-change-me", "change-me") -contains $secretKey.Trim()) {
   $config["SECRET_KEY"] = New-RandomHexToken -NumBytes 48
+  $generatedEnvValues["SECRET_KEY"] = $config["SECRET_KEY"]
   Write-Host "Generated production SECRET_KEY." -ForegroundColor Yellow
 }
 $webhookSecret = Get-MapValue -Map $config -Key "INTEGRATION_WEBHOOK_SECRET"
 if ([string]::IsNullOrWhiteSpace($webhookSecret) -or @("dev-webhook-secret", "change-me") -contains $webhookSecret.Trim()) {
   $config["INTEGRATION_WEBHOOK_SECRET"] = New-RandomHexToken -NumBytes 32
+  $generatedEnvValues["INTEGRATION_WEBHOOK_SECRET"] = $config["INTEGRATION_WEBHOOK_SECRET"]
   Write-Host "Generated INTEGRATION_WEBHOOK_SECRET." -ForegroundColor Yellow
 }
 
@@ -407,6 +602,22 @@ if ($githubEnabled) {
   $config["GITHUB_APP_INSTALLATION_ID"] = ""
 }
 
+$githubUserOauthEnabled = Is-Truthy (Get-MapValue -Map $config -Key "ENABLE_GITHUB_USER_OAUTH" -Default "false")
+$githubOauthClientId = (Get-MapValue -Map $config -Key "GITHUB_OAUTH_CLIENT_ID").Trim()
+$githubOauthClientSecret = (Get-MapValue -Map $config -Key "GITHUB_OAUTH_CLIENT_SECRET").Trim()
+if (-not $githubUserOauthEnabled -and -not [string]::IsNullOrWhiteSpace($githubOauthClientId) -and -not [string]::IsNullOrWhiteSpace($githubOauthClientSecret)) {
+  $githubUserOauthEnabled = $true
+  $config["ENABLE_GITHUB_USER_OAUTH"] = "true"
+}
+if ($githubUserOauthEnabled) {
+  Require-NonEmptyKeys -Map $config -Keys @("GITHUB_OAUTH_CLIENT_ID", "GITHUB_OAUTH_CLIENT_SECRET")
+  if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "GITHUB_USER_TOKEN_ENCRYPTION_KEY"))) {
+    $config["GITHUB_USER_TOKEN_ENCRYPTION_KEY"] = New-RandomHexToken -NumBytes 48
+    $generatedEnvValues["GITHUB_USER_TOKEN_ENCRYPTION_KEY"] = $config["GITHUB_USER_TOKEN_ENCRYPTION_KEY"]
+    Write-Host "Generated GITHUB_USER_TOKEN_ENCRYPTION_KEY for stable GitHub OAuth token encryption." -ForegroundColor Yellow
+  }
+}
+
 $coderunnerMode = Get-MapValue -Map $config -Key "CODERUNNER_MODE" -Default "opencode"
 $coderunnerMode = $coderunnerMode.Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($coderunnerMode)) {
@@ -454,6 +665,13 @@ if ([string]::IsNullOrWhiteSpace($slackMode)) {
   $slackMode = "http"
   $config["SLACK_MODE"] = $slackMode
 }
+$slackOauthEnabled = Is-Truthy (Get-MapValue -Map $config -Key "ENABLE_SLACK_OAUTH" -Default "false")
+$slackClientId = (Get-MapValue -Map $config -Key "SLACK_CLIENT_ID").Trim()
+$slackClientSecret = (Get-MapValue -Map $config -Key "SLACK_CLIENT_SECRET").Trim()
+if (-not $slackOauthEnabled -and -not [string]::IsNullOrWhiteSpace($slackClientId) -and -not [string]::IsNullOrWhiteSpace($slackClientSecret)) {
+  $slackOauthEnabled = $true
+  $config["ENABLE_SLACK_OAUTH"] = "true"
+}
 if ($slackEnabled) {
   if ($slackMode -eq "socket") {
     Write-Host "SLACK_MODE=socket is not supported by this Modal API deployment path; forcing SLACK_MODE=http." -ForegroundColor Yellow
@@ -472,13 +690,33 @@ if ($slackEnabled) {
     Write-Host "Clearing REVIEWER_ALLOWED_USERS to avoid hardcoded reviewer IDs." -ForegroundColor Yellow
   }
   $config["REVIEWER_ALLOWED_USERS"] = ""
-  Require-NonEmptyKeys -Map $config -Keys @("SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET")
-  Test-SlackBotToken -Token (Get-MapValue -Map $config -Key "SLACK_BOT_TOKEN")
-  Write-Host "Validated SLACK_BOT_TOKEN via Slack auth.test." -ForegroundColor Green
+  Require-NonEmptyKeys -Map $config -Keys @("SLACK_SIGNING_SECRET")
+  if ($slackOauthEnabled) {
+    Require-NonEmptyKeys -Map $config -Keys @("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "SLACK_APP_ID")
+    if (-not [string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "SLACK_BOT_TOKEN"))) {
+      Test-SlackBotToken -Token (Get-MapValue -Map $config -Key "SLACK_BOT_TOKEN")
+      Write-Host "Validated fallback SLACK_BOT_TOKEN via Slack auth.test." -ForegroundColor Green
+    }
+    else {
+      Write-Host "Slack OAuth mode enabled without static SLACK_BOT_TOKEN (expected for multi-workspace)." -ForegroundColor Yellow
+    }
+  }
+  else {
+    Require-NonEmptyKeys -Map $config -Keys @("SLACK_BOT_TOKEN")
+    Test-SlackBotToken -Token (Get-MapValue -Map $config -Key "SLACK_BOT_TOKEN")
+    Write-Host "Validated SLACK_BOT_TOKEN via Slack auth.test." -ForegroundColor Green
+  }
 
   if (-not $SkipSlackManifestSync) {
     Require-NonEmptyKeys -Map $config -Keys @("SLACK_APP_ID", "SLACK_APP_CONFIG_TOKEN")
   }
+}
+
+if ($generatedEnvValues.Count -gt 0) {
+  foreach ($key in $generatedEnvValues.Keys) {
+    Set-DotEnvValue -Path $resolvedEnvFile -Key $key -Value ([string]$generatedEnvValues[$key])
+  }
+  Write-Host "Persisted generated secret values to $resolvedEnvFile for stable redeploys." -ForegroundColor Green
 }
 
 Require-NonEmptyKeys -Map $config -Keys @(
@@ -602,19 +840,66 @@ try {
         $probeUrl = $resolvedBaseUrl.TrimEnd("/") + "/api/slack/events"
         $status = -1
         try {
-          $resp = Invoke-WebRequest -Method Get -Uri $probeUrl -TimeoutSec 45
-          $status = [int]$resp.StatusCode
+          $status = Get-HttpStatusCode -Url $probeUrl -AllowRedirect $false
         }
         catch {
-          if ($_.Exception.Response) {
-            $status = [int]$_.Exception.Response.StatusCode.value__
-          }
-          else {
+          $status = Get-StatusCodeFromException -ExceptionObject $_.Exception
+          if ($status -lt 0) {
             throw
           }
         }
         if ($status -ne 405) {
           throw "Expected GET $probeUrl to return 405 when Slack events route exists, got status $status."
+        }
+      }
+      if ($slackOauthEnabled) {
+        Invoke-WithRetry -Name "slack/oauth install route" -Action {
+          $installPath = (Get-MapValue -Map $config -Key "SLACK_OAUTH_INSTALL_PATH" -Default "/api/slack/install").Trim()
+          if ([string]::IsNullOrWhiteSpace($installPath)) {
+            $installPath = "/api/slack/install"
+          }
+          if (-not $installPath.StartsWith("/")) {
+            $installPath = "/" + $installPath
+          }
+          $probeUrl = $resolvedBaseUrl.TrimEnd("/") + $installPath
+          $status = -1
+          try {
+            $status = Get-HttpStatusCode -Url $probeUrl -AllowRedirect $false
+          }
+          catch {
+            $status = Get-StatusCodeFromException -ExceptionObject $_.Exception
+            if ($status -lt 0) {
+              throw
+            }
+          }
+          if ($status -ne 200 -and $status -ne 302 -and $status -ne 303) {
+            throw "Expected GET $probeUrl to return 200/302/303, got status $status."
+          }
+        }
+      }
+    }
+    if ($githubUserOauthEnabled) {
+      Invoke-WithRetry -Name "github/oauth install route" -Action {
+        $installPath = (Get-MapValue -Map $config -Key "GITHUB_OAUTH_INSTALL_PATH" -Default "/api/github/install").Trim()
+        if ([string]::IsNullOrWhiteSpace($installPath)) {
+          $installPath = "/api/github/install"
+        }
+        if (-not $installPath.StartsWith("/")) {
+          $installPath = "/" + $installPath
+        }
+        $probeUrl = $resolvedBaseUrl.TrimEnd("/") + $installPath + "?slack_user_id=healthcheck&slack_team_id=healthcheck"
+        $status = -1
+        try {
+          $status = Get-HttpStatusCode -Url $probeUrl -AllowRedirect $false
+        }
+        catch {
+          $status = Get-StatusCodeFromException -ExceptionObject $_.Exception
+          if ($status -lt 0) {
+            throw
+          }
+        }
+        if ($status -ne 200 -and $status -ne 302 -and $status -ne 303 -and $status -ne 307 -and $status -ne 308) {
+          throw "Expected GET $probeUrl to return 200/302/303/307/308, got status $status."
         }
       }
     }

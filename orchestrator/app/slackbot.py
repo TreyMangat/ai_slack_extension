@@ -13,27 +13,37 @@ from sqlalchemy import delete
 from app.config import get_settings
 from app.db import db_session
 from app.models import SlackIntakeSession
+from app.services.github_repo import parse_repo_slug
+from app.services.github_user_oauth import has_github_user_connection, resolve_github_user_access_token
+from app.services.slack_oauth import get_slack_oauth_runtime
 from app.services.reviewer_service import is_approver_allowed
 
 
 console = Console()
 
 QUESTION_BY_FIELD: dict[str, str] = {
-    "title": "What do you want to build?",
+    "title": "How can I help you?",
     "problem": "Describe what you want in one short paragraph (what to build + why).",
     "business_justification": "Why is this needed now?",
     "links": "Optional: share links/files in this thread, or reply `skip`.",
     "repo": "Do you know what project/repo this belongs to? Reply with `org/repo`, repo URL, or `unsure`.",
+    "base_branch": "Optional: which base branch should we open the PR against? Reply with branch name, or `skip`.",
     "implementation_mode": "Should implementation start from scratch or reuse existing project patterns? Reply `scratch` or `reuse`.",
     "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
     "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
     "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to use defaults.",
 }
 
-CREATE_FLOW_FIELDS = [
+CREATE_FLOW_FIELDS_MINIMAL = [
+    "title",
+    "repo",
+    "base_branch",
+]
+CREATE_FLOW_FIELDS_FULL = [
     "title",
     "problem",
     "repo",
+    "base_branch",
     "acceptance_criteria",
     "links",
 ]
@@ -48,11 +58,20 @@ UPDATE_FALLBACK_FIELDS = [
 ]
 
 SESSION_TTL_SECONDS = 2 * 60 * 60
+APP_HOME_WELCOME_TTL_SECONDS = 6 * 60 * 60
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 SKIP_TOKENS = {"skip", "n/a", "na", "none", "no", "not sure", "unsure", "unknown", "idk"}
 PRIMARY_SLASH_COMMAND = "/prfactory"
 LEGACY_SLASH_COMMAND = "/feature"
 GITHUB_HELP_SLASH_COMMAND = "/prfactory-github"
+INTAKE_MODE_NORMAL = "normal"
+INTAKE_MODE_DEVELOPER = "developer"
+REPO_OPTION_NONE = "__NONE__"
+REPO_OPTION_NEW = "__NEW__"
+REPO_OPTION_CONNECT = "__CONNECT__"
+BRANCH_OPTION_NONE = "__NONE__"
+BRANCH_OPTION_NEW = "__NEW__"
+GITHUB_OPTION_CACHE_TTL_SECONDS = 120
 
 
 @dataclass
@@ -60,6 +79,7 @@ class IntakeSession:
     mode: str  # create | update
     feature_id: str
     user_id: str
+    team_id: str
     channel_id: str
     thread_ts: str
     message_ts: str
@@ -71,6 +91,9 @@ class IntakeSession:
 
 
 ACTIVE_INTAKES: dict[str, IntakeSession] = {}
+APP_HOME_WELCOME_CACHE: dict[str, float] = {}
+GITHUB_REPO_OPTIONS_CACHE: dict[str, tuple[float, list[str]]] = {}
+GITHUB_BRANCH_OPTIONS_CACHE: dict[str, tuple[float, list[str]]] = {}
 
 
 def _parse_lines(text: str) -> list[str]:
@@ -128,11 +151,121 @@ def _normalize_mode(text: str) -> str:
 def _format_mode(mode: str) -> str:
     if mode == "reuse_existing":
         return "Reuse existing repo patterns"
-    return "Build from scratch"
+    return "Build in target repo (default)"
 
 
-def _session_key(*, channel_id: str, thread_ts: str, user_id: str) -> str:
-    return f"{channel_id}:{thread_ts}:{user_id}"
+def _normalize_intake_mode(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized == INTAKE_MODE_DEVELOPER:
+        return INTAKE_MODE_DEVELOPER
+    return INTAKE_MODE_NORMAL
+
+
+def _session_intake_mode(session: IntakeSession) -> str:
+    return _normalize_intake_mode(str((session.answers or {}).get("_intake_mode") or INTAKE_MODE_NORMAL))
+
+
+def _set_session_intake_mode(session: IntakeSession, mode: str) -> None:
+    session.answers["_intake_mode"] = _normalize_intake_mode(mode)
+
+
+def _intake_mode_label(mode: str) -> str:
+    return "Developer" if _normalize_intake_mode(mode) == INTAKE_MODE_DEVELOPER else "Normal"
+
+
+def _intake_mode_toggle_label(mode: str) -> str:
+    current = _normalize_intake_mode(mode)
+    if current == INTAKE_MODE_DEVELOPER:
+        return "Switch to Normal"
+    return "Switch to Developer"
+
+
+def _intake_controls_blocks(*, mode: str) -> list[dict[str, Any]]:
+    current_mode = _normalize_intake_mode(mode)
+    return [
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "ff_toggle_mode",
+                    "text": {"type": "plain_text", "text": _intake_mode_toggle_label(current_mode)},
+                    "value": current_mode,
+                },
+                {
+                    "type": "button",
+                    "action_id": "ff_show_help",
+                    "text": {"type": "plain_text", "text": "Help"},
+                    "value": "help",
+                },
+            ],
+        }
+    ]
+
+
+def _title_prompt_blocks(*, mode: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "text": {"type": "plain_text", "text": QUESTION_BY_FIELD["title"]},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": "Enter what you want to build, then reply in this thread."},
+            ],
+        },
+        *_intake_controls_blocks(mode=mode),
+    ]
+
+
+def _intake_help_text() -> str:
+    return (
+        "If PRFactory stops responding, refresh Slack scopes/events and reinstall the app "
+        "(see `docs/SETUP_SLACK.md`).\n"
+        "If repo dropdown is empty, reconnect GitHub via `/prfactory-github`."
+    )
+
+
+def _slugify_ref(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", (text or "").strip().lower()).strip("-")
+    if not cleaned:
+        return "request"
+    parts = [part for part in cleaned.split("-") if part][:3]
+    return "-".join(parts)[:32] or "request"
+
+
+def _feature_reference(*, feature_id: str, title: str) -> str:
+    fid = (feature_id or "").strip()
+    short = fid[:8] if len(fid) >= 8 else fid
+    slug = _slugify_ref(title)
+    return f"{slug}-{short}" if short else slug
+
+
+def _welcome_cache_key(*, team_id: str, user_id: str) -> str:
+    return f"{team_id}:{user_id}"
+
+
+def _should_send_app_home_welcome(*, team_id: str, user_id: str) -> bool:
+    if not user_id:
+        return False
+
+    now = time.time()
+    threshold = now - APP_HOME_WELCOME_TTL_SECONDS
+    for key, seen_at in list(APP_HOME_WELCOME_CACHE.items()):
+        if seen_at < threshold:
+            APP_HOME_WELCOME_CACHE.pop(key, None)
+
+    key = _welcome_cache_key(team_id=team_id, user_id=user_id)
+    previous = APP_HOME_WELCOME_CACHE.get(key, 0.0)
+    if previous and (now - previous) < APP_HOME_WELCOME_TTL_SECONDS:
+        return False
+    APP_HOME_WELCOME_CACHE[key] = now
+    return True
+
+
+def _session_key(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> str:
+    return f"{team_id}:{channel_id}:{thread_ts}:{user_id}"
 
 
 def _cleanup_expired_sessions() -> None:
@@ -161,6 +294,7 @@ def _session_from_record(record: SlackIntakeSession) -> IntakeSession:
         mode=str(record.mode or "create"),
         feature_id=str(record.feature_id or ""),
         user_id=str(record.user_id or ""),
+        team_id=str(getattr(record, "team_id", "") or ""),
         channel_id=str(record.channel_id or ""),
         thread_ts=str(record.thread_ts or ""),
         message_ts=str(record.message_ts or ""),
@@ -174,7 +308,12 @@ def _session_from_record(record: SlackIntakeSession) -> IntakeSession:
 
 def _store_session(session: IntakeSession) -> None:
     _cleanup_expired_sessions()
-    key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
+    key = _session_key(
+        team_id=session.team_id,
+        channel_id=session.channel_id,
+        thread_ts=session.thread_ts,
+        user_id=session.user_id,
+    )
     ACTIVE_INTAKES[key] = session
     try:
         with db_session() as db:
@@ -186,6 +325,7 @@ def _store_session(session: IntakeSession) -> None:
             row.mode = session.mode
             row.feature_id = session.feature_id
             row.user_id = session.user_id
+            row.team_id = session.team_id
             row.channel_id = session.channel_id
             row.thread_ts = session.thread_ts
             row.message_ts = session.message_ts
@@ -200,9 +340,9 @@ def _store_session(session: IntakeSession) -> None:
         console.print(f"[yellow]slack intake DB persistence failed: {e}[/yellow]")
 
 
-def _get_session(*, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
+def _get_session(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
     _cleanup_expired_sessions()
-    key = _session_key(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+    key = _session_key(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
     cached = ACTIVE_INTAKES.get(key)
     if cached:
         return cached
@@ -225,7 +365,12 @@ def _get_session(*, channel_id: str, thread_ts: str, user_id: str) -> IntakeSess
 
 
 def _drop_session(session: IntakeSession) -> None:
-    key = _session_key(channel_id=session.channel_id, thread_ts=session.thread_ts, user_id=session.user_id)
+    key = _session_key(
+        team_id=session.team_id,
+        channel_id=session.channel_id,
+        thread_ts=session.thread_ts,
+        user_id=session.user_id,
+    )
     ACTIVE_INTAKES.pop(key, None)
     try:
         with db_session() as db:
@@ -240,8 +385,10 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
     fid = feature["id"]
     status = feature["status"]
     title = feature["title"]
+    ref = _feature_reference(feature_id=fid, title=title)
     spec = feature.get("spec") or {}
-    mode = spec.get("implementation_mode", "new_feature")
+    mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
+    mode_label = _format_mode(mode)
     preview = feature.get("preview_url") or ""
     pr = feature.get("github_pr_url") or ""
     repo_hint = str(spec.get("repo") or "").strip()
@@ -289,7 +436,7 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*{title}*\nStatus: `{status}`\nMode: `{mode}`\nID: `{fid}`\n"
+                    f"*{title}*\nStatus: `{status}`\nMode: `{mode}` ({mode_label})\nRef: `{ref}`\nID: `{fid}`\n"
                     f"Missing details: `{missing_summary}`"
                 ),
             },
@@ -331,22 +478,382 @@ def _post_clarification_prompt(client: Any, channel_id: str, thread_ts: str, fea
     client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=prompt)
 
 
+def _github_connect_url_for_user(settings: Any, *, user_id: str, team_id: str = "") -> str:
+    normalized_user = (user_id or "").strip()
+    normalized_team = (team_id or "").strip()
+    if settings.github_user_oauth_enabled() and normalized_user:
+        return settings.github_oauth_install_url_for_user(
+            slack_user_id=normalized_user,
+            slack_team_id=normalized_team,
+        )
+    return settings.github_app_install_url_resolved()
+
+
+def _github_user_connected(settings: Any, *, user_id: str, team_id: str) -> bool:
+    if not settings.github_user_oauth_enabled():
+        return True
+    normalized_user = (user_id or "").strip()
+    if not normalized_user:
+        return False
+    return bool(
+        resolve_github_user_access_token(
+            slack_user_id=normalized_user,
+            slack_team_id=(team_id or "").strip(),
+        )
+    )
+
+
+def _github_status_line_for_user(settings: Any, *, user_id: str, team_id: str) -> str:
+    if settings.github_user_oauth_enabled():
+        if _github_user_connected(settings, user_id=user_id, team_id=team_id):
+            return "GitHub account status: connected."
+        install_url = _github_connect_url_for_user(settings, user_id=user_id, team_id=team_id)
+        if install_url:
+            return f"GitHub account status: not connected yet. Connect here: {install_url}"
+        return "GitHub account status: not connected yet. Use `/prfactory-github` for setup steps."
+    install_url = settings.github_app_install_url_resolved()
+    if install_url:
+        return f"GitHub app install URL: {install_url}"
+    return "Use `/prfactory-github` for GitHub setup guidance."
+
+
+def _cache_key_for_user(*, user_id: str, team_id: str) -> str:
+    return f"{(team_id or '').strip()}:{(user_id or '').strip()}"
+
+
+def _github_api_headers(*, token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _resolve_github_user_token(*, user_id: str, team_id: str) -> str:
+    token = resolve_github_user_access_token(slack_user_id=user_id, slack_team_id=team_id)
+    if token or not (team_id or "").strip():
+        return token
+    # Fallback to user-wide token in case team scoping changed.
+    return resolve_github_user_access_token(slack_user_id=user_id, slack_team_id="")
+
+
+def _fetch_repositories_for_user(
+    settings: Any,
+    *,
+    user_id: str,
+    team_id: str,
+    timeout_seconds: float = 2.5,
+) -> list[str]:
+    if not settings.github_user_oauth_enabled():
+        return []
+    token = _resolve_github_user_token(user_id=user_id, team_id=team_id)
+    if not token:
+        return []
+
+    cache_key = _cache_key_for_user(user_id=user_id, team_id=team_id)
+    now = time.time()
+    cached = GITHUB_REPO_OPTIONS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < GITHUB_OPTION_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    repos: list[str] = []
+    try:
+        response = httpx.get(
+            f"{settings.github_api_base.rstrip('/')}/user/repos",
+            params={
+                "per_page": 100,
+                "sort": "updated",
+                "affiliation": "owner,collaborator,organization_member",
+            },
+            headers=_github_api_headers(token=token),
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                full_name = str(item.get("full_name") or "").strip()
+                owner, repo = parse_repo_slug(full_name)
+                if owner and repo:
+                    repos.append(f"{owner}/{repo}")
+    except Exception as e:
+        console.print(
+            f"[yellow]github_repo_fetch_failed user={user_id} team={team_id} "
+            f"url={settings.github_api_base.rstrip('/')}/user/repos error={e}[/yellow]"
+        )
+        repos = []
+
+    deduped = _dedupe(repos)
+    if deduped:
+        GITHUB_REPO_OPTIONS_CACHE[cache_key] = (now, deduped)
+    else:
+        GITHUB_REPO_OPTIONS_CACHE.pop(cache_key, None)
+    return deduped
+
+
+def _fetch_branches_for_repo(
+    settings: Any,
+    *,
+    user_id: str,
+    team_id: str,
+    repo_slug: str,
+    timeout_seconds: float = 2.5,
+) -> list[str]:
+    owner, repo = parse_repo_slug(repo_slug)
+    if not owner or not repo or not settings.github_user_oauth_enabled():
+        return []
+
+    token = _resolve_github_user_token(user_id=user_id, team_id=team_id)
+    if not token:
+        return []
+
+    cache_key = f"{_cache_key_for_user(user_id=user_id, team_id=team_id)}:{owner}/{repo}"
+    now = time.time()
+    cached = GITHUB_BRANCH_OPTIONS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < GITHUB_OPTION_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    branches: list[str] = []
+    try:
+        response = httpx.get(
+            f"{settings.github_api_base.rstrip('/')}/repos/{owner}/{repo}/branches",
+            params={"per_page": 100},
+            headers=_github_api_headers(token=token),
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if name:
+                    branches.append(name)
+    except Exception as e:
+        console.print(
+            f"[yellow]github_branch_fetch_failed user={user_id} team={team_id} repo={owner}/{repo} "
+            f"error={e}[/yellow]"
+        )
+        branches = []
+
+    deduped = _dedupe(branches)
+    if deduped:
+        GITHUB_BRANCH_OPTIONS_CACHE[cache_key] = (now, deduped)
+    else:
+        GITHUB_BRANCH_OPTIONS_CACHE.pop(cache_key, None)
+    return deduped
+
+
+def _slack_option(*, text: str, value: str) -> dict[str, Any]:
+    option_text = (text or "").strip() or value
+    option_value = (value or "").strip() or option_text
+    return {
+        "text": {"type": "plain_text", "text": option_text[:75]},
+        "value": option_value[:200],
+    }
+
+
+def _fallback_repo_options() -> list[dict[str, Any]]:
+    return [
+        _slack_option(text="None (use defaults)", value=REPO_OPTION_NONE),
+        _slack_option(text="New repo (I will type it)", value=REPO_OPTION_NEW),
+    ]
+
+
+def _fallback_branch_options() -> list[dict[str, Any]]:
+    return [
+        _slack_option(text="None (use default branch)", value=BRANCH_OPTION_NONE),
+        _slack_option(text="Type branch name", value=BRANCH_OPTION_NEW),
+    ]
+
+
+def _warm_repo_cache(settings: Any, *, user_id: str, team_id: str) -> None:
+    try:
+        _fetch_repositories_for_user(
+            settings,
+            user_id=user_id,
+            team_id=team_id,
+            timeout_seconds=8.0,
+        )
+    except Exception:
+        pass
+
+
+def _warm_branch_cache(settings: Any, *, user_id: str, team_id: str, repo_slug: str) -> None:
+    try:
+        _fetch_branches_for_repo(
+            settings,
+            user_id=user_id,
+            team_id=team_id,
+            repo_slug=repo_slug,
+            timeout_seconds=8.0,
+        )
+    except Exception:
+        pass
+
+
+def _repo_options_for_slack(
+    settings: Any,
+    *,
+    user_id: str,
+    team_id: str,
+    query: str,
+) -> list[dict[str, Any]]:
+    raw_query = (query or "").strip()
+    typed = raw_query.lower()
+    options = _fallback_repo_options()
+    has_user_token = False
+    has_saved_connection = False
+    try:
+        has_user_token = bool(_resolve_github_user_token(user_id=user_id, team_id=team_id))
+    except Exception:
+        has_user_token = False
+    try:
+        has_saved_connection = bool(has_github_user_connection(slack_user_id=user_id, slack_team_id=team_id))
+    except Exception:
+        has_saved_connection = False
+
+    if raw_query:
+        owner, repo = parse_repo_slug(raw_query)
+        repo_candidate = f"{owner}/{repo}" if owner and repo else raw_query
+        options.append(_slack_option(text=f"Use {repo_candidate}", value=repo_candidate))
+
+    default_repo = ""
+    if (settings.github_repo_owner or "").strip() and (settings.github_repo_name or "").strip():
+        default_repo = f"{settings.github_repo_owner.strip()}/{settings.github_repo_name.strip()}"
+    if default_repo:
+        options.append(_slack_option(text=f"Default: {default_repo}", value=default_repo))
+
+    repos = _fetch_repositories_for_user(settings, user_id=user_id, team_id=team_id)
+    if not repos and settings.github_user_oauth_enabled() and not has_user_token:
+        console.print(
+            f"[yellow]slack_repo_options_empty user={user_id} team={team_id} "
+            f"has_token=false has_saved_connection={str(has_saved_connection).lower()}[/yellow]"
+        )
+        if has_saved_connection:
+            options.append(_slack_option(text="Reconnect GitHub (refresh token)", value=REPO_OPTION_CONNECT))
+        else:
+            options.append(_slack_option(text="Connect GitHub to load repos", value=REPO_OPTION_CONNECT))
+        return _dedupe_options(options)[:100]
+    if not repos and settings.github_user_oauth_enabled() and has_user_token:
+        console.print(
+            f"[yellow]slack_repo_options_empty user={user_id} team={team_id} "
+            "has_token=true has_saved_connection=true[/yellow]"
+        )
+        options.append(_slack_option(text="No repos returned - type org/repo", value=REPO_OPTION_NEW))
+        return _dedupe_options(options)[:100]
+
+    for slug in repos:
+        if typed and typed not in slug.lower():
+            continue
+        options.append(_slack_option(text=slug, value=slug))
+        if len(options) >= 100:
+            break
+    return _dedupe_options(options)[:100]
+
+
+def _branch_options_for_slack(
+    settings: Any,
+    *,
+    user_id: str,
+    team_id: str,
+    repo_slug: str,
+    query: str,
+) -> list[dict[str, Any]]:
+    raw_query = (query or "").strip()
+    typed = raw_query.lower()
+    options = _fallback_branch_options()
+    if raw_query and re.match(r"^[A-Za-z0-9._/-]+$", raw_query):
+        options.append(_slack_option(text=f"Use {raw_query}", value=raw_query))
+    branches = _fetch_branches_for_repo(settings, user_id=user_id, team_id=team_id, repo_slug=repo_slug)
+    for branch in branches:
+        if typed and typed not in branch.lower():
+            continue
+        options.append(_slack_option(text=branch, value=branch))
+        if len(options) >= 100:
+            break
+    return _dedupe_options(options)[:100]
+
+
+def _dedupe_options(options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for option in options:
+        value = str((option.get("value") or "")).strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(option)
+    return deduped
+
+
+def _developer_mode_repo_blocks(*, options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Target repo (optional).",
+            },
+            "accessory": {
+                "type": "static_select",
+                "action_id": "ff_repo_select",
+                "placeholder": {"type": "plain_text", "text": "Select repo"},
+                "options": options[:100],
+            },
+        }
+    ]
+
+
+def _developer_mode_branch_blocks(*, repo_slug: str, options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    repo_text = repo_slug or "(none)"
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"Base branch for `{repo_text}` (optional).",
+            },
+            "accessory": {
+                "type": "static_select",
+                "action_id": "ff_branch_select",
+                "placeholder": {"type": "plain_text", "text": "Select branch"},
+                "options": options[:100],
+            },
+        }
+    ]
+
+
 def _intro_message(settings: Any) -> str:
     app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
-    install_url = settings.github_app_install_url_resolved()
-    github_line = (
-        f"- connect GitHub: {install_url}"
-        if install_url
-        else "- connect GitHub with `/prfactory-github` (ask admin to set app install URL if missing)"
+    slack_install_url = settings.slack_oauth_install_url_resolved()
+    github_line = "- connect GitHub when prompted in-thread (or run `/prfactory-github`)"
+    if not settings.github_user_oauth_enabled():
+        install_url = settings.github_app_install_url_resolved()
+        if install_url:
+            github_line = f"- connect GitHub: {install_url}"
+    workspace_line = (
+        f"- install {app_name} in another workspace: {slack_install_url}"
+        if settings.slack_oauth_enabled() and slack_install_url
+        else ""
     )
-    return (
-        f"Hi! I am {app_name}. Use `{PRIMARY_SLASH_COMMAND} <what you want built>` in this channel and I will:\n"
-        "- collect details in-thread,\n"
-        "- create a tracked feature request,\n"
-        "- and start a build that opens a PR for review.\n"
-        f"{github_line}\n"
-        f"Dashboard: {settings.base_url}"
-    )
+    lines = [
+        f"Hi! I am {app_name}. Use `{PRIMARY_SLASH_COMMAND} <what you want built>` in this channel and I will:",
+        "- collect details in-thread,",
+        "- create a tracked feature request,",
+        "- and start a build that opens a PR for review.",
+        github_line,
+    ]
+    if workspace_line:
+        lines.append(workspace_line)
+    lines.append(f"Dashboard: {settings.base_url}")
+    return "\n".join(lines)
 
 
 def _post_intro_messages(
@@ -355,6 +862,7 @@ def _post_intro_messages(
     *,
     channel_id: str,
     inviter_id: str,
+    team_id: str,
     logger: Any,
 ) -> None:
     text = _intro_message(settings)
@@ -367,17 +875,21 @@ def _post_intro_messages(
         return
 
     app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
-    install_url = settings.github_app_install_url_resolved()
-    github_help_line = (
-        f"Connect GitHub App here: {install_url}"
-        if install_url
-        else "Use `/prfactory-github` for GitHub setup guidance."
+    slack_install_url = settings.slack_oauth_install_url_resolved()
+    github_help_line = _github_status_line_for_user(settings, user_id=inviter_id, team_id=team_id)
+    workspace_help_line = (
+        f"Install link for additional Slack workspaces: {slack_install_url}"
+        if settings.slack_oauth_enabled() and slack_install_url
+        else ""
     )
-    dm_text = (
-        f"Thanks for adding {app_name}.\n"
-        f"Anyone in that channel can now use `{PRIMARY_SLASH_COMMAND}` or `{LEGACY_SLASH_COMMAND}` to request work.\n"
-        f"{github_help_line}"
-    )
+    dm_lines = [
+        f"Thanks for adding {app_name}.",
+        f"Anyone in that channel can now use `{PRIMARY_SLASH_COMMAND}` or `{LEGACY_SLASH_COMMAND}` to request work.",
+        github_help_line,
+    ]
+    if workspace_help_line:
+        dm_lines.append(workspace_help_line)
+    dm_text = "\n".join(dm_lines)
     try:
         client.chat_postMessage(channel=inviter_id, text=dm_text)
     except Exception as e:  # noqa: BLE001
@@ -447,6 +959,7 @@ def _default_spec() -> dict[str, Any]:
         "acceptance_criteria": [],
         "non_goals": [],
         "repo": "",
+        "base_branch": "",
         "implementation_mode": "new_feature",
         "source_repos": [],
         "risk_flags": [],
@@ -455,12 +968,14 @@ def _default_spec() -> dict[str, Any]:
     }
 
 
-def _build_create_queue(*, has_title: bool, require_repo: bool) -> list[str]:
-    queue = list(CREATE_FLOW_FIELDS)
+def _build_create_queue(*, has_title: bool, require_repo: bool, minimal: bool = True) -> list[str]:
+    queue = list(CREATE_FLOW_FIELDS_MINIMAL if minimal else CREATE_FLOW_FIELDS_FULL)
     if has_title:
         queue.remove("title")
     if not require_repo and "repo" in queue:
         queue.remove("repo")
+    if "repo" not in queue and "base_branch" in queue:
+        queue.remove("base_branch")
     return queue
 
 
@@ -486,6 +1001,11 @@ def _build_update_queue(feature: dict[str, Any]) -> list[str]:
 def _next_field(session: IntakeSession) -> str:
     while session.queue:
         current = session.queue[0]
+        if current == "base_branch":
+            repo_value = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
+            if _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
+                session.queue.pop(0)
+                continue
         if current == "source_repos":
             mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
             if mode != "reuse_existing":
@@ -495,10 +1015,89 @@ def _next_field(session: IntakeSession) -> str:
     return ""
 
 
+def _repo_selection_mutable(session: IntakeSession) -> bool:
+    current = _next_field(session)
+    if current == "repo":
+        return True
+    if current == "base_branch" and session.mode == "create" and _session_intake_mode(session) == INTAKE_MODE_DEVELOPER:
+        return True
+    return False
+
+
 def _ask_next_question(client: Any, session: IntakeSession) -> None:
     field = _next_field(session)
     if not field:
         return
+    if session.mode == "create" and _session_intake_mode(session) == INTAKE_MODE_DEVELOPER:
+        if field == "repo":
+            settings = get_settings()
+            _warm_repo_cache(settings=settings, user_id=session.user_id, team_id=session.team_id)
+            options = _repo_options_for_slack(
+                settings,
+                user_id=session.user_id,
+                team_id=session.team_id,
+                query="",
+            )
+            text = "Select a repo, or type `org/repo`."
+            existing_ts = str(session.answers.get("_repo_prompt_ts") or "").strip()
+            if existing_ts:
+                try:
+                    client.chat_update(
+                        channel=session.channel_id,
+                        ts=existing_ts,
+                        text=text,
+                        blocks=_developer_mode_repo_blocks(options=options),
+                    )
+                    return
+                except Exception:
+                    pass
+            msg = client.chat_postMessage(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts,
+                text=text,
+                blocks=_developer_mode_repo_blocks(options=options),
+            )
+            session.answers["_repo_prompt_ts"] = str(msg.get("ts") or "").strip()
+            _store_session(session)
+            return
+        if field == "base_branch":
+            repo_slug = str(session.answers.get("repo") or "").strip()
+            settings = get_settings()
+            _warm_branch_cache(
+                settings=settings,
+                user_id=session.user_id,
+                team_id=session.team_id,
+                repo_slug=repo_slug,
+            )
+            options = _branch_options_for_slack(
+                settings,
+                user_id=session.user_id,
+                team_id=session.team_id,
+                repo_slug=repo_slug,
+                query="",
+            )
+            text = "Select a base branch, or type one."
+            existing_ts = str(session.answers.get("_branch_prompt_ts") or "").strip()
+            if existing_ts:
+                try:
+                    client.chat_update(
+                        channel=session.channel_id,
+                        ts=existing_ts,
+                        text=text,
+                        blocks=_developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
+                    )
+                    return
+                except Exception:
+                    pass
+            msg = client.chat_postMessage(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts,
+                text=text,
+                blocks=_developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
+            )
+            session.answers["_branch_prompt_ts"] = str(msg.get("ts") or "").strip()
+            _store_session(session)
+            return
     prompt = QUESTION_BY_FIELD.get(field, f"Please provide `{field}`.")
     if session.mode == "update":
         prompt = f"Update request: {prompt}"
@@ -533,13 +1132,28 @@ def _capture_field_answer(
 
     if field == "repo":
         if not text or _is_skip(text):
-            if require_repo:
+            if require_repo and _session_intake_mode(session) != INTAKE_MODE_DEVELOPER:
                 return False, "Target repo is required. Reply with `org/repo`."
             session.answers["repo"] = ""
             return True, "Repo left unspecified."
-        session.answers["repo"] = text.splitlines()[0].strip()
+        repo_input = text.splitlines()[0].strip()
+        owner, repo = parse_repo_slug(repo_input)
+        if owner and repo:
+            repo_input = f"{owner}/{repo}"
+        session.answers["repo"] = repo_input
         session.asked_fields.add("repo")
         return True, "Captured repo/project."
+
+    if field == "base_branch":
+        if not text or _is_skip(text):
+            session.answers["base_branch"] = ""
+            return True, "Using default branch."
+        branch = text.splitlines()[0].strip()
+        if not re.match(r"^[A-Za-z0-9._/-]+$", branch):
+            return False, "Branch name can only include letters, numbers, `.`, `_`, `/`, and `-`."
+        session.answers["base_branch"] = branch
+        session.asked_fields.add("base_branch")
+        return True, f"Base branch set to `{branch}`."
 
     if field == "implementation_mode":
         mode = _normalize_mode(text)
@@ -589,11 +1203,21 @@ def _capture_field_answer(
 def _create_spec_from_session(session: IntakeSession) -> dict[str, Any]:
     spec = _default_spec()
     spec.update(session.answers)
+    spec.pop("_intake_mode", None)
+    spec.pop("_seed_title", None)
+    spec.pop("_controls_message_ts", None)
+    spec.pop("_repo_prompt_ts", None)
+    spec.pop("_branch_prompt_ts", None)
 
     mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
     spec["implementation_mode"] = mode
+    spec["repo"] = str(spec.get("repo") or "").strip()
+    spec["base_branch"] = str(spec.get("base_branch") or "").strip()
     spec["source_repos"] = [str(x).strip() for x in (spec.get("source_repos") or []) if str(x).strip()]
     spec["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
+    if not str(spec.get("problem") or "").strip():
+        title = str(spec.get("title") or "").strip()
+        spec["problem"] = title if title else "Requested via Slack intake."
     if not str(spec.get("business_justification") or "").strip():
         problem = str(spec.get("problem") or "").strip()
         spec["business_justification"] = (
@@ -624,66 +1248,70 @@ def _update_patch_from_session(session: IntakeSession) -> dict[str, Any]:
     return patch
 
 
-def _start_create_intake(client: Any, settings: Any, *, channel_id: str, user_id: str, seed_title: str) -> None:
+def _start_create_intake(
+    client: Any,
+    settings: Any,
+    *,
+    team_id: str,
+    channel_id: str,
+    user_id: str,
+    seed_title: str,
+) -> None:
     msg = client.chat_postMessage(
         channel=channel_id,
-        text=f"Feature request intake started by <@{user_id}>. Reply in this thread.",
+        text=f"Got it - feature request intake started by <@{user_id}>. Reply in this thread.",
     )
     thread_ts = msg["ts"]
 
     answers: dict[str, Any] = {}
+    answers["_intake_mode"] = INTAKE_MODE_NORMAL
     if seed_title:
-        answers["title"] = seed_title[:200]
+        answers["_seed_title"] = seed_title[:200]
 
     require_repo = _repo_required_for_slack_intake(settings)
     session = IntakeSession(
         mode="create",
         feature_id="",
         user_id=user_id,
+        team_id=team_id,
         channel_id=channel_id,
         thread_ts=thread_ts,
         message_ts=thread_ts,
-        queue=_build_create_queue(has_title=bool(seed_title), require_repo=require_repo),
+        # Minimal intake is default: prompt + repo only.
+        queue=_build_create_queue(
+            has_title=False,
+            require_repo=require_repo,
+            minimal=bool(settings.slack_intake_minimal),
+        ),
         answers=answers,
     )
-    if seed_title:
-        session.asked_fields.add("title")
 
     _store_session(session)
 
-    if seed_title:
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=f"Captured request title: *{seed_title[:200]}*",
-        )
-
-    client.chat_postMessage(
+    controls_message = client.chat_postMessage(
         channel=channel_id,
         thread_ts=thread_ts,
-        text=(
-            "I will ask a few short questions in this thread and then start the build automatically.\n"
-            "If I stop responding after your reply, update Slack app scopes/events per `docs/SETUP_SLACK.md` and reinstall."
-        ),
+        text=QUESTION_BY_FIELD["title"],
+        blocks=_title_prompt_blocks(mode=_session_intake_mode(session)),
     )
-    if require_repo:
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text="For production builds, please provide the target repo as `org/repo` when asked.",
-        )
-        install_url = settings.github_app_install_url_resolved()
-        if install_url:
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=f"Before your first build, connect GitHub App access here: {install_url}",
-            )
+    session.answers["_controls_message_ts"] = str(controls_message.get("ts") or "").strip()
+    _store_session(session)
 
-    _ask_next_question(client, session)
+    if _next_field(session) != "title":
+        _ask_next_question(client, session)
 
 
-def _start_update_intake(client: Any, settings: Any, *, feature: dict[str, Any], channel_id: str, thread_ts: str, user_id: str, message_ts: str) -> None:
+def _start_update_intake(
+    client: Any,
+    settings: Any,
+    *,
+    feature: dict[str, Any],
+    team_id: str,
+    channel_id: str,
+    thread_ts: str,
+    user_id: str,
+    message_ts: str,
+) -> None:
     spec = feature.get("spec") or {}
     queue = _build_update_queue(feature)
     answers: dict[str, Any] = {}
@@ -694,6 +1322,7 @@ def _start_update_intake(client: Any, settings: Any, *, feature: dict[str, Any],
         mode="update",
         feature_id=str(feature.get("id") or ""),
         user_id=user_id,
+        team_id=team_id,
         channel_id=channel_id,
         thread_ts=thread_ts,
         message_ts=message_ts,
@@ -731,10 +1360,11 @@ def _enqueue_build_for_feature(
             headers=headers,
         )
     except Exception as e:  # noqa: BLE001
-        return False, f"Failed to contact build endpoint: `{e}`", None
+        return False, f"Failed to contact build endpoint: `{e}`", {"retryable": True}
 
     if r.status_code >= 400:
         detail_text = ""
+        detail_payload: dict[str, Any] = {}
         try:
             payload = r.json()
             detail = payload.get("detail")
@@ -743,6 +1373,12 @@ def _enqueue_build_for_feature(
                 base_message = str(detail.get("message") or "").strip()
                 next_action = str(detail.get("next_action") or "").strip()
                 install_url = str(detail.get("install_url") or "").strip()
+                detail_payload = {
+                    "missing": missing,
+                    "message": base_message,
+                    "next_action": next_action,
+                    "install_url": install_url,
+                }
                 if missing:
                     detail_text = f"{base_message} Missing: {', '.join(missing)}."
                 else:
@@ -757,7 +1393,10 @@ def _enqueue_build_for_feature(
             detail_text = (r.text or "").strip()
         if not detail_text:
             detail_text = f"HTTP {r.status_code}"
-        return False, f"Build was not accepted: {detail_text}", None
+        if detail_payload:
+            message_blob = f"{detail_payload.get('message', '')} {detail_text}".lower()
+            detail_payload["needs_github_user_oauth"] = "no github user oauth token" in message_blob
+        return False, f"Build was not accepted: {detail_text}", detail_payload or {"retryable": True}
 
     payload = r.json() if r.content else {}
     if bool(payload.get("already_in_progress")):
@@ -771,6 +1410,61 @@ def _enqueue_build_for_feature(
     return True, "Build request accepted.", payload
 
 
+def _action_context(body: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
+    container = body.get("container") or {}
+    channel_id = str(body.get("channel", {}).get("id") or container.get("channel_id") or "").strip()
+    user_id = str(body.get("user", {}).get("id") or body.get("user_id") or "").strip()
+    message = body.get("message") or {}
+    thread_ts = str(
+        message.get("thread_ts")
+        or container.get("thread_ts")
+        or message.get("ts")
+        or container.get("message_ts")
+        or ""
+    ).strip()
+    message_ts = str(message.get("ts") or container.get("message_ts") or "").strip()
+    return team_id, channel_id, user_id, thread_ts, message_ts
+
+
+def _post_build_retry_message(
+    client: Any,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    feature_id: str,
+    text: str,
+    install_url: str = "",
+) -> None:
+    elements: list[dict[str, Any]] = []
+    if install_url:
+        elements.append(
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Connect GitHub"},
+                "url": install_url,
+            }
+        )
+    elements.append(
+        {
+            "type": "button",
+            "action_id": "ff_run_build",
+            "text": {"type": "plain_text", "text": "Retry build"},
+            "style": "primary",
+            "value": feature_id,
+        }
+    )
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {"type": "actions", "elements": elements},
+        ],
+    )
+
+
 def _finalize_create_session(client: Any, settings: Any, session: IntakeSession) -> None:
     spec = _create_spec_from_session(session)
     title = str(spec.get("title") or "").strip() or "(untitled feature)"
@@ -778,6 +1472,7 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
     payload = {
         "spec": spec,
         "requester_user_id": session.user_id,
+        "slack_team_id": session.team_id,
         "slack_channel_id": session.channel_id,
         "slack_thread_ts": session.thread_ts,
         "slack_message_ts": session.message_ts,
@@ -815,7 +1510,8 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
         channel=session.channel_id,
         thread_ts=session.thread_ts,
         text=(
-            f"Created request `{feature['id']}` with status `{feature['status']}`.\n"
+            f"Created request `{_feature_reference(feature_id=str(feature.get('id') or ''), title=title)}` "
+            f"(id: `{feature['id']}`) with status `{feature['status']}`.\n"
             f"Mode: {_format_mode(str(spec.get('implementation_mode', 'new_feature')))}"
         ),
     )
@@ -824,7 +1520,7 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
         return
 
     if feature.get("status") == "READY_FOR_BUILD":
-        ok, note, _payload = _enqueue_build_for_feature(
+        ok, note, payload = _enqueue_build_for_feature(
             settings,
             feature_id=str(feature.get("id") or ""),
             actor_id=session.user_id,
@@ -843,10 +1539,14 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
         except Exception:
             pass
         if not ok:
-            client.chat_postMessage(
-                channel=session.channel_id,
+            install_url = str((payload or {}).get("install_url") or "").strip()
+            _post_build_retry_message(
+                client,
+                channel_id=session.channel_id,
                 thread_ts=session.thread_ts,
-                text="Use *Add details in chat* to fix missing fields, then run build again.",
+                feature_id=str(feature.get("id") or ""),
+                text="If you fixed auth/settings, click *Retry build*.",
+                install_url=install_url,
             )
 
 
@@ -909,25 +1609,31 @@ def _finalize_update_session(client: Any, settings: Any, session: IntakeSession)
 def create_slack_bolt_app(settings: Any):
     from slack_bolt import App
 
-    app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret or "")
-    cached_bot_user_id = ""
+    oauth_runtime = get_slack_oauth_runtime()
+    app_kwargs: dict[str, Any] = {"signing_secret": settings.slack_signing_secret or ""}
+    if oauth_runtime is not None:
+        app_kwargs["oauth_settings"] = oauth_runtime.oauth_settings
+        app_kwargs["installation_store"] = oauth_runtime.installation_store
+        app_kwargs["installation_store_bot_only"] = True
+        if (settings.slack_bot_token or "").strip():
+            app_kwargs["token"] = settings.slack_bot_token
+    else:
+        app_kwargs["token"] = settings.slack_bot_token
 
+    app = App(**app_kwargs)
     def _resolve_bot_user_id(client: Any) -> str:
-        nonlocal cached_bot_user_id
-        if cached_bot_user_id:
-            return cached_bot_user_id
         try:
             payload = client.auth_test()
-            cached_bot_user_id = str(payload.get("user_id") or "").strip()
+            return str(payload.get("user_id") or "").strip()
         except Exception:
-            cached_bot_user_id = ""
-        return cached_bot_user_id
+            return ""
 
     @app.event("member_joined_channel")
-    def handle_member_joined_channel(event, client, logger):
+    def handle_member_joined_channel(event, body, client, logger):
         channel_id = str(event.get("channel") or "").strip()
         joined_user_id = str(event.get("user") or "").strip()
         inviter_id = str(event.get("inviter") or "").strip()
+        team_id = str(body.get("team_id") or event.get("team") or "").strip()
         if not channel_id or not joined_user_id:
             return
 
@@ -940,11 +1646,34 @@ def create_slack_bolt_app(settings: Any):
             settings,
             channel_id=channel_id,
             inviter_id=inviter_id,
+            team_id=team_id,
             logger=logger,
         )
 
+    @app.event("app_home_opened")
+    def handle_app_home_opened(event, body, client, logger):
+        user_id = str(event.get("user") or "").strip()
+        team_id = str(body.get("team_id") or event.get("team") or "").strip()
+        if not _should_send_app_home_welcome(team_id=team_id, user_id=user_id):
+            return
+
+        app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
+        github_help_line = _github_status_line_for_user(settings, user_id=user_id, team_id=team_id)
+        text = "\n".join(
+            [
+                f"Welcome to {app_name}.",
+                f"To start in a channel: invite me, then run `{PRIMARY_SLASH_COMMAND} <request>`.",
+                github_help_line,
+            ]
+        )
+        try:
+            client.chat_postMessage(channel=user_id, text=text)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("slack_app_home_welcome_failed user=%s error=%s", user_id, e)
+
     def _handle_create_command(ack, body, client, logger) -> None:
         ack()
+        team_id = str(body.get("team_id") or "").strip()
         channel_id = body.get("channel_id")
         user_id = body.get("user_id")
         text = (body.get("text") or "").strip()
@@ -961,7 +1690,14 @@ def create_slack_bolt_app(settings: Any):
             return
 
         _ensure_bot_in_channel(client, channel_id, logger)
-        _start_create_intake(client, settings, channel_id=channel_id, user_id=user_id, seed_title=text)
+        _start_create_intake(
+            client,
+            settings,
+            team_id=team_id,
+            channel_id=channel_id,
+            user_id=user_id,
+            seed_title=text,
+        )
 
     @app.command(PRIMARY_SLASH_COMMAND)
     def handle_prfactory(ack, body, client, logger):
@@ -974,25 +1710,247 @@ def create_slack_bolt_app(settings: Any):
     @app.command(GITHUB_HELP_SLASH_COMMAND)
     def handle_github_setup(ack, body, client):
         ack()
+        team_id = str(body.get("team_id") or "").strip()
         channel_id = body.get("channel_id")
         user_id = body.get("user_id")
-        install_url = settings.github_app_install_url_resolved()
-        if install_url:
-            text = (
-                f"GitHub connect for {(settings.app_display_name or 'PRFactory').strip() or 'PRFactory'}:\n"
-                f"1. Open {install_url}\n"
-                "2. Select your repo(s) for app access\n"
-                f"3. Run `{PRIMARY_SLASH_COMMAND} <request>` and include `repo=org/repo` if needed"
-            )
+        app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
+        if settings.github_user_oauth_enabled():
+            connected = _github_user_connected(settings, user_id=str(user_id or ""), team_id=team_id)
+            install_url = _github_connect_url_for_user(settings, user_id=user_id, team_id=team_id)
+            if connected:
+                text = (
+                    f"GitHub is already connected for your Slack user in {app_name}.\n"
+                    f"Run `{PRIMARY_SLASH_COMMAND} <request>` to start a build."
+                )
+            elif install_url:
+                text = (
+                    f"GitHub connect for {app_name}:\n"
+                    f"1. Open {install_url}\n"
+                    "2. Authorize access with your own GitHub account\n"
+                    f"3. Run `{PRIMARY_SLASH_COMMAND} <request>` again"
+                )
+            else:
+                text = "GitHub user OAuth is enabled, but install URL is unavailable. Check OAuth settings."
         else:
+            install_url = settings.github_app_install_url_resolved()
             text = (
-                "GitHub install URL is not configured yet. Ask the admin to set `GITHUB_APP_SLUG` "
-                "or `GITHUB_APP_INSTALL_URL` in runtime config."
+                f"GitHub app setup for {app_name}: {install_url}"
+                if install_url
+                else "GitHub install URL is not configured. Set `GITHUB_APP_SLUG` or `GITHUB_APP_INSTALL_URL`."
             )
         client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
 
+    @app.options("ff_repo_select")
+    def handle_repo_options(ack, body):
+        user_id = str(body.get("user", {}).get("id") or body.get("user_id") or "").strip()
+        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
+        query = str(body.get("value") or "").strip()
+        try:
+            options = _repo_options_for_slack(
+                settings,
+                user_id=user_id,
+                team_id=team_id,
+                query=query,
+            )
+        except Exception:
+            options = _fallback_repo_options()
+        ack(options=options)
+
+    @app.options("ff_branch_select")
+    def handle_branch_options(ack, body):
+        user_id = str(body.get("user", {}).get("id") or body.get("user_id") or "").strip()
+        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
+        query = str(body.get("value") or "").strip()
+
+        _team_id, channel_id, _user_id, thread_ts, _message_ts = _action_context(body)
+        session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        repo_slug = ""
+        if session:
+            repo_slug = str(session.answers.get("repo") or "").strip()
+        try:
+            options = _branch_options_for_slack(
+                settings,
+                user_id=user_id,
+                team_id=team_id,
+                repo_slug=repo_slug,
+                query=query,
+            )
+        except Exception:
+            options = _fallback_branch_options()
+        ack(options=options)
+
+    @app.action("ff_toggle_mode")
+    def handle_toggle_mode(ack, body, client):
+        ack()
+        team_id, channel_id, user_id, thread_ts, message_ts = _action_context(body)
+        if not (team_id and channel_id and user_id and thread_ts):
+            return
+        session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        if not session:
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Intake session expired. Run /prfactory again.")
+            return
+        current = _session_intake_mode(session)
+        next_mode = INTAKE_MODE_DEVELOPER if current == INTAKE_MODE_NORMAL else INTAKE_MODE_NORMAL
+        _set_session_intake_mode(session, next_mode)
+        _store_session(session)
+        if next_mode == INTAKE_MODE_DEVELOPER:
+            _warm_repo_cache(settings, user_id=user_id, team_id=team_id)
+        controls_ts = str(session.answers.get("_controls_message_ts") or message_ts or "").strip()
+        if controls_ts:
+            try:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=controls_ts,
+                    text=QUESTION_BY_FIELD["title"],
+                    blocks=_title_prompt_blocks(mode=next_mode),
+                )
+            except Exception:
+                pass
+        if _next_field(session) in {"repo", "base_branch"}:
+            _ask_next_question(client, session)
+
+    @app.action("ff_show_help")
+    def handle_show_help(ack, body, client):
+        ack()
+        _team_id, channel_id, user_id, _thread_ts, _message_ts = _action_context(body)
+        if not (channel_id and user_id):
+            return
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text=_intake_help_text(),
+        )
+
+    @app.action("ff_repo_select")
+    def handle_repo_select(ack, body, client):
+        ack()
+        action = (body.get("actions") or [{}])[0]
+        selected = str((action.get("selected_option") or {}).get("value") or "").strip()
+        team_id, channel_id, user_id, thread_ts, _message_ts = _action_context(body)
+        if not (team_id and channel_id and user_id and thread_ts):
+            return
+        session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        if not session:
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Intake session expired. Run /prfactory again.")
+            return
+        current_field = _next_field(session)
+        if not _repo_selection_mutable(session):
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Repo selection is no longer needed in this session.")
+            return
+
+        if selected == REPO_OPTION_CONNECT:
+            install_url = _github_connect_url_for_user(settings, user_id=user_id, team_id=team_id)
+            text = f"Connect GitHub first: {install_url}" if install_url else "GitHub connect link is unavailable."
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
+            return
+        if selected == REPO_OPTION_NEW:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="Reply in thread with `org/repo` (or repo URL) to set the target repository.",
+            )
+            return
+        if selected == REPO_OPTION_NONE:
+            session.answers["repo"] = ""
+            session.asked_fields.add("repo")
+            if session.queue and session.queue[0] == "repo":
+                session.queue.pop(0)
+            session.answers.pop("base_branch", None)
+            session.asked_fields.discard("base_branch")
+            session.answers.pop("_branch_prompt_ts", None)
+            _store_session(session)
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="Repo left unspecified.")
+            if _next_field(session):
+                _ask_next_question(client, session)
+            elif session.mode == "create":
+                _finalize_create_session(client, settings, session)
+            else:
+                _finalize_update_session(client, settings, session)
+            return
+
+        owner, repo = parse_repo_slug(selected)
+        repo_slug = f"{owner}/{repo}" if owner and repo else selected
+        previous_repo = str(session.answers.get("repo") or "").strip()
+        session.answers["repo"] = repo_slug
+        session.asked_fields.add("repo")
+        if session.queue and session.queue[0] == "repo":
+            session.queue.pop(0)
+        if current_field == "base_branch" and repo_slug != previous_repo:
+            session.answers.pop("base_branch", None)
+            session.asked_fields.discard("base_branch")
+            session.answers.pop("_branch_prompt_ts", None)
+        _store_session(session)
+        if current_field == "base_branch" and repo_slug != previous_repo:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=f"Updated repo: `{repo_slug}`. Branch options refreshed.",
+            )
+        else:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Captured repo: `{repo_slug}`")
+        if _next_field(session):
+            _ask_next_question(client, session)
+        elif session.mode == "create":
+            _finalize_create_session(client, settings, session)
+        else:
+            _finalize_update_session(client, settings, session)
+
+    @app.action("ff_branch_select")
+    def handle_branch_select(ack, body, client):
+        ack()
+        action = (body.get("actions") or [{}])[0]
+        selected = str((action.get("selected_option") or {}).get("value") or "").strip()
+        team_id, channel_id, user_id, thread_ts, _message_ts = _action_context(body)
+        if not (team_id and channel_id and user_id and thread_ts):
+            return
+        session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        if not session:
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Intake session expired. Run /prfactory again.")
+            return
+        if _next_field(session) != "base_branch":
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Base branch selection is no longer needed.")
+            return
+
+        if selected == BRANCH_OPTION_NEW:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="Reply in thread with an existing base branch name (example: `main` or `develop`).",
+            )
+            return
+
+        if selected == BRANCH_OPTION_NONE:
+            session.answers["base_branch"] = ""
+            if session.queue and session.queue[0] == "base_branch":
+                session.queue.pop(0)
+            _store_session(session)
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text="Using repository default base branch.")
+            if _next_field(session):
+                _ask_next_question(client, session)
+            elif session.mode == "create":
+                _finalize_create_session(client, settings, session)
+            else:
+                _finalize_update_session(client, settings, session)
+            return
+
+        if not re.match(r"^[A-Za-z0-9._/-]+$", selected):
+            client.chat_postEphemeral(channel=channel_id, user=user_id, text="Invalid branch name.")
+            return
+        session.answers["base_branch"] = selected
+        session.asked_fields.add("base_branch")
+        if session.queue and session.queue[0] == "base_branch":
+            session.queue.pop(0)
+        _store_session(session)
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Base branch set to `{selected}`.")
+        if _next_field(session):
+            _ask_next_question(client, session)
+        elif session.mode == "create":
+            _finalize_create_session(client, settings, session)
+        else:
+            _finalize_update_session(client, settings, session)
+
     @app.event("message")
-    def handle_message_events(event, client, logger):
+    def handle_message_events(event, body, client, logger):
         subtype = event.get("subtype")
         if subtype in {"bot_message", "message_changed", "message_deleted", "channel_join", "channel_leave"}:
             return
@@ -1000,6 +1958,7 @@ def create_slack_bolt_app(settings: Any):
             return
 
         user_id = str(event.get("user") or "").strip()
+        team_id = str(body.get("team_id") or event.get("team") or "").strip()
         channel_id = str(event.get("channel") or "").strip()
         thread_ts = str(event.get("thread_ts") or "").strip()
         text = str(event.get("text") or "").strip()
@@ -1007,10 +1966,11 @@ def create_slack_bolt_app(settings: Any):
         if not user_id or not channel_id or not thread_ts:
             return
 
-        session = _get_session(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
+        session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
         if not session:
             logger.debug(
-                "slack_message_event_no_session channel=%s thread=%s user=%s subtype=%s",
+                "slack_message_event_no_session team=%s channel=%s thread=%s user=%s subtype=%s",
+                team_id,
                 channel_id,
                 thread_ts,
                 user_id,
@@ -1019,7 +1979,8 @@ def create_slack_bolt_app(settings: Any):
             return
 
         logger.info(
-            "slack_message_event_matched_session channel=%s thread=%s user=%s field=%s subtype=%s",
+            "slack_message_event_matched_session team=%s channel=%s thread=%s user=%s field=%s subtype=%s",
+            team_id,
             channel_id,
             thread_ts,
             user_id,
@@ -1068,6 +2029,7 @@ def create_slack_bolt_app(settings: Any):
         ack()
         action = body["actions"][0]
         feature_id = action["value"]
+        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
         channel_id = body.get("channel", {}).get("id")
         user_id = body["user"]["id"]
         message_ts = body.get("message", {}).get("ts")
@@ -1087,6 +2049,7 @@ def create_slack_bolt_app(settings: Any):
             client,
             settings,
             feature=feature,
+            team_id=team_id,
             channel_id=channel_id,
             thread_ts=thread_ts,
             user_id=user_id,
@@ -1116,7 +2079,7 @@ def create_slack_bolt_app(settings: Any):
             _post_clarification_prompt(client, channel_id, thread_ts, current)
             return
 
-        ok, note, _payload = _enqueue_build_for_feature(
+        ok, note, payload = _enqueue_build_for_feature(
             settings,
             feature_id=feature_id,
             actor_id=user_id,
@@ -1132,6 +2095,16 @@ def create_slack_bolt_app(settings: Any):
                     _update_feature_message(client, refreshed, channel_id=channel_id, message_ts=message_ts)
             except Exception:
                 pass
+        else:
+            install_url = str((payload or {}).get("install_url") or "").strip()
+            _post_build_retry_message(
+                client,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                feature_id=feature_id,
+                text="If you fixed auth/settings, click *Retry build*.",
+                install_url=install_url,
+            )
 
     @app.action("ff_approve")
     def handle_approve(ack, body, client, logger):

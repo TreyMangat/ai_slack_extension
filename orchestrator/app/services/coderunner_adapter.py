@@ -14,7 +14,7 @@ from typing import Any
 
 from rich.console import Console
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.services.github_auth import get_github_token_provider
 from app.services.github_adapter import GitHubAdapter
 from app.services.github_repo import resolve_repo_for_spec
@@ -174,6 +174,14 @@ def _branch_subject(*, issue_number: int, feature_id: str) -> str:
     return str(int(time.time()))
 
 
+def _resolve_pr_base_branch(*, spec: dict[str, Any], settings: Settings) -> str:
+    override = str((spec or {}).get("base_branch") or "").strip()
+    if override:
+        return override
+    # Empty means "use repository default branch", resolved during clone.
+    return ""
+
+
 def _collect_repo_context(repo_path: Path, *, max_files: int, max_chars_per_file: int) -> str:
     files: list[Path] = []
     ignore_dirs = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache"}
@@ -235,25 +243,69 @@ def _prepare_target_repo(
     owner: str,
     repo: str,
     token: str,
-) -> None:
+    base_branch: str = "",
+) -> str:
     clone_url = f"https://github.com/{owner}/{repo}.git"
     auth_header = _github_basic_auth_header(token)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    _run_command(
-        [
-            "git",
-            "-c",
-            f"http.https://github.com/.extraheader={auth_header}",
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            clone_url,
-            str(target_path),
-        ],
-        cwd=target_path.parent,
-        timeout_seconds=600,
-    )
+    clone_cmd = [
+        "git",
+        "-c",
+        f"http.https://github.com/.extraheader={auth_header}",
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+    ]
+    normalized_base = (base_branch or "").strip()
+    if normalized_base:
+        clone_cmd.extend(["--branch", normalized_base])
+    clone_cmd.extend([clone_url, str(target_path)])
+    try:
+        _run_command(
+            clone_cmd,
+            cwd=target_path.parent,
+            timeout_seconds=600,
+        )
+    except Exception as e:  # noqa: BLE001
+        message = str(e)
+        lowered = message.lower()
+        if normalized_base and (
+            ("remote branch" in lowered and "not found" in lowered)
+            or "couldn't find remote ref" in lowered
+            or "could not find remote branch" in lowered
+        ):
+            raise RuntimeError(
+                f"Configured base branch `{normalized_base}` does not exist in `{owner}/{repo}`. "
+                "Choose an existing branch from the dropdown or reply `skip` to use the default branch."
+            ) from e
+        raise
+    if normalized_base:
+        return normalized_base
+    try:
+        checked_out = _run_command(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=target_path,
+            timeout_seconds=30,
+        ).strip()
+        if checked_out and checked_out != "HEAD":
+            return checked_out
+    except Exception:
+        pass
+    try:
+        remote_head = _run_command(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=target_path,
+            timeout_seconds=30,
+        ).strip()
+        marker = "refs/remotes/origin/"
+        if remote_head.startswith(marker):
+            resolved = remote_head[len(marker) :].strip()
+            if resolved:
+                return resolved
+    except Exception:
+        pass
+    return ""
 
 
 def _github_basic_auth_header(token: str) -> str:
@@ -557,6 +609,7 @@ def _build_local_openclaw_prompt(
         f"{refs_block}\n\n"
         "Execution requirements:\n"
         "- Keep changes scoped to the request and acceptance criteria.\n"
+        "- You must produce concrete repository file edits (no no-op output).\n"
         "- Add or update tests for behavior changes.\n"
         "- Run relevant lint/test commands before finishing.\n"
         "- Do not push to remote and do not open PR yourself.\n"
@@ -629,9 +682,26 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
         owner, repo = resolve_repo_for_spec(spec=final_spec, settings=settings)
         if not owner or not repo:
             raise RuntimeError("Could not determine target repo (spec.repo or GITHUB_REPO_OWNER/NAME required)")
+        requested_pr_base = _resolve_pr_base_branch(spec=final_spec, settings=settings)
 
-        token = self.token_provider.get_token(owner=owner, repo=repo)
-        _prepare_target_repo(target_path=target_path, owner=owner, repo=repo, token=token)
+        github_actor_id = str((build_context or {}).get("github_actor_id") or "").strip()
+        github_team_id = str((build_context or {}).get("slack_team_id") or "").strip()
+        token = self.token_provider.get_token(
+            owner=owner,
+            repo=repo,
+            actor_id=github_actor_id,
+            team_id=github_team_id,
+        )
+        resolved_clone_base = _prepare_target_repo(
+            target_path=target_path,
+            owner=owner,
+            repo=repo,
+            token=token,
+            base_branch=requested_pr_base,
+        )
+        pr_base = requested_pr_base or resolved_clone_base or (settings.github_default_branch or "main").strip() or "main"
+        if not str(final_spec.get("base_branch") or "").strip():
+            final_spec["base_branch"] = pr_base
 
         tracking_ref = _tracking_reference(issue_number=issue_number, feature_id=feature_id)
         branch_prefix = (settings.llm_push_branch_prefix or "prfactory").strip().strip("/")
@@ -875,7 +945,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
             title=pr_title,
             body=pr_body,
             head=branch_name,
-            base=(settings.github_default_branch or "main"),
+            base=pr_base,
         )
 
         provider = str((openclaw_meta.get("agentMeta") or {}).get("provider") or "openai-codex")
@@ -936,9 +1006,26 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
         owner, repo = resolve_repo_for_spec(spec=final_spec, settings=settings)
         if not owner or not repo:
             raise RuntimeError("Could not determine target repo (spec.repo or GITHUB_REPO_OWNER/NAME required)")
+        requested_pr_base = _resolve_pr_base_branch(spec=final_spec, settings=settings)
 
-        token = self.token_provider.get_token(owner=owner, repo=repo)
-        _prepare_target_repo(target_path=target_path, owner=owner, repo=repo, token=token)
+        github_actor_id = str((build_context or {}).get("github_actor_id") or "").strip()
+        github_team_id = str((build_context or {}).get("slack_team_id") or "").strip()
+        token = self.token_provider.get_token(
+            owner=owner,
+            repo=repo,
+            actor_id=github_actor_id,
+            team_id=github_team_id,
+        )
+        resolved_clone_base = _prepare_target_repo(
+            target_path=target_path,
+            owner=owner,
+            repo=repo,
+            token=token,
+            base_branch=requested_pr_base,
+        )
+        pr_base = requested_pr_base or resolved_clone_base or (settings.github_default_branch or "main").strip() or "main"
+        if not str(final_spec.get("base_branch") or "").strip():
+            final_spec["base_branch"] = pr_base
 
         tracking_ref = _tracking_reference(issue_number=issue_number, feature_id=feature_id)
         branch_prefix = (settings.llm_push_branch_prefix or "prfactory").strip().strip("/")
@@ -1068,7 +1155,7 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
             title=pr_title,
             body=pr_body,
             head=branch_name,
-            base=(settings.github_default_branch or "main"),
+            base=pr_base,
         )
         console.print(f"[green]Native LLM runner opened PR: {pr_url}[/green]")
         return CodeRunResult(

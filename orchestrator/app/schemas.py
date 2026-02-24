@@ -19,6 +19,7 @@ class FeatureSpec(BaseModel):
     non_goals: list[str] = Field(default_factory=list)
 
     repo: str = Field(default="", description="repo identifier, e.g. org/repo")
+    base_branch: str = Field(default="", description="optional PR base branch override")
     implementation_mode: Literal["new_feature", "reuse_existing"] = "new_feature"
     source_repos: list[str] = Field(
         default_factory=list,
@@ -38,6 +39,7 @@ class FeatureRequestCreate(BaseModel):
 
     requester_user_id: str = ""
 
+    slack_team_id: str = ""
     slack_channel_id: str = ""
     slack_thread_ts: str = ""
     slack_message_ts: str = ""
@@ -51,6 +53,7 @@ class FeatureSpecPatch(BaseModel):
     acceptance_criteria: list[str] | None = None
     non_goals: list[str] | None = None
     repo: str | None = None
+    base_branch: str | None = None
     implementation_mode: Literal["new_feature", "reuse_existing"] | None = None
     source_repos: list[str] | None = None
     risk_flags: list[str] | None = None
@@ -79,6 +82,23 @@ class FeatureEventOut(BaseModel):
     data: dict[str, Any]
 
 
+class FeatureRunOut(BaseModel):
+    id: str
+    status: str
+    runner_type: str
+    runner_run_id: str
+    actor_id: str
+    issue_url: str
+    pr_url: str
+    preview_url: str
+    artifacts: dict[str, Any]
+    error_text: str
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime]
+    finished_at: Optional[datetime]
+
+
 class FeatureRequestOut(BaseModel):
     id: str
     created_at: datetime
@@ -89,6 +109,7 @@ class FeatureRequestOut(BaseModel):
 
     requester_user_id: str
 
+    slack_team_id: str
     slack_channel_id: str
     slack_thread_ts: str
 
@@ -105,6 +126,7 @@ class FeatureRequestOut(BaseModel):
     last_error: str
 
     events: list[FeatureEventOut] = Field(default_factory=list)
+    runs: list[FeatureRunOut] = Field(default_factory=list)
 
 
 class FeatureRequestListOut(BaseModel):
