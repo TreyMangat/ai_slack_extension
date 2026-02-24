@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import api_router
@@ -31,6 +31,11 @@ def create_app() -> FastAPI:
     def _startup() -> None:
         staged = stage_openclaw_auth_if_needed(settings)
         logger.info("openclaw_auth_stage %s", json.dumps(staged, sort_keys=True))
+        if settings.enable_slack_bot and settings.slack_mode_normalized() == "http":
+            if not (settings.slack_bot_token or "").strip():
+                raise RuntimeError("ENABLE_SLACK_BOT=true and SLACK_MODE=http require SLACK_BOT_TOKEN")
+            if not (settings.slack_signing_secret or "").strip():
+                raise RuntimeError("ENABLE_SLACK_BOT=true and SLACK_MODE=http require SLACK_SIGNING_SECRET")
         settings.validate_runtime_guardrails()
         settings.validate_startup_prerequisites()
         logger.info("runtime_diagnostics %s", json.dumps(settings.runtime_diagnostics(), sort_keys=True))
@@ -38,6 +43,17 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(api_router)
+    if settings.enable_slack_bot and settings.slack_mode_normalized() == "http":
+        from slack_bolt.adapter.fastapi import SlackRequestHandler
+
+        from app.slackbot import create_slack_bolt_app
+
+        slack_handler = SlackRequestHandler(create_slack_bolt_app(settings))
+
+        @app.post("/api/slack/events")
+        async def slack_events(request: Request):
+            return await slack_handler.handle(request)
+
     install_request_observability(app)
 
     # Static

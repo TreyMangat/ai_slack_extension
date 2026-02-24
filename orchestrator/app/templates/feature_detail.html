@@ -68,7 +68,7 @@
 
       <h3>Execution</h3>
       <ul>
-        <li>Issue: {% if feature.github_issue_url %}<a href="{{ feature.github_issue_url }}" target="_blank" rel="noopener noreferrer">{{ feature.github_issue_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
+        <li>Repo: <code>{{ feature.spec.get('repo', '(none)') }}</code></li>
         <li>PR: {% if feature.github_pr_url %}<a href="{{ feature.github_pr_url }}" target="_blank" rel="noopener noreferrer">{{ feature.github_pr_url }}</a>{% else %}<span class="muted">(none / pending)</span>{% endif %}</li>
         <li>Preview: {% if feature.preview_url %}<a href="{{ feature.preview_url }}" target="_blank" rel="noopener noreferrer">{{ feature.preview_url }}</a>{% else %}<span class="muted">(none)</span>{% endif %}</li>
       </ul>

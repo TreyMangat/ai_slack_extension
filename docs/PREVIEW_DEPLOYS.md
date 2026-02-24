@@ -6,7 +6,7 @@ For UI requests, reviewers should click a link from the PR and see the feature w
 ## Recommended default: Cloudflare Pages
 
 ### One-time setup (human)
-1. In Cloudflare Pages, create a project connected to GitHub repo `TreyMangat/Slack_AI_Bot` (or your active target repo).
+1. In Cloudflare Pages, create a project connected to your active target GitHub repo.
 2. Set production branch (usually `main`).
 3. Confirm preview deployments are enabled for pull requests (default for GitHub-integrated Pages projects).
 
@@ -25,9 +25,9 @@ Use repo secrets so GitHub workflows can report PR/preview status back:
 - `FEATURE_FACTORY_CALLBACK_URL`
 - `FEATURE_FACTORY_WEBHOOK_SECRET` (must match orchestrator `INTEGRATION_WEBHOOK_SECRET`)
 
-This repo includes:
-- `opencode-runner.yml` -> sends `pr_opened` / `build_failed` callbacks
-- `preview-deployment-callback.yml` -> sends `preview_ready` from successful deployment status events
+Use your CI/deploy workflow to send:
+- `pr_opened` / `build_failed` callbacks when code runner status changes
+- `preview_ready` callback when preview deployment is ready
 
 ## How reviewers find the preview
 - Open PR -> Checks tab

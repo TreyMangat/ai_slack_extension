@@ -17,6 +17,7 @@ from rich.console import Console
 from app.config import get_settings
 from app.services.github_auth import get_github_token_provider
 from app.services.github_adapter import GitHubAdapter
+from app.services.github_repo import resolve_repo_for_spec
 from app.services.llm_provider import LLMProvider, LLMProviderError
 from app.services.pr_description import build_standard_pr_body
 from app.services.prompt_optimizer import build_optimized_prompt, detect_ui_feature
@@ -58,11 +59,12 @@ class MockCodeRunnerAdapter(CodeRunnerAdapter):
         feature_id: str = "",
     ) -> CodeRunResult:
         # Pretend a PR was opened and a preview deployed.
-        fake_pr = f"https://example.local/github/pull/{issue_number}"
-        fake_preview = f"http://localhost:8000/preview/{issue_number}"
+        tracking_ref = _tracking_reference(issue_number=issue_number, feature_id=feature_id)
+        fake_pr = f"https://example.local/github/pull/{tracking_ref}"
+        fake_preview = f"http://localhost:8000/preview/{tracking_ref}"
         mode = (build_context or {}).get("implementation_mode", "new_feature")
         console.print(
-            f"[bold cyan][MOCK CodeRunner][/bold cyan] kickoff issue #{issue_number} mode={mode} -> PR {fake_pr}"
+            f"[bold cyan][MOCK CodeRunner][/bold cyan] kickoff {tracking_ref} mode={mode} -> PR {fake_pr}"
         )
         return CodeRunResult(
             github_pr_url=fake_pr,
@@ -154,24 +156,22 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     return data
 
 
-def _parse_repo_slug(repo_value: str) -> tuple[str, str]:
-    text = (repo_value or "").strip()
-    if not text:
-        return "", ""
+def _tracking_reference(*, issue_number: int, feature_id: str) -> str:
+    if issue_number > 0:
+        return f"issue-{issue_number}"
+    suffix = (feature_id or "").strip()
+    if suffix:
+        return f"feature-{suffix}"
+    return f"request-{int(time.time())}"
 
-    if text.startswith("https://github.com/"):
-        tail = text[len("https://github.com/") :]
-        tail = tail.removesuffix(".git")
-        parts = [p for p in tail.split("/") if p]
-        if len(parts) >= 2:
-            return parts[0], parts[1]
-        return "", ""
 
-    if "/" in text:
-        parts = [p for p in text.removesuffix(".git").split("/") if p]
-        if len(parts) >= 2:
-            return parts[0], parts[1]
-    return "", ""
+def _branch_subject(*, issue_number: int, feature_id: str) -> str:
+    if issue_number > 0:
+        return str(issue_number)
+    clean_feature = re.sub(r"[^a-zA-Z0-9_-]+", "-", (feature_id or "").strip()).strip("-")
+    if clean_feature:
+        return clean_feature[:36]
+    return str(int(time.time()))
 
 
 def _collect_repo_context(repo_path: Path, *, max_files: int, max_chars_per_file: int) -> str:
@@ -290,7 +290,7 @@ def _write_debug_codegen_file(
     *,
     repo_path: Path,
     feature_id: str,
-    issue_number: int,
+    tracking_reference: str,
     spec: dict[str, Any],
 ) -> str:
     timestamp = datetime.now(tz=timezone.utc).isoformat()
@@ -302,7 +302,7 @@ def _write_debug_codegen_file(
         "",
         f"- generated_at_utc: {timestamp}",
         f"- feature_id: {feature_id or '(unknown)'}",
-        f"- issue_number: {issue_number}",
+        f"- tracking_reference: {tracking_reference}",
         f"- title: {title}",
     ]
     target = repo_path / "DEBUG_CODEGEN.md"
@@ -512,7 +512,7 @@ def _npm_build_command(frontend_root: Path, repo_path: Path) -> str:
 
 def _build_local_openclaw_prompt(
     *,
-    issue_number: int,
+    tracking_reference: str,
     feature_id: str,
     spec: dict[str, Any],
     build_context: dict[str, Any] | None,
@@ -550,7 +550,7 @@ def _build_local_openclaw_prompt(
         "You are running as an autonomous coding agent inside the target repository workspace.\n"
         "Make direct file edits and execute commands to implement the request safely.\n\n"
         f"Feature request id: {feature_id or '(unknown)'}\n"
-        f"Issue number: #{issue_number}\n\n"
+        f"Tracking reference: {tracking_reference}\n\n"
         "Structured request:\n"
         f"{optimized_prompt}\n\n"
         "Reference snapshots (read-only context):\n"
@@ -593,15 +593,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
         feature_id: str = "",
     ) -> CodeRunResult:
         mode = self.settings.opencode_execution_mode_normalized()
-        if mode in {"", "github_issue_comment", "issue_comment", "delegated"}:
-            return await self._kickoff_github_issue_comment(
-                github=github,
-                issue_number=issue_number,
-                trigger_comment=trigger_comment,
-                build_context=build_context,
-                spec=spec or {},
-            )
-        if mode == "local_openclaw":
+        if mode in {"", "local_openclaw"}:
             return await self._kickoff_local_openclaw(
                 github=github,
                 issue_number=issue_number,
@@ -609,52 +601,9 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
                 spec=spec,
                 feature_id=feature_id,
             )
-        raise RuntimeError(f"Unsupported OPENCODE_EXECUTION_MODE: {self.settings.opencode_execution_mode}")
-
-    async def _kickoff_github_issue_comment(
-        self,
-        *,
-        github: GitHubAdapter,
-        issue_number: int,
-        trigger_comment: str,
-        build_context: dict[str, Any] | None = None,
-        spec: dict[str, Any] | None = None,
-    ) -> CodeRunResult:
-        final_spec = spec or {}
-        mode = (build_context or {}).get("implementation_mode", "new_feature")
-        repos = (build_context or {}).get("source_repos") or []
-        ui_feature, ui_keywords = detect_ui_feature(final_spec)
-        if bool(final_spec.get("ui_feature")):
-            ui_feature = True
-        ui_keywords_text = ", ".join(ui_keywords) if ui_keywords else "(none)"
-        cloudflare_project = (self.settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
-        cloudflare_prod_branch = (self.settings.cloudflare_pages_production_branch or "").strip() or "main"
-        context_lines = [
-            "",
-            "Build context:",
-            f"- implementation_mode: {mode}",
-            f"- ui_feature: {str(ui_feature).lower()}",
-            f"- ui_keywords: {ui_keywords_text}",
-            "- isolation_policy: work in isolated clone/copy only",
-            f"- preview_provider: {self.settings.preview_provider_normalized() or 'cloudflare_pages'}",
-            f"- cloudflare_pages_project: {cloudflare_project}",
-            f"- cloudflare_pages_production_branch: {cloudflare_prod_branch}",
-            "- PR body must include: What changed, Why, Acceptance criteria checklist, How to test locally, and Preview instructions.",
-        ]
-        if repos:
-            context_lines.append("- source_repos:")
-            context_lines.extend([f"  - {repo}" for repo in repos])
-
-        await github.comment_issue(issue_number=issue_number, body=trigger_comment + "\n" + "\n".join(context_lines))
-        console.print(f"[green]Triggered OpenCode via GitHub issue comment on #{issue_number}[/green]")
-        return CodeRunResult(
-            github_pr_url="",
-            preview_url="",
-            runner_metadata={
-                "runner": "opencode",
-                "execution_mode": "github_issue_comment",
-                "issue_number": issue_number,
-            },
+        raise RuntimeError(
+            "Unsupported OPENCODE_EXECUTION_MODE. "
+            "Issue-comment delegated mode was removed; use OPENCODE_EXECUTION_MODE=local_openclaw."
         )
 
     async def _kickoff_local_openclaw(
@@ -677,19 +626,17 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
         if target_path.exists() and any(target_path.iterdir()):
             raise RuntimeError(f"target workspace path is not empty: {target_path}")
 
-        repo_hint = str(final_spec.get("repo") or "").strip()
-        owner, repo = _parse_repo_slug(repo_hint)
-        if not owner or not repo:
-            owner = (settings.github_repo_owner or "").strip()
-            repo = (settings.github_repo_name or "").strip()
+        owner, repo = resolve_repo_for_spec(spec=final_spec, settings=settings)
         if not owner or not repo:
             raise RuntimeError("Could not determine target repo (spec.repo or GITHUB_REPO_OWNER/NAME required)")
 
-        token = self.token_provider.get_token()
+        token = self.token_provider.get_token(owner=owner, repo=repo)
         _prepare_target_repo(target_path=target_path, owner=owner, repo=repo, token=token)
 
+        tracking_ref = _tracking_reference(issue_number=issue_number, feature_id=feature_id)
         branch_prefix = (settings.llm_push_branch_prefix or "feature-factory").strip().strip("/")
-        branch_name = f"{branch_prefix}/{issue_number}-{int(time.time())}"
+        branch_subject = _branch_subject(issue_number=issue_number, feature_id=feature_id)
+        branch_name = f"{branch_prefix}/{branch_subject}-{int(time.time())}"
         _run_command(["git", "checkout", "-b", branch_name], cwd=target_path, timeout_seconds=30)
 
         ui_feature, _ui_keywords = detect_ui_feature(final_spec)
@@ -710,14 +657,14 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
 
         test_command = (settings.llm_test_command or "").strip()
         prompt = _build_local_openclaw_prompt(
-            issue_number=issue_number,
+            tracking_reference=tracking_ref,
             feature_id=feature_id,
             spec=final_spec,
             build_context=build_context,
             test_command=test_command,
         )
 
-        agent_suffix = feature_id[:8] if feature_id else str(issue_number)
+        agent_suffix = feature_id[:8] if feature_id else branch_subject
         agent_id = _sanitize_agent_id(f"ff-{agent_suffix}-{int(time.time())}")
         cli_timeout = max(int(settings.opencode_timeout_seconds), 60)
 
@@ -733,7 +680,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
             debug_timestamp = _write_debug_codegen_file(
                 repo_path=target_path,
                 feature_id=feature_id,
-                issue_number=issue_number,
+                tracking_reference=tracking_ref,
                 spec=final_spec,
             )
             openclaw_summary = "Debug build mode wrote DEBUG_CODEGEN.md."
@@ -898,7 +845,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
             timeout_seconds=600,
         )
 
-        pr_title = str(final_spec.get("title") or "").strip() or f"Feature request #{issue_number}"
+        pr_title = str(final_spec.get("title") or "").strip() or f"Feature request {tracking_ref}"
         summary_lines: list[str] = []
         if openclaw_summary:
             summary_lines.append(openclaw_summary)
@@ -911,7 +858,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
         pr_body = build_standard_pr_body(
             spec=final_spec,
             feature_id=feature_id,
-            issue_number=issue_number,
+            issue_number=issue_number if issue_number > 0 else None,
             branch_name=branch_name,
             runner_name="opencode-local-openclaw",
             runner_model=settings.opencode_model,
@@ -931,16 +878,6 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
             base=(settings.github_default_branch or "main"),
         )
 
-        await github.comment_issue(
-            issue_number=issue_number,
-            body=(
-                "OpenClaw local runner completed.\n"
-                f"- Branch: `{branch_name}`\n"
-                f"- PR: {pr_url}\n"
-                f"- Model: `{settings.opencode_model}`"
-            ),
-        )
-
         provider = str((openclaw_meta.get("agentMeta") or {}).get("provider") or "openai-codex")
         model = str((openclaw_meta.get("agentMeta") or {}).get("model") or settings.opencode_model)
         console.print(f"[green]Local OpenClaw runner opened PR: {pr_url}[/green]")
@@ -955,7 +892,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
                 "provider": provider,
                 "model": model,
                 "branch_name": branch_name,
-                "issue_number": issue_number,
+                "tracking_reference": tracking_ref,
                 "verification_command": test_command,
                 "verification_output": _truncate(verification_output, max_chars=2000),
                 "ui_build_output": _truncate(ui_build_output, max_chars=2000),
@@ -996,19 +933,17 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
         if target_path.exists() and any(target_path.iterdir()):
             raise RuntimeError(f"target workspace path is not empty: {target_path}")
 
-        repo_hint = str(final_spec.get("repo") or "").strip()
-        owner, repo = _parse_repo_slug(repo_hint)
-        if not owner or not repo:
-            owner = (settings.github_repo_owner or "").strip()
-            repo = (settings.github_repo_name or "").strip()
+        owner, repo = resolve_repo_for_spec(spec=final_spec, settings=settings)
         if not owner or not repo:
             raise RuntimeError("Could not determine target repo (spec.repo or GITHUB_REPO_OWNER/NAME required)")
 
-        token = self.token_provider.get_token()
+        token = self.token_provider.get_token(owner=owner, repo=repo)
         _prepare_target_repo(target_path=target_path, owner=owner, repo=repo, token=token)
 
+        tracking_ref = _tracking_reference(issue_number=issue_number, feature_id=feature_id)
         branch_prefix = (settings.llm_push_branch_prefix or "feature-factory").strip().strip("/")
-        branch_name = f"{branch_prefix}/{issue_number}-{int(time.time())}"
+        branch_subject = _branch_subject(issue_number=issue_number, feature_id=feature_id)
+        branch_name = f"{branch_prefix}/{branch_subject}-{int(time.time())}"
         _run_command(["git", "checkout", "-b", branch_name], cwd=target_path, timeout_seconds=30)
 
         ui_feature, _ui_keywords = detect_ui_feature(final_spec)
@@ -1103,7 +1038,7 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
             timeout_seconds=600,
         )
 
-        pr_title = str(final_spec.get("title") or "").strip() or f"Feature request #{issue_number}"
+        pr_title = str(final_spec.get("title") or "").strip() or f"Feature request {tracking_ref}"
         summary_lines: list[str] = []
         if patch_result and patch_result.rationale:
             summary_lines.append(str(patch_result.rationale))
@@ -1116,7 +1051,7 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
         pr_body = build_standard_pr_body(
             spec=final_spec,
             feature_id=feature_id,
-            issue_number=issue_number,
+            issue_number=issue_number if issue_number > 0 else None,
             branch_name=branch_name,
             runner_name="native-llm",
             runner_model=settings.llm_model,

@@ -1,4 +1,4 @@
-# Feature Factory (Local-first scaffold)
+# Feature Factory (Local + Modal scaffold)
 
 This project is a **local-first** (Docker Compose) scaffold for the workflow you described:
 
@@ -12,7 +12,7 @@ This project is a **local-first** (Docker Compose) scaffold for the workflow you
 
 It is designed so you can:
 - **Start in MOCK_MODE** without Slack/GitHub
-- Later wire in **Slack** (Socket Mode) + **GitHub** (issue + /oc trigger)
+- Later wire in **Slack** + **GitHub App** for direct PR generation (no issue ticket required)
 - Keep the orchestrator future-proof (clear adapters + state machine)
 
 The Slack intake is novice-oriented:
@@ -186,7 +186,7 @@ Safety defaults:
 
 ---
 
-## (Optional) Connect Slack (Socket Mode)
+## (Optional) Connect Slack
 
 Only do this after the mock flow works.
 
@@ -233,7 +233,9 @@ Set:
 - `SLACK_ALLOWED_USERS=U0123ABC,U0456DEF`
 - `REVIEWER_CHANNEL_ID=C09REVIEW`
 
-### 3) Restart
+### 3) Choose runtime mode
+
+Local Docker (Socket Mode):
 
 ```powershell
 docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile slack up --build
@@ -244,6 +246,11 @@ or:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 ```
+
+Modal/cloud (HTTP mode):
+- Set `SLACK_MODE=http`
+- Configure Slack request URL to `<BASE_URL>/api/slack/events`
+- Do not run the separate socket-mode `slackbot` process
 
 Then in Slack, run:
 
@@ -261,167 +268,56 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check_slack_setup.ps1
 
 ---
 
-## (Optional) Connect GitHub + OpenCode
+## (Optional) Connect GitHub (PR-first flow)
 
-This scaffold can create GitHub issues and post a comment that triggers OpenCode.
-It can also run a native in-container LLM coding loop (experimental).
+Current behavior in real mode:
+- no GitHub issue ticket is created
+- worker opens a PR directly
+- callback endpoint is still available for preview/build status updates
 
-### 1) Prepare your target repo
+### 1) Configure GitHub auth
 
-- Create or choose a GitHub repo you want OpenCode to work on
-- This repo now includes `.github/workflows/opencode-runner.yml`
-- Push that workflow to the target repo so `/oc` comments trigger OpenCode automatically
-
-### 1b) Set up OpenClaw locally (Codex OAuth)
-
-Install/update and set model:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_openclaw.ps1
-```
-
-Complete OAuth in an interactive terminal:
-
-```powershell
-openclaw onboard --auth-choice openai-codex
-# or
-openclaw models auth login --provider openai-codex
-```
-
-Verify:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1
-```
-
-Sync host OpenClaw auth into Docker-mounted secrets:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\sync_openclaw_auth.ps1
-```
-
-Optional container-level verification:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check_openclaw_setup.ps1 -CheckContainer
-```
-
-### 2) Choose GitHub auth mode
-
-For local testing:
+Local testing:
 - `GITHUB_AUTH_MODE=token`
 - `GITHUB_TOKEN=<PAT with repo scope>`
 
-For production:
+Production/multi-user:
 - `GITHUB_AUTH_MODE=app`
 - `GITHUB_APP_ID=...`
-- `GITHUB_APP_INSTALLATION_ID=...`
-- `GITHUB_APP_PRIVATE_KEY_PATH=...`
-  - For Docker Compose, store key in `./secrets` and use `/run/secrets/<file>.pem`
+- `GITHUB_APP_PRIVATE_KEY_PATH=...` (or `GITHUB_APP_PRIVATE_KEY=...`)
+- `GITHUB_APP_SLUG=...` (recommended, used for install/login guidance)
 
-### 2b) Choose code runner mode
+### 2) Configure target repo strategy
 
-- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=local_openclaw` (recommended for local Codex OAuth):
-  - worker clones repo, executes OpenClaw in-container, runs tests, commits, pushes branch, opens PR.
-  - no provider API key needed when OpenClaw OAuth auth is synced to `./secrets/openclaw`.
-  - optional pipeline probe: set `OPENCODE_DEBUG_BUILD=true` to create a deterministic PR that adds `DEBUG_CODEGEN.md` instead of calling a model.
-- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=github_issue_comment`:
-  - posts `/oc` trigger comment and expects external runner callbacks.
-- `CODERUNNER_MODE=native_llm` (experimental): the worker clones target repo, asks LLM for patch, runs tests, pushes branch, opens PR.
+Recommended (multi-user):
+- each request includes `spec.repo` (`org/repo`)
+- app installation is resolved dynamically for that repo
 
-For `native_llm`, also set:
-- `LLM_PROVIDER=openai`
-- `LLM_API_KEY=...`
-- `LLM_MODEL=gpt-4.1-mini` (or preferred model)
-- `LLM_TEST_COMMAND=pytest -q` (or your repo's test command)
-- `repo` in feature spec, or `GITHUB_REPO_OWNER` + `GITHUB_REPO_NAME`
+Fallback:
+- set `GITHUB_REPO_OWNER` + `GITHUB_REPO_NAME`
 
-For OpenClaw/OpenCode delegated mode (`CODERUNNER_MODE=opencode`):
-- keep `MOCK_MODE=false`
-- local OpenClaw path:
-  - `OPENCODE_EXECUTION_MODE=local_openclaw`
-  - `OPENCLAW_AUTH_DIR=/home/app/.openclaw`
-  - `OPENCLAW_AUTH_SEED_DIR=/run/secrets/openclaw`
-  - sync auth with `scripts/sync_openclaw_auth.ps1` (startup copies seed auth to writable runtime path).
-- delegated GitHub Actions path:
-  - `OPENCODE_EXECUTION_MODE=github_issue_comment`
-  - workflow default model is `github-copilot/gpt-4.1` (no OpenAI key required)
-  - override with repo variable `OPENCODE_MODEL` if needed
-  - interactive OAuth is local-only; GitHub Actions runners cannot complete OAuth prompts.
-  - for GitHub Actions, use non-interactive auth:
-    - preferred no-key path: `COPILOT_GITHUB_TOKEN` (or built-in `GITHUB_TOKEN`)
-    - API-key path: provider key such as `OPENAI_API_KEY`
+### 3) Choose code runner mode
 
-### 3) Put GitHub config in `.env`
+- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=local_openclaw` (default):
+  - clones target repo, generates code, pushes branch, opens PR.
+- `CODERUNNER_MODE=native_llm` (experimental):
+  - in-container LLM patch/test/push/PR flow.
 
-Set:
-- `GITHUB_ENABLED=true`
-- `GITHUB_AUTH_MODE=token|app`
-- `GITHUB_TOKEN=...` (token mode)
-- `GITHUB_APP_ID=...` (app mode)
-- `GITHUB_APP_INSTALLATION_ID=...` (app mode)
-- `GITHUB_APP_PRIVATE_KEY_PATH=...` (app mode)
-- `GITHUB_REPO_OWNER=your-org-or-user`
-- `GITHUB_REPO_NAME=your-repo`
-- `WORKSPACE_ENABLE_GIT_CLONE=true` (if reuse mode should pull remote source repos)
-
-### 4) Restart
-
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
-```
-
-Now, when you run a build, the worker will:
-- Create a GitHub issue
-- Then either:
-  - run OpenClaw locally (`OPENCODE_EXECUTION_MODE=local_openclaw`) and open a PR directly, or
-  - post the `/oc ...` trigger comment (`OPENCODE_EXECUTION_MODE=github_issue_comment`) for external runner flow
-
-OpenCode workflow secrets/variables in the target repo:
-- `COPILOT_GITHUB_TOKEN` (recommended if using `github-copilot/*` models; falls back to Actions `GITHUB_TOKEN`)
-- `OPENAI_API_KEY` (only if selected `OPENCODE_MODEL` needs OpenAI API key auth)
-- `FEATURE_FACTORY_CALLBACK_URL` (optional, full URL or base URL of orchestrator)
-- `FEATURE_FACTORY_WEBHOOK_SECRET` (optional, must match `INTEGRATION_WEBHOOK_SECRET`; set together with callback URL)
-- `OPENCODE_MODEL` repo variable (optional override of default model)
-
-Preview deployment metadata (recommended for UI requests):
-- `PREVIEW_PROVIDER=cloudflare_pages`
-- `CLOUDFLARE_PAGES_PROJECT_NAME=<project>`
-- `CLOUDFLARE_PAGES_PRODUCTION_BRANCH=main`
-
-See `docs/PREVIEW_DEPLOYS.md` for one-time Cloudflare Pages setup and PR preview callback automation.
-
-If your external runner can call back, use:
-- `POST /api/integrations/execution-callback`
-- Signed with:
-  - `X-Feature-Factory-Timestamp`
-  - `X-Feature-Factory-Signature`
-  - `X-Feature-Factory-Event-Id` (idempotency key)
-
-### 5) Verify GitHub App install + permissions
+### 4) Validate GitHub App setup
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\check_github_app.ps1
 ```
 
-Current required app permissions for this scaffold:
-- `Issues: Read and write` (create issue + post trigger comment)
+Required app permissions:
 - `Metadata: Read`
-- `Contents: Read` only if `WORKSPACE_ENABLE_GIT_CLONE=true`
-
-Optional for future automation (not required today):
+- `Contents: Read and write`
 - `Pull requests: Read and write`
 
-Helper script:
+### 5) Modal deployment
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\send_execution_callback.ps1 `
-  -FeatureId "<feature-id>" `
-  -Event preview_ready `
-  -Secret "dev-webhook-secret" `
-  -PreviewUrl "https://preview.example.com/123" `
-  -GithubPrUrl "https://github.com/org/repo/pull/123"
-```
+For 24/7 hosting on Modal, follow:
+- `docs/SETUP_MODAL.md`
 
 ---
 

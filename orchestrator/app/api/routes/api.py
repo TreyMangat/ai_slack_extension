@@ -42,6 +42,7 @@ from app.services.feature_service import (
     update_feature_spec,
 )
 from app.services.github_adapter import get_github_adapter
+from app.services.github_repo import resolve_repo_for_spec
 from app.services.pr_description import build_standard_pr_body
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
@@ -335,7 +336,8 @@ async def _sync_standard_pr_body(feature: FeatureRequest) -> None:
         cloudflare_production_branch=settings.cloudflare_pages_production_branch,
         repo_path=None,
     )
-    github = get_github_adapter()
+    owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
+    github = get_github_adapter(owner=owner, repo=repo, strict=True)
     await github.update_pull_request_body(pr_number=pr_number, body=body)
 
 
@@ -483,6 +485,32 @@ def start_build(
     actor_id = (build_payload.actor_id or "").strip()
     if user.auth_source != "api_token" or not actor_id:
         actor_id = user.actor_id
+
+    settings = get_settings()
+    spec = feature.spec or {}
+    if not settings.mock_mode:
+        if not settings.github_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "GitHub integration must be enabled for non-mock builds.",
+                    "next_action": "Set GITHUB_ENABLED=true and configure GitHub auth.",
+                },
+            )
+        owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
+        if not owner or not repo:
+            detail: dict[str, object] = {
+                "message": "No target repository configured.",
+                "next_action": "Set spec.repo to org/repo or configure GITHUB_REPO_OWNER/GITHUB_REPO_NAME.",
+            }
+            install_url = settings.github_app_install_url_resolved()
+            if install_url:
+                detail["install_url"] = install_url
+            raise HTTPException(status_code=400, detail=detail)
+        try:
+            get_github_adapter(owner=owner, repo=repo, strict=True)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     if feature.status == BUILDING:
         payload_data = _build_idempotent_payload(feature)

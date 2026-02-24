@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 from rq import Connection, Worker
 
@@ -18,9 +19,10 @@ def main() -> None:
     settings.validate_runtime_guardrails()
     settings.validate_startup_prerequisites()
     redis_conn = get_redis()
+    burst = os.getenv("WORKER_BURST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
     with Connection(redis_conn):
         w = Worker(["default"])
-        w.work(with_scheduler=False)
+        w.work(with_scheduler=False, burst=burst)
 
 
 if __name__ == "__main__":

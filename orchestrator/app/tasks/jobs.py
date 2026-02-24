@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from textwrap import dedent
 from typing import Any
 
 from rich.console import Console
@@ -13,7 +11,7 @@ from app.observability import metrics
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
-from app.services.prompt_optimizer import detect_ui_feature
+from app.services.github_repo import resolve_repo_for_spec
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
@@ -73,94 +71,10 @@ def _workspace_plan(
     return plan
 
 
-def _issue_body_from_feature(feature: FeatureRequest, workspace_plan: dict[str, Any] | None = None) -> str:
-    settings = get_settings()
-    spec = feature.spec or {}
-    ac = spec.get("acceptance_criteria") or []
-    non_goals = spec.get("non_goals") or []
-    source_repos = spec.get("source_repos") or []
-    ui_feature, ui_keywords = detect_ui_feature(spec)
-    if bool(spec.get("ui_feature")):
-        ui_feature = True
-
-    ac_bullets = "\n".join([f"- {x}" for x in ac]) if ac else "- (none provided)"
-    ng_bullets = "\n".join([f"- {x}" for x in non_goals]) if non_goals else "- (none)"
-    risk = ", ".join(spec.get("risk_flags") or []) or "(none)"
-    source_repo_bullets = "\n".join([f"- {x}" for x in source_repos]) if source_repos else "- (none)"
-    ui_keywords_bullets = "\n".join([f"- {x}" for x in ui_keywords]) if ui_keywords else "- (none)"
-    preview_provider = settings.preview_provider_normalized() or "cloudflare_pages"
-    cloudflare_project = (settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
-    cloudflare_prod_branch = (settings.cloudflare_pages_production_branch or "").strip() or "main"
-    final_workspace_plan = workspace_plan or _workspace_plan(spec, feature.id)
-    optimized_prompt = str(spec.get("optimized_prompt", "")).strip()
-    optimized_prompt_section = ""
-    if optimized_prompt:
-        optimized_prompt_section = (
-            "\n## Optimized Build Prompt\n"
-            "```text\n"
-            f"{optimized_prompt}\n"
-            "```\n"
-        )
-
-    return dedent(
-        f"""
-        ## Feature Spec
-
-        **Title:** {spec.get('title', '')}
-
-        **Problem:**
-        {spec.get('problem', '')}
-
-        **Business justification (why now):**
-        {spec.get('business_justification', '')}
-
-        **Proposed solution:**
-        {spec.get('proposed_solution', '')}
-
-        **Implementation mode:** {spec.get('implementation_mode', 'new_feature')}
-
-        **Source repos (reference-only):**
-        {source_repo_bullets}
-
-        **Acceptance criteria:**
-        {ac_bullets}
-
-        **Non-goals:**
-        {ng_bullets}
-
-        **Risk flags:** {risk}
-
-        **UI feature:** {str(ui_feature).lower()}
-
-        **UI keyword matches:**
-        {ui_keywords_bullets}
-
-        **Preview provider:** {preview_provider}
-
-        **Cloudflare Pages project (if configured):** {cloudflare_project}
-
-        **Cloudflare Pages production branch:** {cloudflare_prod_branch}
-
-        ## Safe Workspace Plan
-        ```json
-        {json.dumps(final_workspace_plan, indent=2)}
-        ```
-        {optimized_prompt_section}
-
-        ---
-        ### Raw spec JSON
-        ```json
-        {json.dumps(spec, indent=2)}
-        ```
-        """
-    ).strip()
-
-
 async def kickoff_build(feature_id: str) -> None:
-    """Background job: create issue, trigger code runner, store PR/preview."""
+    """Background job: run code runner and store PR/preview outputs."""
 
     settings = get_settings()
-    github = get_github_adapter()
     coderunner = get_coderunner_adapter()
     slack = get_slack_adapter()
 
@@ -231,6 +145,45 @@ async def kickoff_build(feature_id: str) -> None:
                 )
             return
 
+        if not settings.mock_mode and not settings.github_enabled:
+            message = "GitHub integration must be enabled for non-mock builds (set GITHUB_ENABLED=true)."
+            feature.last_error = message
+            action_result = perform_action(feature.status, "fail_build")
+            validate_transition(feature.status, action_result.new_status)
+            feature.status = action_result.new_status
+            feature.active_build_job_id = ""
+            log_event(db, feature, event_type="build_failed", message=message)
+            metrics.inc("build_jobs_failed_total", 1)
+            if feature.slack_channel_id and feature.slack_thread_ts:
+                slack.post_thread_message(
+                    channel=feature.slack_channel_id,
+                    thread_ts=feature.slack_thread_ts,
+                    text=f"Build failed for *{feature.title}*: `{message}`",
+                )
+            return
+
+        owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
+        target_repo = f"{owner}/{repo}" if owner and repo else ""
+        feature.github_issue_url = ""
+        if not settings.mock_mode and not target_repo:
+            message = "No target repository configured. Set `spec.repo` (org/repo) or GITHUB_REPO_OWNER/GITHUB_REPO_NAME."
+            feature.last_error = message
+            action_result = perform_action(feature.status, "fail_build")
+            validate_transition(feature.status, action_result.new_status)
+            feature.status = action_result.new_status
+            feature.active_build_job_id = ""
+            log_event(db, feature, event_type="build_failed", message=message)
+            metrics.inc("build_jobs_failed_total", 1)
+            if feature.slack_channel_id and feature.slack_thread_ts:
+                install_url = settings.github_app_install_url_resolved()
+                install_hint = f"\nInstall URL: {install_url}" if install_url else ""
+                slack.post_thread_message(
+                    channel=feature.slack_channel_id,
+                    thread_ts=feature.slack_thread_ts,
+                    text=f"Build failed for *{feature.title}*: `{message}`{install_hint}",
+                )
+            return
+
         if feature.slack_channel_id and feature.slack_thread_ts:
             slack.post_thread_message(
                 channel=feature.slack_channel_id,
@@ -238,26 +191,21 @@ async def kickoff_build(feature_id: str) -> None:
                 text=(
                     f"Started build for *{feature.title}* (id: `{feature.id}`) | mode: `{mode}` | "
                     f"prepared references: {prepared_count}/{source_repo_count}"
+                    + (f" | repo: `{target_repo}`" if target_repo else "")
                 ),
             )
 
-        stage = "github_issue_create"
+        stage = "github_adapter_init"
         try:
-            issue = await github.create_issue(
-                title=feature.title,
-                body=_issue_body_from_feature(feature, workspace_plan=workspace_plan),
-                labels=["feature-factory"],
-            )
-            safe_issue_url = normalize_external_url(issue.html_url)
-            if safe_issue_url:
-                feature.github_issue_url = safe_issue_url
-            log_event(
-                db,
-                feature,
-                event_type="github_issue_created",
-                message=f"Created GitHub issue #{issue.number}",
-                data={"issue_url": safe_issue_url, "issue_number": issue.number},
-            )
+            github = get_github_adapter(owner=owner, repo=repo, strict=(not settings.mock_mode and settings.github_enabled))
+            if target_repo:
+                log_event(
+                    db,
+                    feature,
+                    event_type="github_repo_resolved",
+                    message=f"Resolved target repo {target_repo}",
+                    data={"repo": target_repo},
+                )
 
             stage = "coderunner_kickoff"
             optimized_prompt = _truncate_for_event(spec.get("optimized_prompt", ""), max_chars=6000)
@@ -277,14 +225,14 @@ async def kickoff_build(feature_id: str) -> None:
                     "ui_feature": bool(spec.get("ui_feature")),
                     "ui_keywords": spec.get("ui_keywords") or [],
                     "optimized_prompt": optimized_prompt,
-                    "github_issue_number": issue.number,
+                    "target_repo": target_repo,
                 },
             )
 
             result = await coderunner.kickoff(
                 github=github,
-                issue_number=issue.number,
-                trigger_comment=settings.opencode_trigger_comment,
+                issue_number=0,
+                trigger_comment="",
                 build_context=workspace_plan,
                 spec=spec,
                 feature_id=feature.id,
@@ -313,7 +261,7 @@ async def kickoff_build(feature_id: str) -> None:
                 db,
                 feature,
                 event_type="pr_opened",
-                message="PR opened (or trigger sent)",
+                message="PR opened",
                 data={"pr_url": safe_pr_url},
             )
 
@@ -331,8 +279,8 @@ async def kickoff_build(feature_id: str) -> None:
                     thread_ts=feature.slack_thread_ts,
                     text=(
                         f"PR step complete for *{feature.title}*\n"
-                        f"Issue: {feature.github_issue_url or '(none)'}\n"
-                        f"PR: {feature.github_pr_url or '(pending from OpenCode)'}"
+                        f"Repo: {target_repo or '(none)'}\n"
+                        f"PR: {feature.github_pr_url or '(pending)'}"
                         f"{runner_line}"
                     ),
                 )

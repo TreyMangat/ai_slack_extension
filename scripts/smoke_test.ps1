@@ -194,9 +194,8 @@ if ($EffectiveMockMode) {
 else {
   Assert-True (($validFeature.status -eq "PR_OPENED") -or ($validFeature.status -eq "PREVIEW_READY")) "Feature did not reach PR_OPENED/PREVIEW_READY in time"
 }
-Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_issue_url)) "github_issue_url missing"
+Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_pr_url)) "github_pr_url missing"
 if ($EffectiveMockMode) {
-  Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.github_pr_url)) "github_pr_url missing"
   Assert-True (-not [string]::IsNullOrWhiteSpace($validFeature.preview_url)) "preview_url missing"
 
   Write-Host "Approving feature..." -ForegroundColor Cyan

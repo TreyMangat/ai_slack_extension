@@ -1,6 +1,8 @@
-# Slack setup (Socket Mode)
+# Slack setup (Socket or HTTP mode)
 
-This scaffold uses **Slack Bolt (Python)** with **Socket Mode**.
+This scaffold uses **Slack Bolt (Python)** with either:
+- `SLACK_MODE=socket` (separate bot process)
+- `SLACK_MODE=http` (events served by FastAPI at `/api/slack/events`, recommended for Modal/cloud)
 The `/feature` flow is designed for non-technical users:
 - guided thread-based chat intake (no popup modal)
 - automatic clarification prompts if required fields are missing
@@ -41,8 +43,9 @@ The `/feature` flow is designed for non-technical users:
 
 Set:
 - `ENABLE_SLACK_BOT=true`
+- `SLACK_MODE=socket|http`
 - `SLACK_BOT_TOKEN=xoxb-...`
-- `SLACK_APP_TOKEN=xapp-...`
+- `SLACK_APP_TOKEN=xapp-...` (required for `SLACK_MODE=socket`)
 - `REVIEWER_ALLOWED_USERS=U0123ABC,U0456DEF` (recommended)
 
 Optional restrictions:
@@ -51,11 +54,16 @@ Optional restrictions:
 - `SLACK_REQUIRE_MENTION=true`
 - `REVIEWER_CHANNEL_ID=C09REVIEW`
 
-Restart docker compose with the Slack profile:
+Socket mode restart (docker compose with Slack profile):
 
 ```powershell
 docker compose --profile slack up --build
 ```
+
+HTTP mode (FastAPI-served endpoint):
+- set `SLACK_MODE=http`
+- set Slack Request URL to: `<BASE_URL>/api/slack/events`
+- do not run the separate socket-mode `slackbot` worker for this mode
 
 After changing scopes/event subscriptions, reinstall or re-authorize the app in your workspace.
 

@@ -29,8 +29,7 @@ class GitHubTokenProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._lock = threading.Lock()
-        self._cached_token = ""
-        self._cached_expires_at = datetime.fromtimestamp(0, tz=timezone.utc)
+        self._cached_by_installation: dict[str, tuple[str, datetime]] = {}
 
     def _mode(self) -> str:
         return self.settings.github_auth_mode_normalized()
@@ -72,22 +71,23 @@ class GitHubTokenProvider:
         }
         return jwt.encode(payload, private_key, algorithm="RS256")
 
-    def _fetch_installation_token(self) -> tuple[str, datetime]:
-        installation_id = (self.settings.github_app_installation_id or "").strip()
-        if not installation_id:
-            raise GitHubAuthError("GITHUB_APP_INSTALLATION_ID is required when GITHUB_AUTH_MODE=app")
-
-        api_base = self.settings.github_api_base.rstrip("/")
+    def _app_headers(self) -> dict[str, str]:
         jwt_token = self._mint_app_jwt()
-        url = f"{api_base}/app/installations/{installation_id}/access_tokens"
-        headers = {
+        return {
             "Authorization": f"Bearer {jwt_token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
+    def _fetch_installation_token(self, installation_id: str) -> tuple[str, datetime]:
+        normalized_installation_id = (installation_id or "").strip()
+        if not normalized_installation_id:
+            raise GitHubAuthError("installation id is required when requesting GitHub App token")
+        api_base = self.settings.github_api_base.rstrip("/")
+        url = f"{api_base}/app/installations/{normalized_installation_id}/access_tokens"
+
         with httpx.Client(timeout=30) as client:
-            response = client.post(url, headers=headers, json={})
+            response = client.post(url, headers=self._app_headers(), json={})
             response.raise_for_status()
             data = response.json()
 
@@ -97,25 +97,71 @@ class GitHubTokenProvider:
             raise GitHubAuthError("GitHub App installation token response missing token")
         return token, expires_at
 
-    def get_token(self) -> str:
+    def resolve_installation_id_for_repo(self, *, owner: str, repo: str) -> str:
+        normalized_owner = (owner or "").strip()
+        normalized_repo = (repo or "").strip()
+        if not normalized_owner or not normalized_repo:
+            raise GitHubAuthError("owner/repo is required for dynamic GitHub App installation lookup")
+
+        api_base = self.settings.github_api_base.rstrip("/")
+        url = f"{api_base}/repos/{normalized_owner}/{normalized_repo}/installation"
+
+        with httpx.Client(timeout=30) as client:
+            response = client.get(url, headers=self._app_headers())
+        if response.status_code == 404:
+            install_url = self.settings.github_app_install_url_resolved()
+            message = f"GitHub App is not installed on repo {normalized_owner}/{normalized_repo}."
+            if install_url:
+                message += f" Install it here: {install_url}"
+            raise GitHubAuthError(message)
+        response.raise_for_status()
+        payload = response.json()
+        installation_id = str(payload.get("id") or "").strip()
+        if not installation_id:
+            raise GitHubAuthError(
+                f"GitHub App installation lookup returned no installation id for {normalized_owner}/{normalized_repo}"
+            )
+        return installation_id
+
+    def _get_installation_token(self, installation_id: str) -> str:
+        normalized_installation_id = (installation_id or "").strip()
+        if not normalized_installation_id:
+            raise GitHubAuthError("GitHub App installation id is required")
+
+        now = datetime.now(tz=timezone.utc)
+        cached = self._cached_by_installation.get(normalized_installation_id)
+        if cached and now < (cached[1] - timedelta(seconds=60)):
+            return cached[0]
+
+        with self._lock:
+            now = datetime.now(tz=timezone.utc)
+            cached = self._cached_by_installation.get(normalized_installation_id)
+            if cached and now < (cached[1] - timedelta(seconds=60)):
+                return cached[0]
+            token, expires_at = self._fetch_installation_token(normalized_installation_id)
+            self._cached_by_installation[normalized_installation_id] = (token, expires_at)
+            return token
+
+    def get_token(self, *, owner: str = "", repo: str = "") -> str:
         mode = self._mode()
         if mode in {"", "token", "pat"}:
             return self._token_from_pat()
         if mode != "app":
             raise GitHubAuthError(f"Unsupported GITHUB_AUTH_MODE '{self.settings.github_auth_mode}'")
 
-        now = datetime.now(tz=timezone.utc)
-        if self._cached_token and now < (self._cached_expires_at - timedelta(seconds=60)):
-            return self._cached_token
+        configured_installation_id = (self.settings.github_app_installation_id or "").strip()
+        if configured_installation_id:
+            return self._get_installation_token(configured_installation_id)
 
-        with self._lock:
-            now = datetime.now(tz=timezone.utc)
-            if self._cached_token and now < (self._cached_expires_at - timedelta(seconds=60)):
-                return self._cached_token
-            token, expires_at = self._fetch_installation_token()
-            self._cached_token = token
-            self._cached_expires_at = expires_at
-            return token
+        normalized_owner = (owner or "").strip()
+        normalized_repo = (repo or "").strip()
+        if not normalized_owner or not normalized_repo:
+            raise GitHubAuthError(
+                "GITHUB_AUTH_MODE=app requires either GITHUB_APP_INSTALLATION_ID or a target repo "
+                "(owner/repo) to resolve installation dynamically."
+            )
+        installation_id = self.resolve_installation_id_for_repo(owner=normalized_owner, repo=normalized_repo)
+        return self._get_installation_token(installation_id)
 
 
 @lru_cache

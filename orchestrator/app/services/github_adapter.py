@@ -68,7 +68,7 @@ class RealGitHubAdapter(GitHubAdapter):
         self.initial_backoff_seconds = 0.5
 
     def _headers(self) -> dict[str, str]:
-        token = self.token_provider.get_token()
+        token = self.token_provider.get_token(owner=self.owner, repo=self.repo)
         return {
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -149,37 +149,50 @@ class RealGitHubAdapter(GitHubAdapter):
         await self._request_with_retry(method="PATCH", url=url, payload=payload)
 
 
-def get_github_adapter() -> GitHubAdapter:
+def get_github_adapter(*, owner: str = "", repo: str = "", strict: bool = False) -> GitHubAdapter:
     settings = get_settings()
 
     if settings.mock_mode or not settings.github_enabled:
         return MockGitHubAdapter()
 
-    if not (settings.github_repo_owner and settings.github_repo_name):
-        console.print("[yellow]GitHub enabled but missing owner/repo. Falling back to mock adapter.[/yellow]")
+    resolved_owner = (owner or settings.github_repo_owner or "").strip()
+    resolved_repo = (repo or settings.github_repo_name or "").strip()
+    if not (resolved_owner and resolved_repo):
+        message = "GitHub enabled but missing owner/repo."
+        if strict:
+            raise RuntimeError(message)
+        console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
         return MockGitHubAdapter()
 
     mode = settings.github_auth_mode_normalized()
     if mode in {"", "token", "pat"} and not settings.github_token:
-        console.print("[yellow]GitHub token auth selected but GITHUB_TOKEN is empty. Falling back to mock adapter.[/yellow]")
+        message = "GitHub token auth selected but GITHUB_TOKEN is empty."
+        if strict:
+            raise RuntimeError(message)
+        console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
         return MockGitHubAdapter()
     if mode == "app":
-        if not settings.github_app_id or not settings.github_app_installation_id:
-            console.print(
-                "[yellow]GitHub App auth selected but app identifiers are missing. Falling back to mock adapter.[/yellow]"
-            )
+        if not settings.github_app_id:
+            message = "GitHub App auth selected but GITHUB_APP_ID is missing."
+            if strict:
+                raise RuntimeError(message)
+            console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
             return MockGitHubAdapter()
         if not settings.github_app_private_key and not settings.github_app_private_key_path:
-            console.print(
-                "[yellow]GitHub App auth selected but private key is missing. Falling back to mock adapter.[/yellow]"
-            )
+            message = "GitHub App auth selected but private key is missing."
+            if strict:
+                raise RuntimeError(message)
+            console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
             return MockGitHubAdapter()
     if mode not in {"", "token", "pat", "app"}:
-        console.print(f"[yellow]Unsupported GITHUB_AUTH_MODE={settings.github_auth_mode}. Falling back to mock.[/yellow]")
+        message = f"Unsupported GITHUB_AUTH_MODE={settings.github_auth_mode}."
+        if strict:
+            raise RuntimeError(message)
+        console.print(f"[yellow]{message} Falling back to mock.[/yellow]")
         return MockGitHubAdapter()
 
     return RealGitHubAdapter(
-        owner=settings.github_repo_owner,
-        repo=settings.github_repo_name,
+        owner=resolved_owner,
+        repo=resolved_repo,
         api_base=settings.github_api_base,
     )

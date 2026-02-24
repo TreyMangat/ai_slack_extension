@@ -57,3 +57,12 @@ def test_validate_startup_prerequisites_rejects_missing_openclaw_auth(monkeypatc
     settings = Settings()
     with pytest.raises(RuntimeError):
         settings.validate_startup_prerequisites()
+
+
+def test_github_app_install_url_resolved_from_slug(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://feature:feature@db:5432/feature_factory")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("GITHUB_APP_SLUG", "feature-factory-bot")
+    settings = Settings()
+    assert settings.github_app_install_url_resolved() == "https://github.com/apps/feature-factory-bot/installations/new"

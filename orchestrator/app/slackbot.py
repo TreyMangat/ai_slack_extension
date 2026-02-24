@@ -240,7 +240,7 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
     mode = spec.get("implementation_mode", "new_feature")
     preview = feature.get("preview_url") or ""
     pr = feature.get("github_pr_url") or ""
-    issue = feature.get("github_issue_url") or ""
+    repo_hint = str(spec.get("repo") or "").strip()
     validation = spec.get("_validation") or {}
     missing = validation.get("missing") or []
     missing_summary = ", ".join(missing) if missing else "none"
@@ -296,7 +296,7 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f"Issue: {issue or '(none)'} | PR: {pr or '(pending)'} | "
+                        f"Repo: {repo_hint or '(none)'} | PR: {pr or '(pending)'} | "
                         f"Preview: {preview or '(none)'}"
                     ),
                 }
@@ -656,10 +656,16 @@ def _enqueue_build_for_feature(
             if isinstance(detail, dict):
                 missing = [str(x).strip() for x in (detail.get("missing") or []) if str(x).strip()]
                 base_message = str(detail.get("message") or "").strip()
+                next_action = str(detail.get("next_action") or "").strip()
+                install_url = str(detail.get("install_url") or "").strip()
                 if missing:
                     detail_text = f"{base_message} Missing: {', '.join(missing)}."
                 else:
                     detail_text = base_message
+                if next_action:
+                    detail_text = f"{detail_text} {next_action}".strip()
+                if install_url:
+                    detail_text = f"{detail_text} Install: {install_url}".strip()
             else:
                 detail_text = str(detail or "").strip()
         except Exception:  # noqa: BLE001
@@ -815,21 +821,8 @@ def _finalize_update_session(client: Any, settings: Any, session: IntakeSession)
         )
 
 
-def main() -> None:
-    settings = get_settings()
-
-    if not settings.enable_slack_bot:
-        console.print("[yellow]Slack bot is disabled (ENABLE_SLACK_BOT=false). Sleeping...[/yellow]")
-        while True:
-            time.sleep(3600)
-
-    if not settings.slack_bot_token or not settings.slack_app_token:
-        console.print("[red]Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN. Sleeping...[/red]")
-        while True:
-            time.sleep(3600)
-
+def create_slack_bolt_app(settings: Any):
     from slack_bolt import App
-    from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret or "")
 
@@ -1034,6 +1027,32 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=f"Failed to approve: `{e}`")
 
+    return app
+
+
+def main() -> None:
+    settings = get_settings()
+
+    if not settings.enable_slack_bot:
+        console.print("[yellow]Slack bot is disabled (ENABLE_SLACK_BOT=false). Sleeping...[/yellow]")
+        while True:
+            time.sleep(3600)
+
+    if settings.slack_mode_normalized() != "socket":
+        console.print(
+            "[yellow]Slack bot process only runs in socket mode; set SLACK_MODE=socket or run HTTP mode in FastAPI.[/yellow]"
+        )
+        while True:
+            time.sleep(3600)
+
+    if not settings.slack_bot_token or not settings.slack_app_token:
+        console.print("[red]Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN. Sleeping...[/red]")
+        while True:
+            time.sleep(3600)
+
+    from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+    app = create_slack_bolt_app(settings)
     console.print("[green]Starting Slack Socket Mode handler...[/green]")
     SocketModeHandler(app, settings.slack_app_token).start()
 

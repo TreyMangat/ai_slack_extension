@@ -42,7 +42,7 @@ RBAC defaults:
 
 Current behavior:
 - In `MOCK_MODE=true`, the code runner is simulated and returns mock PR/preview URLs.
-- In `MOCK_MODE=false`, orchestrator creates a GitHub issue and posts the OpenCode trigger comment.
+- In `MOCK_MODE=false`, orchestrator runs the code runner and opens a PR directly.
 - External runner (OpenCode/CI) performs the real coding work and calls back to:
   - `POST /api/integrations/execution-callback`
   - include `X-Feature-Factory-Event-Id` for idempotent replay-safe callbacks
@@ -53,8 +53,8 @@ So, production code generation does not happen on end-user machines; it happens 
 
 1. Request created (Slack/UI/API) -> spec validated.
 2. Build starts -> isolated workspace snapshot prepared.
-3. GitHub issue created (+ OpenCode trigger comment in real mode).
-4. External runner opens PR + preview and sends signed callback.
+3. Code runner opens PR from isolated branch.
+4. Preview/callback updates are posted to orchestrator.
 5. Reviewer/admin approves in Slack/UI (`REVIEWER_ALLOWED_USERS` enforced).
 6. Feature advances to merge-ready states.
 
@@ -68,7 +68,7 @@ GitHub auth modes:
 
 Persisted:
 - Postgres: feature requests, state transitions, audit events.
-- GitHub: issues/PRs/branches (if real integration is used).
+- GitHub: PRs/branches (if real integration is used).
 
 Ephemeral/local:
 - Workspace snapshots under `WORKSPACE_ROOT`.

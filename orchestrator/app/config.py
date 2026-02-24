@@ -71,22 +71,18 @@ class Settings(BaseSettings):
     github_app_private_key: str = Field(default="", alias="GITHUB_APP_PRIVATE_KEY")
     github_app_private_key_path: str = Field(default="", alias="GITHUB_APP_PRIVATE_KEY_PATH")
     github_app_jwt_ttl_seconds: int = Field(default=540, alias="GITHUB_APP_JWT_TTL_SECONDS")
+    github_app_slug: str = Field(default="", alias="GITHUB_APP_SLUG")
+    github_app_install_url: str = Field(default="", alias="GITHUB_APP_INSTALL_URL")
     github_repo_owner: str = Field(default="", alias="GITHUB_REPO_OWNER")
     github_repo_name: str = Field(default="", alias="GITHUB_REPO_NAME")
     github_api_base: str = Field(default="https://api.github.com", alias="GITHUB_API_BASE")
     github_default_branch: str = Field(default="main", alias="GITHUB_DEFAULT_BRANCH")
 
-    opencode_trigger_comment: str = Field(
-        default="/oc Implement this issue. Follow the acceptance criteria. Add tests.",
-        alias="OPENCODE_TRIGGER_COMMENT",
-    )
-
     # Code runner strategy:
-    # - opencode: trigger external OpenCode workflow via issue comment (default)
+    # - opencode: run OpenClaw inside worker and open PR directly
     # - native_llm: run in-container LLM coding loop (experimental)
     coderunner_mode: str = Field(default="opencode", alias="CODERUNNER_MODE")
     # opencode execution strategy:
-    # - github_issue_comment: delegated mode; trigger external workflow by issue comment
     # - local_openclaw: run OpenClaw locally inside worker container, then commit + open PR
     opencode_execution_mode: str = Field(default="local_openclaw", alias="OPENCODE_EXECUTION_MODE")
     openclaw_auth_dir: str = Field(default="/home/app/.openclaw", alias="OPENCLAW_AUTH_DIR")
@@ -232,6 +228,8 @@ class Settings(BaseSettings):
             "enable_slack_bot": bool(self.enable_slack_bot),
             "github_enabled": bool(self.github_enabled),
             "github_auth_mode": self.github_auth_mode_normalized() or "token",
+            "github_app_slug": (self.github_app_slug or "").strip(),
+            "github_app_install_url": self.github_app_install_url_resolved(),
             "github_app_private_key_configured": bool(key_path or (self.github_app_private_key or "").strip()),
             "github_app_private_key_file_exists": bool(key_file_exists),
             "workspace_enable_git_clone": bool(self.workspace_enable_git_clone),
@@ -267,6 +265,9 @@ class Settings(BaseSettings):
     def github_auth_mode_normalized(self) -> str:
         return (self.github_auth_mode or "").strip().lower()
 
+    def slack_mode_normalized(self) -> str:
+        return (self.slack_mode or "").strip().lower()
+
     def coderunner_mode_normalized(self) -> str:
         return (self.coderunner_mode or "").strip().lower()
 
@@ -287,6 +288,15 @@ class Settings(BaseSettings):
 
     def rbac_approver_rules(self) -> list[str]:
         return self._parse_csv(self.rbac_approvers)
+
+    def github_app_install_url_resolved(self) -> str:
+        explicit = (self.github_app_install_url or "").strip()
+        if explicit:
+            return explicit
+        slug = (self.github_app_slug or "").strip()
+        if slug:
+            return f"https://github.com/apps/{slug}/installations/new"
+        return ""
 
 
 @lru_cache

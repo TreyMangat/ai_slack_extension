@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -122,9 +123,13 @@ def run_stale_callback_alerts_once() -> None:
 
 def main() -> None:
     settings = get_settings()
+    run_once = os.getenv("CLEANUP_RUN_ONCE", "").strip().lower() in {"1", "true", "yes", "on"}
     interval_minutes = max(settings.workspace_cleanup_interval_minutes, 1)
     interval_seconds = interval_minutes * 60
-    console.print(f"[green]Starting workspace cleanup worker (interval={interval_minutes}m)[/green]")
+    if run_once:
+        console.print("[green]Running one-shot cleanup cycle[/green]")
+    else:
+        console.print(f"[green]Starting workspace cleanup worker (interval={interval_minutes}m)[/green]")
 
     while True:
         try:
@@ -132,6 +137,8 @@ def main() -> None:
             run_stale_callback_alerts_once()
         except Exception as e:  # noqa: BLE001
             console.print(f"[yellow]workspace cleanup worker error: {e}[/yellow]")
+        if run_once:
+            return
         time.sleep(interval_seconds)
 
 
