@@ -50,6 +50,22 @@ SESSION_TTL_SECONDS = 2 * 60 * 60
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 SKIP_TOKENS = {"skip", "n/a", "na", "none", "no", "not sure", "unsure", "unknown", "idk"}
 
+SLACK_INTRO_MESSAGE = (
+    "Hey — I’m your Feature Factory Slack bot 👋 "
+    "I turn your requests into implementable feature work: I collect requirements, kick off builds, "
+    "and post progress updates back into Slack."
+)
+
+
+def _is_directed_to_bot(event: dict[str, Any], *, bot_user_id: str) -> bool:
+    channel_type = str(event.get("channel_type") or "").strip().lower()
+    if channel_type == "im":
+        return True
+    if not bot_user_id:
+        return False
+    text = str(event.get("text") or "")
+    return f"<@{bot_user_id}>" in text
+
 
 @dataclass
 class IntakeSession:
@@ -833,6 +849,13 @@ def main() -> None:
 
     app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret or "")
 
+    bot_user_id = ""
+    try:
+        auth_info = app.client.auth_test()
+        bot_user_id = str(auth_info.get("user_id") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[yellow]Slack auth_test failed; mention-detection disabled: {e}[/yellow]")
+
     @app.command("/feature")
     def handle_feature(ack, body, client, logger):
         ack()
@@ -867,7 +890,15 @@ def main() -> None:
         thread_ts = str(event.get("thread_ts") or "").strip()
         text = str(event.get("text") or "").strip()
 
-        if not user_id or not channel_id or not thread_ts:
+        if not user_id or not channel_id:
+            return
+
+        directed_to_bot = _is_directed_to_bot(event, bot_user_id=bot_user_id)
+        if directed_to_bot and not thread_ts:
+            client.chat_postMessage(channel=channel_id, text=SLACK_INTRO_MESSAGE)
+            return
+
+        if not thread_ts:
             return
 
         session = _get_session(channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
