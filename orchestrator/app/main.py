@@ -44,15 +44,21 @@ def create_app() -> FastAPI:
     # Routes
     app.include_router(api_router)
     if settings.enable_slack_bot and settings.slack_mode_normalized() == "http":
-        from slack_bolt.adapter.fastapi import SlackRequestHandler
+        try:
+            from slack_bolt.adapter.fastapi import SlackRequestHandler
 
-        from app.slackbot import create_slack_bolt_app
+            from app.slackbot import create_slack_bolt_app
 
-        slack_handler = SlackRequestHandler(create_slack_bolt_app(settings))
+            slack_handler = SlackRequestHandler(create_slack_bolt_app(settings))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("slack_http_init_failed error=%s", e)
+            slack_handler = None
 
-        @app.post("/api/slack/events")
-        async def slack_events(request: Request):
-            return await slack_handler.handle(request)
+        if slack_handler is not None:
+
+            @app.post("/api/slack/events")
+            async def slack_events(request: Request):
+                return await slack_handler.handle(request)
 
     install_request_observability(app)
 

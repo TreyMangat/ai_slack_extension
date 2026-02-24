@@ -10,8 +10,8 @@ Build flow is PR-first (no GitHub issue ticket creation).
 ## 1) Prerequisites
 
 1. Modal account + CLI auth
-- Install: `pip install modal`
-- Login: `modal token new`
+- Install (Windows + Python 3.12): `py -3.12 -m pip install modal`
+- Login: `py -3.12 -m modal token new`
 
 2. Managed Postgres + Redis
 - Set `DATABASE_URL` and `REDIS_URL` to managed services (not local Docker URLs).
@@ -33,7 +33,7 @@ Use `.env.example` as the base and set production values.
 
 Required values for Modal:
 - `APP_ENV=prod`
-- `RUN_MIGRATIONS=true`
+- `RUN_MIGRATIONS=false` (recommended for low-cost steady-state; run migrations manually during release)
 - `MOCK_MODE=false`
 - `GITHUB_ENABLED=true`
 - `GITHUB_AUTH_MODE=app`
@@ -57,28 +57,48 @@ Recommended:
 - `AUTH_MODE=edge_sso` (or `api_token`)
 - `API_AUTH_TOKEN=...`
 - `DISABLE_AUTOMERGE=true`
+- low-cost defaults (already set in `modal_app.py`, override only if needed):
+  - `MODAL_API_MIN_CONTAINERS=0`
+  - `MODAL_API_MAX_CONTAINERS=1`
+  - `MODAL_API_ALLOW_CONCURRENT_INPUTS=8`
+  - `MODAL_QUEUE_DRAIN_SECONDS=180`
+  - `MODAL_CLEANUP_INTERVAL_MINUTES=120`
+  - `MODAL_SKIP_WORKER_WHEN_QUEUE_EMPTY=true`
 
-Slack on Modal (optional, recommended via HTTP mode):
-- `ENABLE_SLACK_BOT=true`
-- `SLACK_MODE=http`
-- `SLACK_BOT_TOKEN=xoxb-...`
-- `SLACK_SIGNING_SECRET=...`
-- Set Slack Request URL to: `<BASE_URL>/api/slack/events`
+Slack on Modal (optional):
+- HTTP mode:
+  - `ENABLE_SLACK_BOT=true`
+  - `SLACK_MODE=http`
+  - `SLACK_BOT_TOKEN=xoxb-...`
+  - `SLACK_SIGNING_SECRET=...`
+  - Set Slack Request URL to: `<BASE_URL>/api/slack/events`
+- Socket mode:
+  - `ENABLE_SLACK_BOT=true`
+  - `SLACK_MODE=socket`
+  - `SLACK_BOT_TOKEN=xoxb-...`
+  - `SLACK_APP_TOKEN=xapp-...`
+  - run the separate socket worker process (not the FastAPI webhook route)
 
 ## 3) Create Modal Secret
 
 Create one secret containing all env vars above:
 
 ```powershell
-modal secret create feature-factory-env `
+py -3.12 -m modal secret create feature-factory-env `
   APP_ENV=prod `
-  RUN_MIGRATIONS=true `
+  RUN_MIGRATIONS=false `
   MOCK_MODE=false `
   GITHUB_ENABLED=true `
   GITHUB_AUTH_MODE=app `
   GITHUB_APP_ID=123456 `
   GITHUB_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----" `
   GITHUB_APP_SLUG=your-app-slug `
+  MODAL_API_MIN_CONTAINERS=0 `
+  MODAL_API_MAX_CONTAINERS=1 `
+  MODAL_API_ALLOW_CONCURRENT_INPUTS=8 `
+  MODAL_QUEUE_DRAIN_SECONDS=180 `
+  MODAL_CLEANUP_INTERVAL_MINUTES=120 `
+  MODAL_SKIP_WORKER_WHEN_QUEUE_EMPTY=true `
   DATABASE_URL="postgresql+psycopg2://..." `
   REDIS_URL="redis://..." `
   SECRET_KEY="replace-me" `
@@ -91,13 +111,29 @@ modal secret create feature-factory-env `
 From repo root:
 
 ```powershell
-modal deploy .\modal_app.py
+py -3.12 -m modal deploy .\modal_app.py
 ```
 
 This deploys:
-- `api` (always-on container with `min_containers=1`)
-- queue drainer schedule (every 20s)
-- cleanup schedule (every 5m)
+- `api` (scale-to-zero by default: `min_containers=0`)
+- queue drainer schedule (every 180s by default)
+- cleanup schedule (every 120m by default)
+
+Production helper (recommended):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>"
+```
+
+The helper script:
+- syncs `feature-factory-env` and `slack-secret` from `.env`
+- syncs provider-specific secrets `NeonURL` and `feature-factory-redis`
+- maps `NEONURL -> DATABASE_URL` and `UPSTASH_REDIS_URL -> REDIS_URL` when needed
+- enforces `sslmode=require` for Neon URLs and `rediss://` for Upstash URLs
+- enforces production-safe env defaults
+- loads GitHub App private key from local PEM when needed
+- bundles `secrets/openclaw` into the Modal image when using `opencode/local_openclaw`
+- deploys via Python 3.12 and verifies `/health`, `/health/ready`, and `/health/runtime`
 
 ## 5) Configure Slack (Optional)
 

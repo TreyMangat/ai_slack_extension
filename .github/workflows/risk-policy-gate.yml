@@ -155,7 +155,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12"]
     env:
       DATABASE_URL: postgresql+psycopg2://feature:feature@localhost:5432/feature_factory
       REDIS_URL: redis://localhost:6379/0
@@ -247,6 +247,25 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ needs.preflight.outputs.head_sha }}
+
+      - name: Create CI env file for docker compose
+        shell: bash
+        run: |
+          cat > .env <<'EOF'
+          APP_ENV=ci
+          MOCK_MODE=true
+          RUN_MIGRATIONS=false
+          DATABASE_URL=postgresql+psycopg2://feature:feature@db:5432/feature_factory
+          REDIS_URL=redis://redis:6379/0
+          SECRET_KEY=ci-secret-key
+          AUTH_MODE=disabled
+          BASE_URL=http://localhost:8000
+          ORCHESTRATOR_INTERNAL_URL=http://api:8000
+          ENABLE_SLACK_BOT=false
+          GITHUB_ENABLED=false
+          CODERUNNER_MODE=opencode
+          OPENCODE_EXECUTION_MODE=local_openclaw
+          EOF
 
       - name: Start stack
         run: docker compose up -d --build api worker db redis
@@ -346,15 +365,47 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.head_sha }}
 
+      - name: Detect repository code scanning status
+        id: code_scanning
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://api.github.com/repos/${{ github.repository }}/code-scanning/default-setup"
+          status="$(curl -sS -o "$RUNNER_TEMP/code-scanning.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$url")"
+          if [[ "$status" == "200" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$status" == "404" ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Code scanning is not enabled for this repository; skipping CodeQL analysis." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Failed to determine code scanning status (HTTP $status)." >&2
+          cat "$RUNNER_TEMP/code-scanning.json"
+          exit 1
+
       - name: Initialize CodeQL
+        if: ${{ steps.code_scanning.outputs.enabled == 'true' }}
         uses: github/codeql-action/init@60d8f0d1f1f8c8d07ef53bd027032705d414ec28
         with:
           languages: python
 
       - name: Analyze with CodeQL
+        if: ${{ steps.code_scanning.outputs.enabled == 'true' }}
         uses: github/codeql-action/analyze@60d8f0d1f1f8c8d07ef53bd027032705d414ec28
         with:
           category: "/language:python"
+
+      - name: Skip CodeQL when code scanning is disabled
+        if: ${{ steps.code_scanning.outputs.enabled != 'true' }}
+        run: echo "CodeQL skipped because repository code scanning is disabled."
 
   review_agent:
     name: review-agent

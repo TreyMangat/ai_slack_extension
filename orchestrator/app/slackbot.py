@@ -327,6 +327,43 @@ def _post_clarification_prompt(client: Any, channel_id: str, thread_ts: str, fea
     client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=prompt)
 
 
+def _intro_message(settings: Any) -> str:
+    return (
+        "Hi! I am Feature Factory. Use `/feature <what you want built>` in this channel and I will:\n"
+        "- collect details in-thread,\n"
+        "- create a tracked feature request,\n"
+        "- and start a build that opens a PR for review.\n"
+        f"Dashboard: {settings.base_url}"
+    )
+
+
+def _post_intro_messages(
+    client: Any,
+    settings: Any,
+    *,
+    channel_id: str,
+    inviter_id: str,
+    logger: Any,
+) -> None:
+    text = _intro_message(settings)
+    try:
+        client.chat_postMessage(channel=channel_id, text=text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("slack_intro_channel_post_failed channel=%s error=%s", channel_id, e)
+
+    if not inviter_id:
+        return
+
+    dm_text = (
+        "Thanks for adding Feature Factory.\n"
+        "Anyone in that channel can now use `/feature` to request work and track build/PR progress."
+    )
+    try:
+        client.chat_postMessage(channel=inviter_id, text=dm_text)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("slack_intro_dm_failed user=%s error=%s", inviter_id, e)
+
+
 def _api_headers(settings: Any, *, actor: str = "slackbot") -> dict[str, str] | None:
     token = (settings.api_auth_token or "").strip()
     if not token:
@@ -825,6 +862,38 @@ def create_slack_bolt_app(settings: Any):
     from slack_bolt import App
 
     app = App(token=settings.slack_bot_token, signing_secret=settings.slack_signing_secret or "")
+    cached_bot_user_id = ""
+
+    def _resolve_bot_user_id(client: Any) -> str:
+        nonlocal cached_bot_user_id
+        if cached_bot_user_id:
+            return cached_bot_user_id
+        try:
+            payload = client.auth_test()
+            cached_bot_user_id = str(payload.get("user_id") or "").strip()
+        except Exception:
+            cached_bot_user_id = ""
+        return cached_bot_user_id
+
+    @app.event("member_joined_channel")
+    def handle_member_joined_channel(event, client, logger):
+        channel_id = str(event.get("channel") or "").strip()
+        joined_user_id = str(event.get("user") or "").strip()
+        inviter_id = str(event.get("inviter") or "").strip()
+        if not channel_id or not joined_user_id:
+            return
+
+        bot_user_id = _resolve_bot_user_id(client)
+        if not bot_user_id or joined_user_id != bot_user_id:
+            return
+
+        _post_intro_messages(
+            client,
+            settings,
+            channel_id=channel_id,
+            inviter_id=inviter_id,
+            logger=logger,
+        )
 
     @app.command("/feature")
     def handle_feature(ack, body, client, logger):

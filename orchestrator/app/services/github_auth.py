@@ -51,8 +51,15 @@ class GitHubTokenProvider:
             return path.read_text(encoding="utf-8")
 
         if inline_key:
-            # Supports multiline content passed through env.
-            return inline_key.replace("\\n", "\n")
+            # Supports multiline content passed through env and normalizes
+            # historical escaped forms produced by earlier deploy tooling.
+            normalized = inline_key.strip()
+            if normalized.startswith('"') and normalized.endswith('"') and len(normalized) >= 2:
+                normalized = normalized[1:-1]
+            normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n")
+            normalized = normalized.replace("\\\n", "\n")
+            normalized = normalized.replace("\r\n", "\n")
+            return normalized
 
         raise GitHubAuthError("GitHub App auth requires GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY")
 

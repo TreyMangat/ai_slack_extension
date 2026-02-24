@@ -31,6 +31,7 @@ The `/feature` flow is designed for non-technical users:
    - `mpim:history`
 
 7. Event subscriptions (bot events):
+   - `member_joined_channel` (recommended: posts onboarding message when bot is invited)
    - `message.channels`
    - `message.groups`
    - `message.im`
@@ -64,6 +65,7 @@ HTTP mode (FastAPI-served endpoint):
 - set `SLACK_MODE=http`
 - set Slack Request URL to: `<BASE_URL>/api/slack/events`
 - do not run the separate socket-mode `slackbot` worker for this mode
+- when the bot is invited to a channel, it posts a short onboarding message and DMs the inviter
 
 After changing scopes/event subscriptions, reinstall or re-authorize the app in your workspace.
 
