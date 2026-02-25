@@ -3,36 +3,7 @@ from __future__ import annotations
 from app.services.pr_description import build_standard_pr_body
 
 
-def test_build_standard_pr_body_for_ui_without_preview_url() -> None:
-    spec = {
-        "title": "Add checkout page UI",
-        "problem": "Need a new checkout interface with cleaner layout",
-        "business_justification": "Improve conversion in checkout flow",
-        "acceptance_criteria": ["Checkout form renders", "Primary CTA is visible"],
-        "ui_feature": True,
-    }
-    body = build_standard_pr_body(
-        spec=spec,
-        feature_id="11111111-1111-1111-1111-111111111111",
-        issue_number=12,
-        branch_name="feature-factory/test",
-        runner_name="opencode-local-openclaw",
-        runner_model="openai-codex/gpt-5.3-codex",
-        summary="Implemented checkout layout and call-to-action refinements.",
-        verification_output="npm run build passed",
-        verification_command="pytest -q",
-        verification_warning="",
-        preview_url="",
-        cloudflare_project_name="ff-pages",
-        cloudflare_production_branch="main",
-    )
-    assert "## UI Preview" in body
-    assert "Cloudflare Pages" in body
-    assert "## What Changed" in body
-    assert "## Acceptance Criteria" in body
-
-
-def test_build_standard_pr_body_for_non_ui_includes_example_output() -> None:
+def test_build_standard_pr_body_includes_example_output_when_no_preview() -> None:
     spec = {
         "title": "Add API pagination",
         "problem": "Large responses are hard to consume",
@@ -56,5 +27,31 @@ def test_build_standard_pr_body_for_non_ui_includes_example_output() -> None:
     )
     assert "## Example Output / Logs" in body
     assert "GET /api/items?limit=20&offset=0 returned 200" in body
-    assert "## UI Preview" not in body
+    assert "## Preview" not in body
 
+
+def test_build_standard_pr_body_includes_preview_when_available() -> None:
+    spec = {
+        "title": "Add export command",
+        "problem": "Users need downloadable reports",
+        "business_justification": "Support operations workflows",
+        "acceptance_criteria": ["Command writes CSV report"],
+    }
+    body = build_standard_pr_body(
+        spec=spec,
+        feature_id="33333333-3333-3333-3333-333333333333",
+        issue_number=55,
+        branch_name="feature-factory/test3",
+        runner_name="opencode-local-openclaw",
+        runner_model="openai-codex/gpt-5.3-codex",
+        summary="Added export command and file writer.",
+        verification_output="pytest -q passed",
+        verification_command="pytest -q",
+        verification_warning="",
+        preview_url="https://preview.example.com/run/123",
+        cloudflare_project_name="ignored-now",
+        cloudflare_production_branch="main",
+    )
+    assert "## Preview" in body
+    assert "https://preview.example.com/run/123" in body
+    assert "## Example Output / Logs" not in body

@@ -4226,3 +4226,8 @@
 2026-02-24 05:16:10-08:00 
 2026-02-24 05:16:10-08:00 See https://modal.com/docs/guide/modal-1-0-migration for more information.
 2026-02-24 05:16:10-08:00   @app.function(
+2026-02-24 05:19:08-08:00 /root/modal_app.py:79: DeprecationError: 2025-04-09: The `allow_concurrent_inputs` parameter is deprecated. Please use the `@modal.concurrent` decorator instead.
+2026-02-24 05:19:08-08:00 
+2026-02-24 05:19:08-08:00 See https://modal.com/docs/guide/modal-1-0-migration for more information.
+2026-02-24 05:19:08-08:00   @app.function(
+2026-02-24 05:21:10-08:00 Stopping app - user stopped from CLI.

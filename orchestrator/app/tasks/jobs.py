@@ -310,8 +310,6 @@ async def kickoff_build(feature_id: str) -> None:
                     "source_repos": spec.get("source_repos") or [],
                     "acceptance_criteria": spec.get("acceptance_criteria") or [],
                     "links": spec.get("links") or [],
-                    "ui_feature": bool(spec.get("ui_feature")),
-                    "ui_keywords": spec.get("ui_keywords") or [],
                     "optimized_prompt": optimized_prompt,
                     "target_repo": target_repo,
                 },
@@ -378,17 +376,6 @@ async def kickoff_build(feature_id: str) -> None:
                     ),
                     team_id=feature.slack_team_id,
                 )
-                if bool(spec.get("ui_feature")):
-                    cloudflare_project = (settings.cloudflare_pages_project_name or "").strip() or "(configure CLOUDFLARE_PAGES_PROJECT_NAME)"
-                    slack.post_thread_message(
-                        channel=feature.slack_channel_id,
-                        thread_ts=feature.slack_thread_ts,
-                        text=(
-                            "UI request detected. To view preview, open the PR Checks tab and click the "
-                            f"Cloudflare Pages deployment. Project: `{cloudflare_project}`."
-                        ),
-                        team_id=feature.slack_team_id,
-                    )
 
             safe_preview_url = normalize_external_url(result.preview_url or "")
             if safe_preview_url:

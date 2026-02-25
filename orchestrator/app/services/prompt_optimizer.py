@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 
@@ -13,53 +12,9 @@ def _non_empty(value: Any, fallback: str = "") -> str:
     return text or fallback
 
 
-UI_KEYWORDS: tuple[str, ...] = (
-    "ui",
-    "user interface",
-    "frontend",
-    "front-end",
-    "website",
-    "web app",
-    "page",
-    "screen",
-    "component",
-    "layout",
-    "button",
-    "form",
-    "modal",
-    "navigation",
-    "navbar",
-    "sidebar",
-    "dashboard",
-    "style",
-    "styling",
-    "css",
-    "theme",
-    "visual",
-)
-
-
 def detect_ui_feature(spec: dict[str, Any]) -> tuple[bool, list[str]]:
-    text_chunks: list[str] = []
-    for key in ["title", "problem", "business_justification", "proposed_solution", "repo"]:
-        value = str(spec.get(key) or "").strip()
-        if value:
-            text_chunks.append(value)
-
-    for key in ["acceptance_criteria", "links", "source_repos", "risk_flags"]:
-        values = spec.get(key) or []
-        if isinstance(values, list):
-            text_chunks.extend([str(v).strip() for v in values if str(v).strip()])
-
-    haystack = "\n".join(text_chunks).lower()
-    matched: list[str] = []
-    for keyword in UI_KEYWORDS:
-        pattern = r"\b" + re.escape(keyword) + r"\b"
-        if re.search(pattern, haystack):
-            matched.append(keyword)
-
-    unique = sorted(set(matched))
-    return (len(unique) > 0, unique)
+    # UI-specific routing is intentionally disabled so all requests follow the same path.
+    return (False, [])
 
 
 def build_optimized_prompt(spec: dict[str, Any]) -> str:
@@ -77,30 +32,16 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
     links = _lines(spec.get("links"))
     source_repos = _lines(spec.get("source_repos"))
     risk_flags = _lines(spec.get("risk_flags"))
-    ui_feature, ui_keywords = detect_ui_feature(spec)
 
     acceptance_lines = "\n".join([f"- {item}" for item in acceptance]) or "- Define measurable acceptance criteria."
     non_goal_lines = "\n".join([f"- {item}" for item in non_goals]) or "- None specified."
     link_lines = "\n".join([f"- {item}" for item in links]) or "- None provided."
     source_repo_lines = "\n".join([f"- {item}" for item in source_repos]) or "- None provided."
     risk_lines = "\n".join([f"- {item}" for item in risk_flags]) or "- No explicit high-risk flags provided."
-    ui_keywords_line = ", ".join(ui_keywords) if ui_keywords else "(none)"
-    ui_hint = "yes" if ui_feature else "no"
 
     solution_line = ""
     if proposed_solution:
         solution_line = f"\nPreferred approach:\n- {proposed_solution}\n"
-
-    ui_requirements = ""
-    if ui_feature:
-        ui_requirements = (
-            "\nUI delivery requirements\n"
-            "- Ensure reviewers can click a preview from the PR checks/deployments.\n"
-            "- If no frontend scaffold exists, create a minimal Vite + React app under `web/`.\n"
-            "- Include `dev`, `build`, and `preview` npm scripts.\n"
-            "- Implement a simple demo page matching the requested UI behavior.\n"
-            "- Keep backend integration mocked/static unless explicitly requested.\n"
-        )
 
     return (
         "Build Request\n"
@@ -121,10 +62,6 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
         f"{non_goal_lines}\n\n"
         "Risk flags\n"
         f"{risk_lines}\n\n"
-        "Request classification\n"
-        f"- UI feature: {ui_hint}\n"
-        f"- Matched UI keywords: {ui_keywords_line}\n"
-        f"{ui_requirements}\n"
         "Delivery requirements\n"
         "- Keep changes scoped to the request.\n"
         "- Add/update tests when behavior changes.\n"
@@ -134,8 +71,7 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
 
 def attach_optimized_prompt(spec: dict[str, Any]) -> dict[str, Any]:
     updated = dict(spec or {})
-    ui_feature, ui_keywords = detect_ui_feature(updated)
-    updated["ui_feature"] = bool(ui_feature)
-    updated["ui_keywords"] = ui_keywords
+    updated.pop("ui_feature", None)
+    updated.pop("ui_keywords", None)
     updated["optimized_prompt"] = build_optimized_prompt(updated)
     return updated

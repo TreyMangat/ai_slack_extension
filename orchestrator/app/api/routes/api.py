@@ -47,7 +47,6 @@ from app.services.github_repo import resolve_repo_for_spec
 from app.services.pr_description import build_standard_pr_body
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
-from app.services.prompt_optimizer import detect_ui_feature
 from app.services.url_safety import normalize_external_url
 from app.state_machine import (
     FAILED_BUILD,
@@ -350,9 +349,6 @@ async def _sync_standard_pr_body(feature: FeatureRequest) -> None:
     runner_model = str(runner_metadata.get("model") or "").strip() or (settings.opencode_model or "").strip()
 
     spec = dict(feature.spec or {})
-    ui_feature, _ui_keywords = detect_ui_feature(spec)
-    if bool(spec.get("ui_feature")) or ui_feature:
-        spec["ui_feature"] = True
 
     body = build_standard_pr_body(
         spec=spec,

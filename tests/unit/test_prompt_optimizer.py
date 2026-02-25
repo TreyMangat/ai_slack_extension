@@ -32,4 +32,6 @@ def test_attach_optimized_prompt_populates_spec_key() -> None:
     updated = attach_optimized_prompt(spec)
     assert "optimized_prompt" in updated
     assert "Dark mode" in updated["optimized_prompt"]
-
+    assert "UI delivery requirements" not in updated["optimized_prompt"]
+    assert "ui_feature" not in updated
+    assert "ui_keywords" not in updated
