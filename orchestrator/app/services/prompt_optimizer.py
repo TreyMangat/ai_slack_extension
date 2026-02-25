@@ -12,11 +12,6 @@ def _non_empty(value: Any, fallback: str = "") -> str:
     return text or fallback
 
 
-def detect_ui_feature(spec: dict[str, Any]) -> tuple[bool, list[str]]:
-    # UI-specific routing is intentionally disabled so all requests follow the same path.
-    return (False, [])
-
-
 def build_optimized_prompt(spec: dict[str, Any]) -> str:
     """Create a deterministic implementation prompt from intake data."""
 
@@ -25,6 +20,7 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
     why_now = _non_empty(spec.get("business_justification"), "No urgency/business context provided.")
     mode = _non_empty(spec.get("implementation_mode"), "new_feature")
     repo = _non_empty(spec.get("repo"), "(not specified)")
+    edit_scope = _non_empty(spec.get("edit_scope"))
     proposed_solution = _non_empty(spec.get("proposed_solution"))
 
     acceptance = _lines(spec.get("acceptance_criteria"))
@@ -37,6 +33,7 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
     non_goal_lines = "\n".join([f"- {item}" for item in non_goals]) or "- None specified."
     link_lines = "\n".join([f"- {item}" for item in links]) or "- None provided."
     source_repo_lines = "\n".join([f"- {item}" for item in source_repos]) or "- None provided."
+    edit_scope_lines = f"- {edit_scope}" if edit_scope else "- Not specified."
     risk_lines = "\n".join([f"- {item}" for item in risk_flags]) or "- No explicit high-risk flags provided."
 
     solution_line = ""
@@ -54,6 +51,8 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
         f"{solution_line}\n"
         "Reference context\n"
         f"{source_repo_lines}\n\n"
+        "Edit targeting hints\n"
+        f"{edit_scope_lines}\n\n"
         "Supporting links / attachments\n"
         f"{link_lines}\n\n"
         "Acceptance criteria\n"

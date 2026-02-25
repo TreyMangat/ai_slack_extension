@@ -9,6 +9,12 @@ def parse_repo_slug(repo_value: str) -> tuple[str, str]:
     text = (repo_value or "").strip()
     if not text:
         return "", ""
+    if text.startswith("<") and text.endswith(">"):
+        # Slack links may arrive as <https://github.com/org/repo|label>.
+        text = text[1:-1].strip()
+    if "|" in text:
+        text = text.split("|", 1)[0].strip()
+    text = text.strip("`").strip()
 
     if text.startswith("https://github.com/"):
         tail = text[len("https://github.com/") :]

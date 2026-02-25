@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 from rich.console import Console
@@ -451,10 +452,15 @@ async def kickoff_build(feature_id: str) -> None:
                 if "produced no repository changes" in error_text.lower():
                     resolved_repo = target_repo or "(none)"
                     resolved_base = str(spec.get("base_branch") or "").strip() or "(default branch)"
+                    retry_line = ""
+                    match = re.search(r"after (\d+) attempt", error_text.lower())
+                    if match:
+                        retry_line = f"Model attempts: `{match.group(1)}`.\n"
                     guidance = (
                         "\nLikely causes: request details were too vague, wrong repo selected, or wrong base branch.\n"
+                        f"{retry_line}"
                         f"Resolved target: repo `{resolved_repo}`, base `{resolved_base}`.\n"
-                        "Use *Add details in chat* to specify exact files/behavior, then retry build."
+                        "Use *Add more context* to specify exact files/behavior, then retry build."
                     )
                 slack.post_thread_message(
                     channel=feature.slack_channel_id,

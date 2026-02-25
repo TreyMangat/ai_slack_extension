@@ -53,6 +53,7 @@ Choose one runtime coding strategy:
   - `LLM_MODEL=...`
 - or `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=local_openclaw`
   - requires OpenClaw auth files to exist in container runtime
+  - optional hardening: `OPENCODE_NO_CHANGE_RETRY_ATTEMPTS=1`
 
 Recommended:
 - `AUTH_MODE=edge_sso` (or `api_token`)
@@ -70,6 +71,7 @@ Slack on Modal (optional):
 - HTTP mode:
   - `ENABLE_SLACK_BOT=true`
   - `SLACK_MODE=http`
+  - `SLACK_REQUIRE_PROMPT_CONFIRMATION=true` (recommended: confirm optimized prompt before build starts)
   - `SLACK_SIGNING_SECRET=...`
   - `ENABLE_SLACK_OAUTH=true`
   - `SLACK_CLIENT_ID=...`

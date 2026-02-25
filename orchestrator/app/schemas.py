@@ -25,13 +25,15 @@ class FeatureSpec(BaseModel):
         default_factory=list,
         description="Referenced source repos when implementation_mode=reuse_existing",
     )
+    edit_scope: str = Field(
+        default="",
+        description="For reuse_existing mode, targeted files/modules/symbols to edit",
+    )
     risk_flags: list[str] = Field(default_factory=list, description="e.g. auth, payments, migrations")
 
     # Optional extras
     links: list[str] = Field(default_factory=list)
     debug_build: bool = False
-    ui_feature: bool = False
-    ui_keywords: list[str] = Field(default_factory=list)
 
 
 class FeatureRequestCreate(BaseModel):
@@ -56,11 +58,10 @@ class FeatureSpecPatch(BaseModel):
     base_branch: str | None = None
     implementation_mode: Literal["new_feature", "reuse_existing"] | None = None
     source_repos: list[str] | None = None
+    edit_scope: str | None = None
     risk_flags: list[str] | None = None
     links: list[str] | None = None
     debug_build: bool | None = None
-    ui_feature: bool | None = None
-    ui_keywords: list[str] | None = None
 
 
 class FeatureSpecUpdateRequest(BaseModel):

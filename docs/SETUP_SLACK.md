@@ -5,10 +5,10 @@ PRFactory uses Slack Bolt (Python) with:
 - `SLACK_MODE=http` for cloud/Modal (`/api/slack/events`, recommended)
 
 Primary user command:
-- `/prfactory <request>`
+- `/prfactory <full context request>`
 
 Compatibility/utility commands:
-- `/feature <request>` (legacy alias)
+- `/feature <full context request>` (legacy alias)
 - `/prfactory-github` (GitHub account connect link for that Slack user)
 
 ## 1) Create Slack app + scopes
@@ -94,11 +94,13 @@ Try:
 /prfactory Add a button to export invoices
 ```
 
+The slash command text is treated as full prompt context. PRFactory then asks for a short title as the first in-thread reply.
+
 When the bot is invited to a channel, it posts a short onboarding message and DMs the inviter with GitHub setup guidance.
 When the app home is opened after install, PRFactory also sends a one-time setup DM reminder (including GitHub connect link).
 The `/prfactory-github` command remains available but is no longer required for discoverability.
 In non-mock production mode, the intake flow requires a target `org/repo` before build starts.
-Default intake flow is minimal: prompt + repo, then auto-build.
+Default intake flow is minimal: title + mode + repo, then prompt confirmation before build.
 
 ## 6) Per-user GitHub sign-in (shared channels)
 

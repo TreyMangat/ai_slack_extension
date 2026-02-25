@@ -109,6 +109,7 @@ class Settings(BaseSettings):
 
     # Slack intake behavior
     slack_intake_minimal: bool = Field(default=True, alias="SLACK_INTAKE_MINIMAL")
+    slack_require_prompt_confirmation: bool = Field(default=True, alias="SLACK_REQUIRE_PROMPT_CONFIRMATION")
 
     # Code runner strategy:
     # - opencode: run OpenClaw inside worker and open PR directly
@@ -122,6 +123,7 @@ class Settings(BaseSettings):
     opencode_model: str = Field(default="openai-codex/gpt-5.3-codex", alias="OPENCODE_MODEL")
     opencode_timeout_seconds: int = Field(default=1800, alias="OPENCODE_TIMEOUT_SECONDS")
     opencode_keep_temp_agents: bool = Field(default=False, alias="OPENCODE_KEEP_TEMP_AGENTS")
+    opencode_no_change_retry_attempts: int = Field(default=1, alias="OPENCODE_NO_CHANGE_RETRY_ATTEMPTS")
     opencode_debug_build: bool = Field(default=False, alias="OPENCODE_DEBUG_BUILD")
     preview_provider: str = Field(default="cloudflare_pages", alias="PREVIEW_PROVIDER")
     cloudflare_pages_project_name: str = Field(default="", alias="CLOUDFLARE_PAGES_PROJECT_NAME")
@@ -280,6 +282,7 @@ class Settings(BaseSettings):
             "slack_oauth_enabled": bool(self.slack_oauth_enabled()),
             "slack_oauth_install_url": self.slack_oauth_install_url_resolved(),
             "slack_app_redirect_url": self.slack_app_redirect_url_resolved(),
+            "slack_require_prompt_confirmation": bool(self.slack_require_prompt_confirmation),
             "github_enabled": bool(self.github_enabled),
             "github_auth_mode": self.github_auth_mode_normalized() or "token",
             "github_app_slug": (self.github_app_slug or "").strip(),
@@ -298,6 +301,7 @@ class Settings(BaseSettings):
             "openclaw_auth_seed_dir_exists": bool(seed_dir.exists()),
             "openclaw_auth_seed_files_detected": len(seed_candidates),
             "openclaw_cli_available": bool(shutil.which("openclaw")),
+            "opencode_no_change_retry_attempts": int(self.opencode_no_change_retry_attempts),
         }
 
     def slack_allowed_channel_set(self) -> set[str]:

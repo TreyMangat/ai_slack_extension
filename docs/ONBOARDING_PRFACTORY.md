@@ -109,7 +109,7 @@ Same workspace flow:
 
 3. Coworker runs:
 
-- `/prfactory <request>`
+- `/prfactory <full context request>`
 
 4. When asked, coworker provides `repo=org/repo` (required for non-mock builds).
 
@@ -120,12 +120,13 @@ Different workspace (self-serve install):
 3. After install, they invite bot in a channel:
 - `/invite @PRFactory`
 4. They run:
-- `/prfactory <request>`
+- `/prfactory <full context request>`
 
 Notes:
 - `/prfactory-github` still works, but PRFactory now also posts user-specific GitHub connect links in onboarding and intake prompts.
 - This flow supports multiple workspaces because each install stores a workspace-specific bot token.
 - Each Slack user connects their own GitHub account for builds (no shared GitHub identity in-channel).
+- `/prfactory` command text is treated as full prompt context; PRFactory asks for a short title as the first thread reply.
 
 ## 5) App ID, Team ID, and install links
 

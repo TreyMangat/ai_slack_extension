@@ -17,6 +17,36 @@ def test_parse_repo_slug_supports_https_url() -> None:
     assert repo == "widgets"
 
 
+def test_parse_repo_slug_supports_plain_slug() -> None:
+    owner, repo = parse_repo_slug("acme/widgets")
+    assert owner == "acme"
+    assert repo == "widgets"
+
+
+def test_parse_repo_slug_supports_backtick_wrapped_slug() -> None:
+    owner, repo = parse_repo_slug("`acme/widgets`")
+    assert owner == "acme"
+    assert repo == "widgets"
+
+
+def test_parse_repo_slug_supports_slack_link_wrapped_url() -> None:
+    owner, repo = parse_repo_slug("<https://github.com/acme/widgets|widgets>")
+    assert owner == "acme"
+    assert repo == "widgets"
+
+
+def test_parse_repo_slug_supports_slack_wrapped_slug() -> None:
+    owner, repo = parse_repo_slug("<acme/widgets|widgets>")
+    assert owner == "acme"
+    assert repo == "widgets"
+
+
+def test_parse_repo_slug_supports_https_tree_url() -> None:
+    owner, repo = parse_repo_slug("https://github.com/acme/widgets/tree/main")
+    assert owner == "acme"
+    assert repo == "widgets"
+
+
 def test_resolve_repo_for_spec_prefers_spec_repo() -> None:
     settings = _settings()
     owner, repo = resolve_repo_for_spec(spec={"repo": "acme/live-repo"}, settings=settings)
