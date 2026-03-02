@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -80,8 +86,12 @@ REPO_OPTION_NEW = "__NEW__"
 REPO_OPTION_CONNECT = "__CONNECT__"
 BRANCH_OPTION_NONE = "__NONE__"
 BRANCH_OPTION_NEW = "__NEW__"
+BRANCH_OPTION_AUTOGEN = "__AUTOGEN__"
 GITHUB_OPTION_CACHE_TTL_SECONDS = 120
 STABLE_BASE_BRANCH_CANDIDATES = ("main", "master", "develop", "dev", "trunk")
+BRANCH_WORKTREE_FETCH_TIMEOUT_SECONDS = 8
+BRANCH_WORKTREE_CATALOG_ROOT = Path(tempfile.gettempdir()) / "prfactory_branch_catalog"
+BRANCH_WORKTREE_PATH_NAME = "selection"
 
 
 @dataclass
@@ -334,6 +344,76 @@ def _feature_reference(*, feature_id: str, title: str) -> str:
     return f"{slug}-{short}" if short else slug
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _format_elapsed(seconds: int) -> str:
+    total = max(int(seconds), 0)
+    minutes, secs = divmod(total, 60)
+    hours, mins = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _build_progress_text(feature: dict[str, Any]) -> str:
+    status = str(feature.get("status") or "").strip()
+    if status != "BUILDING":
+        return ""
+
+    runs = feature.get("runs") or []
+    active_job_id = str(feature.get("active_build_job_id") or "").strip()
+    candidate_run: dict[str, Any] | None = None
+    if active_job_id:
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            if str(run.get("runner_run_id") or "").strip() == active_job_id:
+                candidate_run = run
+                break
+    if candidate_run is None:
+        for run in reversed(runs):
+            if not isinstance(run, dict):
+                continue
+            if str(run.get("status") or "").strip().upper() in {"RUNNING", "QUEUED"}:
+                candidate_run = run
+                break
+
+    now = datetime.now(timezone.utc)
+    started_at = _parse_iso_datetime((candidate_run or {}).get("started_at")) or _parse_iso_datetime(feature.get("updated_at"))
+    if not started_at:
+        started_at = _parse_iso_datetime(feature.get("created_at")) or now
+    elapsed_text = _format_elapsed(int((now - started_at).total_seconds()))
+
+    last_signal = _parse_iso_datetime((candidate_run or {}).get("updated_at"))
+    events = feature.get("events") or []
+    if not last_signal and isinstance(events, list):
+        for event in reversed(events):
+            if not isinstance(event, dict):
+                continue
+            maybe = _parse_iso_datetime(event.get("created_at"))
+            if maybe:
+                last_signal = maybe
+                break
+    signal_text = ""
+    if last_signal:
+        signal_text = f" | Last signal `{_format_elapsed(int((now - last_signal).total_seconds()))}` ago"
+    return f"Build runtime: `{elapsed_text}`{signal_text}"
+
+
 def _welcome_cache_key(*, team_id: str, user_id: str) -> str:
     return f"{team_id}:{user_id}"
 
@@ -487,6 +567,7 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
     validation = spec.get("_validation") or {}
     missing = validation.get("missing") or []
     missing_summary = ", ".join(missing) if missing else "none"
+    progress_text = _build_progress_text(feature)
 
     actions: list[dict[str, Any]] = [
         {
@@ -496,6 +577,15 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
             "value": fid,
         },
     ]
+    if status == "BUILDING":
+        actions.append(
+            {
+                "type": "button",
+                "action_id": "ff_refresh_status",
+                "text": {"type": "plain_text", "text": "Refresh status"},
+                "value": fid,
+            }
+        )
     if status == "READY_FOR_BUILD":
         actions.append(
             {
@@ -537,7 +627,12 @@ def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict
                         f"Repo: {repo_hint or '(none)'} | PR: {pr or '(pending)'} | "
                         f"Preview: {preview or '(none)'}"
                     ),
-                }
+                },
+                *(
+                    [{"type": "mrkdwn", "text": progress_text}]
+                    if progress_text
+                    else []
+                ),
             ],
         },
         {"type": "actions", "elements": actions},
@@ -614,6 +709,271 @@ def _github_api_headers(*, token: str) -> dict[str, str]:
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+
+def _github_basic_auth_extraheader(token: str) -> str:
+    raw = f"x-access-token:{token}".encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"AUTHORIZATION: basic {encoded}"
+
+
+def _run_git_command(*, cmd: list[str], cwd: Path, timeout_seconds: int) -> str:
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=max(timeout_seconds, 1),
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "git command failed"
+        raise RuntimeError(message)
+    return str(result.stdout or "").strip()
+
+
+def _branch_catalog_paths(*, owner: str, repo: str) -> tuple[Path, Path]:
+    normalized = f"{owner.strip().lower()}/{repo.strip().lower()}"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    owner_slug = re.sub(r"[^a-z0-9_.-]+", "-", owner.strip().lower()).strip("-") or "owner"
+    repo_slug = re.sub(r"[^a-z0-9_.-]+", "-", repo.strip().lower()).strip("-") or "repo"
+    root = BRANCH_WORKTREE_CATALOG_ROOT / f"{owner_slug}--{repo_slug}--{digest}"
+    return root / "repo", root / BRANCH_WORKTREE_PATH_NAME
+
+
+def _remote_default_branch_from_git(*, repo_path: Path) -> str:
+    try:
+        raw = _run_git_command(
+            cmd=["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=repo_path,
+            timeout_seconds=10,
+        )
+    except Exception:
+        return ""
+    marker = "refs/remotes/origin/"
+    if raw.startswith(marker):
+        return raw[len(marker) :].strip()
+    return ""
+
+
+def _list_worktree_branches(*, repo_path: Path) -> list[str]:
+    try:
+        raw = _run_git_command(
+            cmd=["git", "worktree", "list", "--porcelain"],
+            cwd=repo_path,
+            timeout_seconds=10,
+        )
+    except Exception:
+        return []
+
+    branches: list[str] = []
+    seen: set[str] = set()
+    marker = "refs/heads/"
+    for line in raw.splitlines():
+        text = str(line or "").strip()
+        if not text.startswith("branch "):
+            continue
+        value = text[len("branch ") :].strip()
+        if value.startswith(marker):
+            value = value[len(marker) :].strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        branches.append(value)
+    return branches
+
+
+def _list_remote_branches_sorted_by_recent_commit(*, repo_path: Path) -> list[str]:
+    try:
+        raw = _run_git_command(
+            cmd=[
+                "git",
+                "for-each-ref",
+                "refs/remotes/origin",
+                "--sort=-committerdate",
+                "--format=%(refname:short)",
+            ],
+            cwd=repo_path,
+            timeout_seconds=20,
+        )
+    except Exception:
+        return []
+
+    branches: list[str] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        value = str(line or "").strip()
+        if not value.startswith("origin/"):
+            continue
+        name = value[len("origin/") :].strip()
+        if not name or name == "HEAD":
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        branches.append(name)
+    return branches
+
+
+def _sort_branch_names_for_selection(
+    settings: Any,
+    *,
+    branches: list[str],
+    default_branch: str = "",
+    worktree_branches: list[str] | None = None,
+) -> list[str]:
+    normalized_default = str(default_branch or "").strip().lower()
+    worktree_set = {str(x or "").strip().lower() for x in (worktree_branches or []) if str(x or "").strip()}
+    candidate_rank = {name: idx for idx, name in enumerate(STABLE_BASE_BRANCH_CANDIDATES)}
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in branches:
+        branch = str(item or "").strip()
+        if not branch:
+            continue
+        key = branch.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(branch)
+
+    indexed = list(enumerate(cleaned))
+
+    def _bucket(branch_name: str) -> tuple[int, int]:
+        lowered = branch_name.lower()
+        if lowered and lowered == normalized_default:
+            return (0, 0)
+        is_worktree = lowered in worktree_set
+        is_generated = _is_autogenerated_branch(settings, branch_name)
+        stable_idx = candidate_rank.get(lowered)
+        if is_worktree and not is_generated:
+            return (1, 0)
+        if stable_idx is not None and not is_generated:
+            return (2, stable_idx)
+        if not is_generated:
+            return (3, 0)
+        if is_worktree:
+            return (4, 0)
+        return (5, 0)
+
+    indexed.sort(key=lambda pair: (*_bucket(pair[1]), pair[0], pair[1].lower()))
+    return [item[1] for item in indexed]
+
+
+def _fetch_branches_via_worktree_catalog(
+    settings: Any,
+    *,
+    owner: str,
+    repo: str,
+    token: str,
+    timeout_seconds: float,
+) -> tuple[str, list[str]]:
+    if shutil.which("git") is None:
+        return "", []
+
+    repo_path, selection_worktree = _branch_catalog_paths(owner=owner, repo=repo)
+    repo_path.parent.mkdir(parents=True, exist_ok=True)
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+    auth_header = _github_basic_auth_extraheader(token)
+    timeout = max(int(timeout_seconds), 2)
+
+    try:
+        if not (repo_path / ".git").exists():
+            if repo_path.exists():
+                shutil.rmtree(repo_path, ignore_errors=True)
+            _run_git_command(
+                cmd=[
+                    "git",
+                    "-c",
+                    f"http.https://github.com/.extraheader={auth_header}",
+                    "clone",
+                    "--filter=blob:none",
+                    "--depth",
+                    "1",
+                    "--no-single-branch",
+                    "--no-checkout",
+                    clone_url,
+                    str(repo_path),
+                ],
+                cwd=repo_path.parent,
+                timeout_seconds=timeout,
+            )
+        else:
+            _run_git_command(
+                cmd=[
+                    "git",
+                    "-c",
+                    f"http.https://github.com/.extraheader={auth_header}",
+                    "fetch",
+                    "--prune",
+                    "--no-tags",
+                    "--depth",
+                    "1",
+                    "origin",
+                    "+refs/heads/*:refs/remotes/origin/*",
+                ],
+                cwd=repo_path,
+                timeout_seconds=timeout,
+            )
+        try:
+            _run_git_command(
+                cmd=[
+                    "git",
+                    "-c",
+                    f"http.https://github.com/.extraheader={auth_header}",
+                    "remote",
+                    "set-head",
+                    "origin",
+                    "-a",
+                ],
+                cwd=repo_path,
+                timeout_seconds=timeout,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        console.print(
+            f"[yellow]github_branch_catalog_sync_failed repo={owner}/{repo} error={e}[/yellow]"
+        )
+        return "", []
+
+    default_branch = _remote_default_branch_from_git(repo_path=repo_path)
+    if default_branch:
+        try:
+            _run_git_command(cmd=["git", "worktree", "prune"], cwd=repo_path, timeout_seconds=10)
+        except Exception:
+            pass
+        # Keep one detached selection worktree per repo so branch selection can use git-worktree state.
+        if not selection_worktree.exists():
+            try:
+                _run_git_command(
+                    cmd=[
+                        "git",
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(selection_worktree),
+                        f"origin/{default_branch}",
+                    ],
+                    cwd=repo_path,
+                    timeout_seconds=20,
+                )
+            except Exception:
+                pass
+
+    raw_branches = _list_remote_branches_sorted_by_recent_commit(repo_path=repo_path)
+    worktree_branches = _list_worktree_branches(repo_path=repo_path)
+    sorted_branches = _sort_branch_names_for_selection(
+        settings,
+        branches=raw_branches,
+        default_branch=default_branch,
+        worktree_branches=worktree_branches,
+    )
+    return default_branch, sorted_branches
 
 
 def _resolve_github_user_token(*, user_id: str, team_id: str) -> str:
@@ -702,6 +1062,19 @@ def _fetch_branches_for_repo(
     if cached and (now - cached[0]) < GITHUB_OPTION_CACHE_TTL_SECONDS:
         return list(cached[1])
 
+    default_from_git, worktree_branches = _fetch_branches_via_worktree_catalog(
+        settings,
+        owner=owner,
+        repo=repo,
+        token=token,
+        timeout_seconds=max(timeout_seconds, BRANCH_WORKTREE_FETCH_TIMEOUT_SECONDS),
+    )
+    if worktree_branches:
+        GITHUB_BRANCH_OPTIONS_CACHE[cache_key] = (now, list(worktree_branches))
+        if default_from_git:
+            GITHUB_REPO_DEFAULT_BRANCH_CACHE[cache_key] = (now, default_from_git)
+        return list(worktree_branches)
+
     branches: list[str] = []
     try:
         response = httpx.get(
@@ -727,11 +1100,18 @@ def _fetch_branches_for_repo(
         branches = []
 
     deduped = _dedupe(branches)
-    if deduped:
-        GITHUB_BRANCH_OPTIONS_CACHE[cache_key] = (now, deduped)
+    default_cached = str((GITHUB_REPO_DEFAULT_BRANCH_CACHE.get(cache_key) or (0.0, ""))[1] or "").strip()
+    sorted_branches = _sort_branch_names_for_selection(
+        settings,
+        branches=deduped,
+        default_branch=default_cached,
+        worktree_branches=[],
+    )
+    if sorted_branches:
+        GITHUB_BRANCH_OPTIONS_CACHE[cache_key] = (now, sorted_branches)
     else:
         GITHUB_BRANCH_OPTIONS_CACHE.pop(cache_key, None)
-    return deduped
+    return sorted_branches
 
 
 def _fetch_default_branch_for_repo(
@@ -755,6 +1135,19 @@ def _fetch_default_branch_for_repo(
     cached = GITHUB_REPO_DEFAULT_BRANCH_CACHE.get(cache_key)
     if cached and (now - cached[0]) < GITHUB_OPTION_CACHE_TTL_SECONDS:
         return str(cached[1] or "")
+
+    default_from_git, worktree_branches = _fetch_branches_via_worktree_catalog(
+        settings,
+        owner=owner,
+        repo=repo,
+        token=token,
+        timeout_seconds=max(timeout_seconds, BRANCH_WORKTREE_FETCH_TIMEOUT_SECONDS),
+    )
+    if default_from_git:
+        GITHUB_REPO_DEFAULT_BRANCH_CACHE[cache_key] = (now, default_from_git)
+        if worktree_branches:
+            GITHUB_BRANCH_OPTIONS_CACHE[cache_key] = (now, list(worktree_branches))
+        return default_from_git
 
     default_branch = ""
     try:
@@ -799,8 +1192,9 @@ def _fallback_repo_options() -> list[dict[str, Any]]:
 
 def _fallback_branch_options() -> list[dict[str, Any]]:
     return [
-        _slack_option(text="None (use default branch)", value=BRANCH_OPTION_NONE),
-        _slack_option(text="Type branch name", value=BRANCH_OPTION_NEW),
+        _slack_option(text="Auto-create PRFactory branch (recommended)", value=BRANCH_OPTION_AUTOGEN),
+        _slack_option(text="None (use default base branch)", value=BRANCH_OPTION_NONE),
+        _slack_option(text="Type existing base branch", value=BRANCH_OPTION_NEW),
     ]
 
 
@@ -1261,7 +1655,9 @@ def _ask_next_question(client: Any, session: IntakeSession) -> None:
                 repo_slug=repo_slug,
                 query="",
             )
-            text = "Select a base branch, or type one."
+            text = (
+                "Select an existing base branch. PRFactory always creates a new work branch automatically."
+            )
             existing_ts = str(session.answers.get("_branch_prompt_ts") or "").strip()
             if existing_ts:
                 try:
@@ -1358,11 +1754,12 @@ def _capture_field_answer(
         if mode != "reuse_existing":
             return True, "Reuse references not needed for scratch mode."
 
+        if _is_skip(text) or not text:
+            session.answers["source_repos"] = []
+            session.asked_fields.add("source_repos")
+            return True, "No external reference repos provided; I will use the target repo context only."
+
         repos = _parse_lines(text)
-        if (not repos and _is_skip(text)) or (not repos and not text):
-            repo_hint = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
-            if repo_hint:
-                repos = [repo_hint]
         if not repos:
             return False, "Reuse mode needs at least one reference repo. Please provide one per line."
         session.answers["source_repos"] = repos
@@ -1435,14 +1832,14 @@ def _create_spec_from_session(session: IntakeSession) -> dict[str, Any]:
     criteria = [str(x).strip() for x in (spec.get("acceptance_criteria") or []) if str(x).strip()]
     if not criteria:
         title = str(spec.get("title") or "feature").strip()
+        problem = str(spec.get("problem") or "").strip()
+        problem_excerpt = problem[:160].rstrip() if problem else title
         criteria = [
-            f"`{title}` is implemented and accessible to end users.",
+            f"Implements requested behavior: {problem_excerpt}.",
             "Changes are committed and opened as a PR for review.",
         ]
     spec["acceptance_criteria"] = criteria
 
-    if mode == "reuse_existing" and not spec["source_repos"] and spec.get("repo"):
-        spec["source_repos"] = [str(spec["repo"]).strip()]
     if mode == "reuse_existing" and not str(spec.get("edit_scope") or "").strip():
         spec["edit_scope"] = "Focus on existing modules and files that directly implement this request."
 
@@ -2265,7 +2662,7 @@ def create_slack_bolt_app(settings: Any):
             )
             return
 
-        if selected == BRANCH_OPTION_NONE:
+        if selected in {BRANCH_OPTION_NONE, BRANCH_OPTION_AUTOGEN}:
             default_branch = _fetch_default_branch_for_repo(
                 settings,
                 user_id=user_id,
@@ -2285,7 +2682,8 @@ def create_slack_bolt_app(settings: Any):
                     session.asked_fields.add("base_branch")
                     branch_note = (
                         f"Repository default `{default_branch}` looks auto-generated.\n"
-                        f"Using stable fallback base branch `{fallback}`."
+                        f"Using stable fallback base branch `{fallback}`.\n"
+                        "PRFactory will still create a new `prfactory/...` work branch for this request."
                     )
                 else:
                     session.answers["base_branch"] = ""
@@ -2293,14 +2691,21 @@ def create_slack_bolt_app(settings: Any):
                         f"Using repository default base branch `{default_branch}`.\n"
                         "Warning: this looks like an auto-generated PRFactory branch. "
                         "Set a stable default branch in GitHub (for example `main` or `develop`) "
-                        "or choose a branch explicitly."
+                        "or choose a branch explicitly.\n"
+                        "PRFactory will still create a new `prfactory/...` work branch for this request."
                     )
             elif default_branch:
                 session.answers["base_branch"] = ""
-                branch_note = f"Using repository default base branch `{default_branch}`."
+                branch_note = (
+                    f"Using repository default base branch `{default_branch}`.\n"
+                    "PRFactory will create a new `prfactory/...` work branch for this request."
+                )
             else:
                 session.answers["base_branch"] = ""
-                branch_note = "Using repository default base branch."
+                branch_note = (
+                    "Using repository default base branch.\n"
+                    "PRFactory will create a new `prfactory/...` work branch for this request."
+                )
             _drop_field_from_queue(session, "base_branch")
             _store_session(session)
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=branch_note)
@@ -2494,6 +2899,27 @@ def create_slack_bolt_app(settings: Any):
                 text="If you fixed auth/settings, click *Retry build*.",
                 install_url=install_url,
             )
+
+    @app.action("ff_refresh_status")
+    def handle_refresh_status(ack, body, client):
+        ack()
+        action = body["actions"][0]
+        feature_id = action["value"]
+        channel_id = body.get("channel", {}).get("id")
+        user_id = body.get("user", {}).get("id")
+        root_message_ts = _action_root_message_ts(body)
+        if not (channel_id and root_message_ts):
+            return
+        try:
+            refreshed = _fetch_feature(settings, feature_id)
+            _update_feature_message(client, refreshed, channel_id=channel_id, message_ts=root_message_ts)
+        except Exception as e:  # noqa: BLE001
+            if user_id:
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=f"Could not refresh status: `{e}`",
+                )
 
     @app.action("ff_approve")
     def handle_approve(ack, body, client, logger):

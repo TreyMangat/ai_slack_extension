@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from datetime import datetime
 import re
 from typing import Any
@@ -33,6 +35,61 @@ def _truncate_for_event(value: Any, *, max_chars: int = 4000) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 3] + "..."
+
+
+def _format_duration_seconds(total_seconds: int) -> str:
+    seconds = max(int(total_seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, mins = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _build_timeout_window_seconds(settings: Any) -> int:
+    if (
+        settings.coderunner_mode_normalized() == "opencode"
+        and settings.opencode_execution_mode_normalized() == "local_openclaw"
+    ):
+        return max(int(settings.opencode_timeout_seconds), 0)
+    return 0
+
+
+async def _build_heartbeat_loop(
+    *,
+    slack: Any,
+    channel_id: str,
+    thread_ts: str,
+    team_id: str,
+    feature_title: str,
+    mode: str,
+    target_repo: str,
+    started_at: datetime,
+    interval_seconds: int,
+    timeout_window_seconds: int,
+) -> None:
+    while True:
+        await asyncio.sleep(max(interval_seconds, 1))
+        elapsed = int((datetime.utcnow() - started_at).total_seconds())
+        timeout_note = ""
+        if timeout_window_seconds > 0:
+            remaining = max(timeout_window_seconds - elapsed, 0)
+            timeout_note = (
+                f" | Timeout window: `{_format_duration_seconds(timeout_window_seconds)}` total "
+                f"(~`{_format_duration_seconds(remaining)}` remaining)"
+            )
+        repo_note = f"\nRepo: `{target_repo}`" if target_repo else ""
+        slack.post_thread_message(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=(
+                f"Still building *{feature_title}* (`{mode}`).{repo_note}\n"
+                f"Elapsed: `{_format_duration_seconds(elapsed)}`{timeout_note}"
+            ),
+            team_id=team_id,
+        )
 
 
 def _mode_strategy_label(mode: str) -> str:
@@ -183,35 +240,31 @@ async def kickoff_build(feature_id: str) -> None:
         prepared_count = len([r for r in workspace_result.prepared_references if r.status == "prepared"])
         source_repo_count = len([r for r in workspace_result.source_repos if r.strip()])
         if mode == "reuse_existing" and source_repo_count > 0 and prepared_count == 0:
-            message = (
-                "Reuse mode requested, but no source repository snapshots were prepared. "
-                "Provide a local source path under WORKSPACE_LOCAL_COPY_ROOT or enable git cloning."
+            warning = (
+                "Reuse mode included reference repos, but no external snapshots were prepared. "
+                "Proceeding with target-repo context only."
             )
-            feature.last_error = message
-            action_result = perform_action(feature.status, "fail_build")
-            validate_transition(feature.status, action_result.new_status)
-            feature.status = action_result.new_status
-            feature.active_build_job_id = ""
-            feature_run.status = "FAILED"
-            feature_run.error_text = message
-            feature_run.finished_at = datetime.utcnow()
-            log_event(db, feature, event_type="build_failed", message=message)
             log_event(
                 db,
                 feature,
-                event_type="dead_letter_external_call",
-                message="Workspace preparation failed before external execution",
-                data={"stage": "workspace_prepare", "error": message},
+                event_type="workspace_prepare_warning",
+                message=warning,
+                data={
+                    "source_repo_count": source_repo_count,
+                    "prepared_reference_count": prepared_count,
+                },
             )
-            metrics.inc("build_jobs_failed_total", 1)
             if feature.slack_channel_id and feature.slack_thread_ts:
                 slack.post_thread_message(
                     channel=feature.slack_channel_id,
                     thread_ts=feature.slack_thread_ts,
-                    text=f"Build failed for *{feature.title}*: `{message}`",
+                    text=(
+                        f"Workspace note for *{feature.title}*: {warning}\n"
+                        "Tip: enable `WORKSPACE_ENABLE_GIT_CLONE=true` or provide local source paths only if you "
+                        "need extra reference snapshots."
+                    ),
                     team_id=feature.slack_team_id,
                 )
-            return
 
         if not settings.mock_mode and not settings.github_enabled:
             message = "GitHub integration must be enabled for non-mock builds (set GITHUB_ENABLED=true)."
@@ -276,6 +329,28 @@ async def kickoff_build(feature_id: str) -> None:
                 thread_ts=feature.slack_thread_ts,
                 text=" | ".join(message_parts),
                 team_id=feature.slack_team_id,
+            )
+
+        heartbeat_task: asyncio.Task[None] | None = None
+        heartbeat_interval_seconds = max(int(settings.build_status_heartbeat_seconds), 0)
+        if (
+            feature.slack_channel_id
+            and feature.slack_thread_ts
+            and heartbeat_interval_seconds > 0
+        ):
+            heartbeat_task = asyncio.create_task(
+                _build_heartbeat_loop(
+                    slack=slack,
+                    channel_id=feature.slack_channel_id,
+                    thread_ts=feature.slack_thread_ts,
+                    team_id=feature.slack_team_id,
+                    feature_title=feature.title,
+                    mode=mode,
+                    target_repo=target_repo,
+                    started_at=datetime.utcnow(),
+                    interval_seconds=heartbeat_interval_seconds,
+                    timeout_window_seconds=_build_timeout_window_seconds(settings),
+                )
             )
 
         stage = "github_adapter_init"
@@ -468,6 +543,11 @@ async def kickoff_build(feature_id: str) -> None:
                     text=f"Build failed for *{feature.title}*: {error_text}{guidance}",
                     team_id=feature.slack_team_id,
                 )
+        finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
 
 def kickoff_build_job(feature_id: str) -> None:

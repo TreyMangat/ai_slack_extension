@@ -12,12 +12,25 @@ def _non_empty(value: Any, fallback: str = "") -> str:
     return text or fallback
 
 
+def _normalized_why_now(*, problem: str, why_now: str) -> str:
+    raw = str(why_now or "").strip()
+    if not raw:
+        return "User requested this now via Slack intake."
+    lowered = raw.lower()
+    marker = "requested via slack intake. context:"
+    if lowered.startswith(marker):
+        context = raw.split(":", 1)[1].strip() if ":" in raw else ""
+        if context and context.lower() == str(problem or "").strip().lower():
+            return "User requested this now via Slack intake."
+    return raw
+
+
 def build_optimized_prompt(spec: dict[str, Any]) -> str:
     """Create a deterministic implementation prompt from intake data."""
 
     title = _non_empty(spec.get("title"), "Untitled feature")
     problem = _non_empty(spec.get("problem"), "No user problem provided.")
-    why_now = _non_empty(spec.get("business_justification"), "No urgency/business context provided.")
+    why_now = _normalized_why_now(problem=problem, why_now=spec.get("business_justification"))
     mode = _non_empty(spec.get("implementation_mode"), "new_feature")
     repo = _non_empty(spec.get("repo"), "(not specified)")
     edit_scope = _non_empty(spec.get("edit_scope"))
@@ -30,42 +43,54 @@ def build_optimized_prompt(spec: dict[str, Any]) -> str:
     risk_flags = _lines(spec.get("risk_flags"))
 
     acceptance_lines = "\n".join([f"- {item}" for item in acceptance]) or "- Define measurable acceptance criteria."
-    non_goal_lines = "\n".join([f"- {item}" for item in non_goals]) or "- None specified."
-    link_lines = "\n".join([f"- {item}" for item in links]) or "- None provided."
-    source_repo_lines = "\n".join([f"- {item}" for item in source_repos]) or "- None provided."
-    edit_scope_lines = f"- {edit_scope}" if edit_scope else "- Not specified."
-    risk_lines = "\n".join([f"- {item}" for item in risk_flags]) or "- No explicit high-risk flags provided."
+    non_goal_lines = "\n".join([f"- {item}" for item in non_goals]) if non_goals else ""
+    link_lines = "\n".join([f"- {item}" for item in links]) if links else ""
+    source_repo_lines = "\n".join([f"- {item}" for item in source_repos]) if source_repos else ""
+    risk_lines = "\n".join([f"- {item}" for item in risk_flags]) if risk_flags else ""
 
-    solution_line = ""
+    sections: list[str] = [
+        "Build Request",
+        f"- Feature: {title}",
+        f"- Implementation mode: {mode}",
+        f"- Target repo: {repo}",
+        "",
+        "User context",
+        f"- Problem: {problem}",
+        f"- Why now: {why_now}",
+    ]
+
     if proposed_solution:
-        solution_line = f"\nPreferred approach:\n- {proposed_solution}\n"
+        sections.extend(["", "Preferred approach", f"- {proposed_solution}"])
+    if source_repo_lines:
+        sections.extend(["", "Reference context", source_repo_lines])
+    if edit_scope:
+        sections.extend(["", "Edit targeting hints", f"- {edit_scope}"])
+    if link_lines:
+        sections.extend(["", "Supporting links / attachments", link_lines])
 
-    return (
-        "Build Request\n"
-        f"- Feature: {title}\n"
-        f"- Implementation mode: {mode}\n"
-        f"- Target repo: {repo}\n\n"
-        "User context\n"
-        f"- Problem: {problem}\n"
-        f"- Why now: {why_now}\n"
-        f"{solution_line}\n"
-        "Reference context\n"
-        f"{source_repo_lines}\n\n"
-        "Edit targeting hints\n"
-        f"{edit_scope_lines}\n\n"
-        "Supporting links / attachments\n"
-        f"{link_lines}\n\n"
-        "Acceptance criteria\n"
-        f"{acceptance_lines}\n\n"
-        "Non-goals\n"
-        f"{non_goal_lines}\n\n"
-        "Risk flags\n"
-        f"{risk_lines}\n\n"
-        "Delivery requirements\n"
-        "- Keep changes scoped to the request.\n"
-        "- Add/update tests when behavior changes.\n"
-        "- Summarize implementation and verification steps.\n"
-    ).strip()
+    sections.extend(
+        [
+            "",
+            "Acceptance criteria",
+            acceptance_lines,
+        ]
+    )
+
+    if non_goal_lines:
+        sections.extend(["", "Non-goals", non_goal_lines])
+    if risk_lines:
+        sections.extend(["", "Risk flags", risk_lines])
+
+    sections.extend(
+        [
+            "",
+            "Delivery requirements",
+            "- Keep changes scoped to the request.",
+            "- Add/update tests when behavior changes.",
+            "- Summarize implementation and verification steps.",
+        ]
+    )
+    return "\n".join(sections).strip()
 
 
 def attach_optimized_prompt(spec: dict[str, Any]) -> dict[str, Any]:

@@ -1,389 +1,252 @@
-# PRFactory (Local + Modal scaffold)
+# PRFactory
 
-This project is a **local-first** (Docker Compose) scaffold for the workflow you described:
+PRFactory is a Slack- and UI-driven feature orchestration system that turns requests into validated specs, runs build jobs, and publishes PR/preview outputs with approval gates.
 
-1. A non-dev submits a feature request (Slack or local web UI)
-2. The system asks clarifying follow-up questions until the request is a **validated spec**
-3. A build job runs (mocked locally by default)
-4. The worker prepares an isolated workspace snapshot (for safe repo reuse)
-5. A PR + preview link are produced (mocked locally by default)
-6. A requester can approve in Slack/UI
-7. Merge is controlled by policy (auto-merge is **disabled by default**)
+This repository is local-first (Docker Compose) and production-aware (Modal/edge auth support), with mock mode available for fast onboarding.
 
-It is designed so you can:
-- **Start in MOCK_MODE** without Slack/GitHub
-- Later wire in **Slack** + **GitHub App** for direct PR generation (no issue ticket required)
-- Keep the orchestrator future-proof (clear adapters + state machine)
+## Core workflow
 
-The Slack intake is novice-oriented:
-- asks only for what to build + target repo in the default flow
-- defaults missing fields automatically for local POC speed
-- auto-starts build when the request is valid (no extra confirmation step)
-- posts clarifying questions when details are missing
-- supports iterative updates through an **Add details in chat** action
-- routes preview/PR output to reviewer/admin approval
+1. Intake from Slack or web UI.
+2. Spec validation (`READY_FOR_BUILD` or `NEEDS_INFO`).
+3. Background build execution (RQ worker).
+4. PR and preview updates.
+5. Product/reviewer approval and merge-gated progression.
 
----
+State machine:
 
-## What you get
+`NEW -> NEEDS_INFO -> READY_FOR_BUILD -> BUILDING -> PR_OPENED -> PREVIEW_READY -> PRODUCT_APPROVED -> READY_TO_MERGE -> MERGED`
 
-- **FastAPI** web app (local UI + JSON API)
-- **Postgres** database
-- **Redis + RQ** worker for background jobs
-- **Cleanup worker** for scheduled workspace retention
-- Optional **Slack bot** process (disabled by default)
-- Pluggable adapters for Slack, GitHub, Code Runner, Preview
+Failure states:
 
----
+`FAILED_SPEC`, `FAILED_BUILD`, `FAILED_PREVIEW`, `NEEDS_HUMAN`
 
-## Quick Start (Windows, novice-friendly)
+## Architecture
 
-### 1) Install required software
+- `api` (FastAPI): UI pages, REST API, health/runtime endpoints, optional Slack HTTP events.
+- `worker` (RQ): queued build execution and PR/preview orchestration.
+- `cleanup` worker: workspace retention cleanup + stale callback alerts.
+- `slackbot` (optional profile): Slack Socket Mode bot process.
+- `db` (Postgres) and `redis`.
 
-1. **Docker Desktop for Windows**
-   - Install and make sure Docker is running.
-2. **Git for Windows**
-   - Needed to clone repos and for VS Code integrations.
-3. **VS Code**
-   - Open this folder in VS Code.
+External integrations are adapter-based (`SlackAdapter`, `GitHubAdapter`, `CodeRunnerAdapter`) for mock/real runtime switching.
 
-> You do **not** need to install Python locally because everything runs in Docker.
+## Quick start (local)
 
-### 2) Unzip / open the project
+### 1) Prerequisites
 
-- Unzip the project
-- Open this project folder in VS Code
+- Docker Desktop
+- Git
+- VS Code (recommended)
 
-### 3) Create your `.env`
-
-In the project root:
-
-- Copy `.env.example` to `.env`
-
-On Windows PowerShell:
+### 2) Configure environment
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Leave everything as-is for now (MOCK_MODE is enabled by default).
-Local defaults keep `AUTH_MODE=disabled`; production should use `AUTH_MODE=edge_sso`.
+Defaults are local-friendly (`MOCK_MODE=true`, `AUTH_MODE=disabled`).
 
-### 4) Start the stack
-
-In VS Code Terminal (PowerShell):
+### 3) Start services
 
 ```powershell
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-Helper script:
+Or helper script:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1
 ```
 
-`docker-compose.yml` is production-safe by default (no hot reload, no host DB/Redis ports).
-`docker-compose.dev.yml` adds local developer overrides.
-If you are reusing an older local DB volume after schema changes, run `scripts/migrate.ps1`
-or reset with `scripts/reset_db.ps1`.
-
-### 5) Open the local UI
-
-Go to:
-
-- http://localhost:8000
-- http://localhost:8000/health/ready (readiness check)
-
-Create a feature request, then click **Run Build** to simulate a PR + preview.
-If the request lands in `NEEDS_INFO`, open the feature page and use **Save and revalidate** to fill missing details.
-
-### 6) Run the smoke test script
-
-In a second PowerShell terminal:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\smoke_test.ps1
-```
-
-The smoke script now reads `/health/runtime` to detect the API's effective `MOCK_MODE`
-so checks stay accurate even when `.env` and running containers drift.
-
-This verifies the core API workflow end-to-end:
-- health check
-- spec validation
-- build enqueue + worker transition
-- preview readiness
-- product approval
-
-If you run local unit tests outside Docker, use Python 3.12:
-
-```powershell
-py -3.12 -m pytest -q
-```
-
-### 7) (Optional) Run Alembic migration path locally
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1
-```
-
-This exercises the production migration path (`alembic upgrade head`).
-If your local DB was created before Alembic, run once with bootstrap stamping:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1 -BootstrapStamp
-```
-
-### 8) (Optional) Verify real-mode callback flow
-
-This validates the non-mock execution path where an external runner posts status back.
-
-1. Set in `.env`:
-   - `MOCK_MODE=false`
-   - `INTEGRATION_WEBHOOK_SECRET=dev-webhook-secret`
-2. Restart:
-
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
-```
-
-3. Run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\real_mode_callback_smoke.ps1 -Secret "dev-webhook-secret"
-```
-
----
-
-## What "MOCK_MODE" means
-
-When `MOCK_MODE=true`:
-- No Slack tokens required
-- No GitHub token required
-- The "code runner" simulates creating:
-  - a PR URL
-  - a preview URL
-- This lets you test the end-to-end orchestration and state machine locally.
-
----
-
-## Reuse mode and safe snapshots
-
-When `implementation_mode=reuse_existing`, each build prepares an isolated workspace:
-- `target/` for generated changes
-- `references/` for source repo snapshots
-- `workspace_manifest.json` for audit/debug data
-
-Safety defaults:
-- `WORKSPACE_ENABLE_GIT_CLONE=false` (remote clone disabled unless explicitly enabled)
-- local path snapshots are restricted to `WORKSPACE_LOCAL_COPY_ROOT`
-- `.git` metadata is removed from snapshots
-- retention policy supports shorter storage for failed/non-PR work:
-  - `WORKSPACE_RETENTION_HOURS_WITH_PR`
-  - `WORKSPACE_RETENTION_HOURS_WITHOUT_PR`
-  - `WORKSPACE_RETENTION_HOURS_FAILED`
-
----
-
-## (Optional) Connect Slack
-
-Only do this after the mock flow works.
-
-### 1) Create a Slack app
-
-In Slack API dashboard:
-- Create an app
-- Enable **Socket Mode**
-- Create an **App Token** (starts with `xapp-...`) with `connections:write`
-- Add a **Bot Token** (starts with `xoxb-...`) via OAuth & Permissions
-
-Recommended bot scopes (minimum viable):
-- `chat:write`
-- `commands`
-- `channels:read`
-- `channels:history`
-- `channels:join` (recommended, lets bot join public channels)
-- `groups:read`
-- `groups:history`
-- `im:read`
-- `im:history`
-- `mpim:read`
-- `mpim:history`
-
-Event subscriptions (bot events):
-- `app_home_opened`
-- `member_joined_channel`
-- `message.channels`
-- `message.groups`
-- `message.im`
-- `message.mpim`
-
-Add slash commands:
-- `/prfactory`
-- `/feature` (legacy alias)
-- `/prfactory-github`
-
-### 2) Put tokens in `.env`
-
-Set:
-- `ENABLE_SLACK_BOT=true`
-- `SLACK_MODE=http` (for Modal/cloud)
-- `SLACK_SIGNING_SECRET=...`
-- `ENABLE_SLACK_OAUTH=true`
-- `SLACK_CLIENT_ID=...`
-- `SLACK_CLIENT_SECRET=...`
-- `SLACK_APP_ID=...`
-- `SLACK_APP_CONFIG_TOKEN=...` (App Configuration Token from `https://api.slack.com/apps`, usually `xoxe.xoxp-...`)
-- `SLACK_BOT_TOKEN=...` (optional single-workspace fallback)
-- `SLACK_APP_TOKEN=...` (only required for local `SLACK_MODE=socket`)
-
-(Optional)
-- `REVIEWER_CHANNEL_ID=C09REVIEW`
-
-### 3) Choose runtime mode
-
-Local Docker (Socket Mode):
-
-```powershell
-docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile slack up --build
-```
-
-or:
+With Slack profile:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 ```
 
-Modal/cloud (HTTP mode):
-- Keep `SLACK_MODE=http`
-- Run `py -3.12 .\scripts\sync_slack_manifest.py --env-file .env` to auto-sync URLs/events/commands/callback
-- Do not run the separate socket-mode `slackbot` process
-- Share install URL for external workspaces: `<BASE_URL>/api/slack/install`
+### 4) Open the app
 
-Scope notes:
-- `SLACK_APP_CONFIG_TOKEN` configures the app (not channel-specific).
-- In OAuth mode, each installed workspace gets its own bot token.
-- Any channel can use the bot after invite (no allowlist in production deploy script).
+- `http://localhost:8000`
+- `http://localhost:8000/health`
+- `http://localhost:8000/health/ready`
+- `http://localhost:8000/health/runtime`
 
-Then in Slack, run:
-
-```
-/prfactory Add a button to export invoices
-```
-
-The bot will continue intake in thread (chat-first, no popup modal), then auto-start build once required fields are captured.
-
-If thread replies are ignored, validate scopes/events:
+### 5) Run smoke test
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check_slack_setup.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\smoke_test.ps1
 ```
 
----
-
-## (Optional) Connect GitHub (PR-first flow)
-
-Current behavior in real mode:
-- no GitHub issue ticket is created
-- worker opens a PR directly
-- callback endpoint is still available for preview/build status updates
-
-### 1) Configure GitHub auth
-
-Local testing:
-- `GITHUB_AUTH_MODE=token`
-- `GITHUB_TOKEN=<PAT with repo scope>`
-
-Production repository access:
-- `GITHUB_AUTH_MODE=app`
-- `GITHUB_APP_ID=...`
-- `GITHUB_APP_PRIVATE_KEY_PATH=...` (or `GITHUB_APP_PRIVATE_KEY=...`)
-- `GITHUB_APP_SLUG=...` (recommended, used for install/login guidance)
-
-Per-user GitHub identity (recommended for shared Slack channels):
-- `ENABLE_GITHUB_USER_OAUTH=true`
-- `GITHUB_OAUTH_CLIENT_ID=...`
-- `GITHUB_OAUTH_CLIENT_SECRET=...`
-- `GITHUB_USER_OAUTH_REQUIRED=true`
-- optional: `GITHUB_USER_TOKEN_ENCRYPTION_KEY=...` (otherwise derived from `SECRET_KEY`)
-
-With the settings above, each Slack user must connect their own GitHub account before build.
-PRFactory no longer uses one shared GitHub identity for all users in the same Slack workspace/channel.
-
-### 2) Configure target repo strategy
-
-Recommended (multi-user):
-- each request includes `spec.repo` (`org/repo`)
-- app installation is resolved dynamically for that repo
-
-Fallback:
-- set `GITHUB_REPO_OWNER` + `GITHUB_REPO_NAME`
-
-### 3) Choose code runner mode
-
-- `CODERUNNER_MODE=opencode` + `OPENCODE_EXECUTION_MODE=local_openclaw` (default):
-  - clones target repo, generates code, pushes branch, opens PR.
-- `CODERUNNER_MODE=native_llm` (experimental):
-  - in-container LLM patch/test/push/PR flow.
-
-### 4) Validate GitHub App setup
+### 6) Optional migrations path test
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check_github_app.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1
 ```
 
-Required app permissions:
-- `Metadata: Read`
-- `Contents: Read and write`
-- `Pull requests: Read and write`
+Legacy DB bootstrap stamp:
 
-### 5) Modal deployment
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\migrate.ps1 -BootstrapStamp
+```
 
-For 24/7 hosting on Modal, follow:
-- `docs/SETUP_MODAL.md`
-- For exact coworker onboarding + invite flow, use `docs/ONBOARDING_PRFACTORY.md`
+## Runtime modes
 
----
+- `MOCK_MODE=true`
+  - No real GitHub/Slack credentials required.
+  - PR/preview outputs are simulated.
+  - Best for local workflow validation.
 
-## Project layout
+- `MOCK_MODE=false`
+  - Requires real GitHub integration and execution path.
+  - Supports signed callback ingestion via `/api/integrations/execution-callback`.
 
-- `orchestrator/app/main.py` - FastAPI entrypoint
-- `orchestrator/app/models.py` - DB models
-- `orchestrator/app/services/*` - adapters and business logic
-- `orchestrator/app/tasks/jobs.py` - queued background jobs
-- `orchestrator/app/worker.py` - RQ worker
-- `orchestrator/app/cleanup_worker.py` - scheduled workspace cleanup worker
-- `orchestrator/app/slackbot.py` - Slack Socket Mode bot (optional)
+## Auth and RBAC
 
----
+`AUTH_MODE`:
 
-## Safety notes (important)
+- `disabled` (default local)
+- `api_token` (requires `X-FF-Token`)
+- `edge_sso` (trusted identity headers)
 
-- Auto-merge is disabled by default (`DISABLE_AUTOMERGE=true`).
-- Slack and GitHub adapters are designed to be least-privilege.
-- Treat Slack messages and attachments as **untrusted input**.
-- Auth/RBAC are configurable:
-  - local: `AUTH_MODE=disabled`
-  - edge SSO: `AUTH_MODE=edge_sso` + trusted headers (`X-Forwarded-Email`, `X-Forwarded-Groups`)
-  - service calls: `API_AUTH_TOKEN` with `X-FF-Token`
-- Scheduled cleanup is independent from build flow (`WORKSPACE_CLEANUP_INTERVAL_MINUTES`).
+RBAC is configured through:
 
----
+- `RBAC_REQUESTERS`
+- `RBAC_BUILDERS`
+- `RBAC_APPROVERS`
 
-## Next steps
+Production guardrails are enforced when `APP_ENV=prod` and `ENFORCE_PRODUCTION_SECURITY=true`.
 
-- Edit `docs/ARCHITECTURE.md` to match your real infrastructure
-- Review `docs/PRODUCTION_READINESS.md` for org-grade rollout requirements
-- Use `docs/ORG_DEPLOYMENT.md` for server/VM deployment and storage lifecycle policy
-- Use `docs/SETUP_AUTH.md` for edge SSO + RBAC configuration
-- Track finalized deployment assumptions in `PRODUCTION_INPUTS.md`
-- Use `docs/code-factory.md` for risk-aware PR gating and review-agent operations
-- Use `docs/MODEL_PROVIDERS.md` for multi-provider runner strategy (OpenAI/Claude/Gemini)
-- Use `docs/OPENCLAW_AUTH.md` for container auth mounting and no-key Codex OAuth flow
-- Use `docs/PREVIEW_DEPLOYS.md` for PR preview deployment setup (Cloudflare Pages recommended)
-- Replace mock adapters with real deployments:
-  - preview environments (Vercel/Netlify/K8s)
-  - stricter policy gates
-  - GitHub webhooks for PR status
+## API surface (key endpoints)
 
+Health:
+
+- `GET /health`
+- `GET /health/ready`
+- `GET /health/metrics`
+- `GET /health/runtime`
+
+Feature orchestration:
+
+- `GET /api/feature-requests`
+- `POST /api/feature-requests`
+- `GET /api/feature-requests/{feature_id}`
+- `POST /api/feature-requests/{feature_id}/revalidate`
+- `PATCH /api/feature-requests/{feature_id}/spec`
+- `POST /api/feature-requests/{feature_id}/build`
+- `POST /api/feature-requests/{feature_id}/approve`
+
+Integrations:
+
+- `POST /api/integrations/execution-callback` (signed webhook)
+
+## Current repository structure
+
+```text
+.
+|- docs/
+|- scripts/
+|- tests/
+|- orchestrator/
+|  |- app/
+|  |  |- api/
+|  |  |- services/
+|  |  |- tasks/
+|  |  |- templates/
+|  |  |- static/
+|  |- alembic/
+|  |- Dockerfile
+|- docker-compose.yml
+|- docker-compose.dev.yml
+|- modal_app.py
+|- .env.example
+```
+
+## Recommended location for the GitHub repo/branch indexer
+
+For your planned GitHub repository/branch indexer, the best fit is a **new top-level service folder**:
+
+`/indexer`
+
+Why this is the best fit:
+
+- It has independent runtime behavior (scheduled sync/webhooks) from the build orchestrator.
+- It isolates GitHub API rate-limit pressure away from build jobs.
+- It can scale/deploy independently (or be disabled) without touching core request->build flow.
+- It keeps `orchestrator/app/services` focused on request lifecycle, not catalog ingestion.
+
+### Suggested indexer structure
+
+```text
+indexer/
+|- app/
+|  |- __init__.py
+|  |- main.py                 # optional API (webhook + health)
+|  |- config.py               # INDEXER_* env vars
+|  |- db.py
+|  |- models.py               # repo/branch/index_run tables
+|  |- api/
+|  |  |- routes.py            # /health, /webhooks/github
+|  |- services/
+|  |  |- github_client.py
+|  |  |- repository_indexer.py
+|  |  |- branch_indexer.py
+|  |  |- sync_policy.py
+|  |- tasks/
+|  |  |- jobs.py              # enqueue + execution jobs
+|  |- worker.py               # RQ/cron-like worker entrypoint
+|- alembic/
+|- alembic.ini
+|- requirements.txt
+|- Dockerfile
+```
+
+### Data model suggestion
+
+Add indexer-owned tables:
+
+- `github_repositories`
+- `github_branches`
+- `github_index_runs`
+
+Keep them separate from feature request tables to avoid coupling orchestration logic to index cache internals.
+
+### Integration contract with orchestrator
+
+The orchestrator should read index data as a cache/hint layer only:
+
+- repo validation during intake (`spec.repo`)
+- base branch suggestions (`spec.base_branch`)
+- optional Slack autocomplete support
+
+If indexer data is stale/unavailable, orchestrator should gracefully fall back to direct GitHub lookups or current behavior.
+
+### Docker Compose extension (planned)
+
+When you add the indexer, extend compose with an `indexer` service that shares Postgres/Redis and runs independently from `api`/`worker`.
+
+## Slack and GitHub setup docs
+
+- Slack: `docs/SETUP_SLACK.md`
+- GitHub: `docs/SETUP_GITHUB.md`
+- Auth/RBAC: `docs/SETUP_AUTH.md`
+- Modal: `docs/SETUP_MODAL.md`
+- Architecture notes: `docs/ARCHITECTURE.md`
+- Production posture: `docs/PRODUCTION_READINESS.md`
+- Org deployment: `docs/ORG_DEPLOYMENT.md`
+
+## Safety defaults
+
+- `DISABLE_AUTOMERGE=true` by default.
+- Intake is treated as untrusted input.
+- Workspace isolation and retention controls are enabled and configurable.
+- Signed callback verification is supported for external execution events.
+
+## Development and tests
+
+Run Python unit tests locally (Python 3.12):
+
+```powershell
+py -3.12 -m pytest -q
+```
+
+Main test suites are under `tests/unit` and include auth, state machine, GitHub adapters, callback idempotency, and workspace behavior.

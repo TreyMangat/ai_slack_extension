@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlencode
 
 
 DEFAULT_DISPLAY_NAME = "PRFactory"
@@ -73,14 +74,26 @@ def _oauth_callback_url(base_url: str, callback_path: str) -> str:
     return base_url.rstrip("/") + path
 
 
-def _slack_api_call(*, token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _slack_api_call(
+    *,
+    token: str,
+    method: str,
+    payload: dict[str, Any],
+    form_encoded: bool = False,
+) -> dict[str, Any]:
+    if form_encoded:
+        body = urlencode({k: str(v) for k, v in payload.items()}).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded; charset=utf-8"
+    else:
+        body = json.dumps(payload).encode("utf-8")
+        content_type = "application/json; charset=utf-8"
     req = request.Request(
         url=f"https://slack.com/api/{method}",
         method="POST",
-        data=json.dumps(payload).encode("utf-8"),
+        data=body,
         headers={
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=utf-8",
+            "Content-Type": content_type,
         },
     )
     try:
@@ -106,6 +119,64 @@ def _slack_api_call(*, token: str, method: str, payload: dict[str, Any]) -> dict
         hint = f" needed={needed}" if needed else ""
         raise RuntimeError(f"Slack API {method} error: {error_code or 'unknown_error'}{hint}")
     return payload_json
+
+
+def _rotate_config_token(*, token: str, refresh_token: str) -> tuple[str, str]:
+    normalized_refresh = (refresh_token or "").strip()
+    if not normalized_refresh:
+        return token, refresh_token
+
+    rotate_payload = {"refresh_token": normalized_refresh}
+    bearer_candidates: list[str] = []
+    for candidate in [token, normalized_refresh]:
+        value = str(candidate or "").strip()
+        if value and value not in bearer_candidates:
+            bearer_candidates.append(value)
+
+    last_error: Exception | None = None
+    for bearer in bearer_candidates:
+        try:
+            rotated = _slack_api_call(
+                token=bearer,
+                method="tooling.tokens.rotate",
+                payload=rotate_payload,
+                form_encoded=True,
+            )
+            new_access = str(rotated.get("token") or "").strip()
+            new_refresh = str(rotated.get("refresh_token") or "").strip()
+            if not new_access or not new_refresh:
+                raise RuntimeError("tooling.tokens.rotate returned missing token fields.")
+            return new_access, new_refresh
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+
+    if last_error is not None:
+        raise RuntimeError(f"Slack App Configuration token rotation failed: {last_error}") from last_error
+    return token, refresh_token
+
+
+def _write_dotenv_values(path: Path, updates: dict[str, str]) -> None:
+    existing_lines: list[str] = []
+    if path.exists():
+        existing_lines = path.read_text(encoding="utf-8").splitlines()
+
+    for key, value in updates.items():
+        replaced = False
+        for idx, line in enumerate(existing_lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in line:
+                continue
+            current_key = line.split("=", 1)[0].strip()
+            if current_key != key:
+                continue
+            existing_lines[idx] = f"{key}={value}"
+            replaced = True
+            break
+        if not replaced:
+            existing_lines.append(f"{key}={value}")
+
+    output = "\n".join(existing_lines).rstrip() + "\n"
+    path.write_text(output, encoding="utf-8")
 
 
 def _ensure_bot_events(existing: list[str]) -> list[str]:
@@ -211,11 +282,32 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="Slack App Configuration token (xoxe.xoxp-..., falls back to SLACK_APP_CONFIG_TOKEN).",
     )
+    parser.add_argument(
+        "--config-refresh-token",
+        default="",
+        help=(
+            "Slack App Configuration refresh token "
+            "(falls back to SLACK_APP_CONFIG_REFRESH_TOKEN)."
+        ),
+    )
     parser.add_argument("--display-name", default="", help="Slack app display name (default PRFactory).")
     parser.add_argument(
         "--oauth-callback-path",
         default="",
         help="OAuth callback path (defaults to SLACK_OAUTH_CALLBACK_PATH or /api/slack/oauth/callback).",
+    )
+    parser.add_argument(
+        "--skip-token-rotation",
+        action="store_true",
+        help="Skip tooling.tokens.rotate for the App Configuration token.",
+    )
+    parser.add_argument(
+        "--write-rotated-token-to-env",
+        action="store_true",
+        help=(
+            "Write rotated SLACK_APP_CONFIG_TOKEN and SLACK_APP_CONFIG_REFRESH_TOKEN "
+            "back to --env-file."
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print patched manifest JSON and exit.")
     return parser.parse_args()
@@ -228,6 +320,11 @@ def main() -> int:
     base_url = _env_or_arg(value=args.base_url, env=env, key="BASE_URL")
     app_id = _env_or_arg(value=args.app_id, env=env, key="SLACK_APP_ID")
     config_token = _env_or_arg(value=args.config_token, env=env, key="SLACK_APP_CONFIG_TOKEN")
+    config_refresh_token = _env_or_arg(
+        value=args.config_refresh_token,
+        env=env,
+        key="SLACK_APP_CONFIG_REFRESH_TOKEN",
+    )
     display_name = _env_or_arg(value=args.display_name, env=env, key="APP_DISPLAY_NAME") or DEFAULT_DISPLAY_NAME
     callback_path = _env_or_arg(
         value=args.oauth_callback_path,
@@ -240,14 +337,44 @@ def main() -> int:
         missing.append("BASE_URL/--base-url")
     if not app_id:
         missing.append("SLACK_APP_ID/--app-id")
-    if not config_token:
-        missing.append("SLACK_APP_CONFIG_TOKEN/--config-token")
+    if not config_token and not config_refresh_token:
+        missing.append("SLACK_APP_CONFIG_TOKEN or SLACK_APP_CONFIG_REFRESH_TOKEN")
     if missing:
         raise RuntimeError(
             "Missing required inputs: "
             + ", ".join(missing)
             + ". Set them in .env or pass CLI flags."
         )
+
+    if not args.skip_token_rotation and config_refresh_token:
+        token_for_rotation = config_token or config_refresh_token
+        rotated_access = ""
+        rotated_refresh = ""
+        try:
+            rotated_access, rotated_refresh = _rotate_config_token(
+                token=token_for_rotation,
+                refresh_token=config_refresh_token,
+            )
+        except RuntimeError as exc:
+            if config_token:
+                print(f"WARN: {exc}. Continuing with provided config token.", file=sys.stderr)
+            else:
+                raise
+        if rotated_access and rotated_refresh:
+            config_token = rotated_access
+            config_refresh_token = rotated_refresh
+            if args.write_rotated_token_to_env:
+                env_file_path = Path(args.env_file)
+                _write_dotenv_values(
+                    env_file_path,
+                    {
+                        "SLACK_APP_CONFIG_TOKEN": config_token,
+                        "SLACK_APP_CONFIG_REFRESH_TOKEN": config_refresh_token,
+                    },
+                )
+
+    if not config_token:
+        raise RuntimeError("No usable Slack App Configuration access token available after rotation attempt.")
 
     request_url = _events_url(base_url)
     oauth_callback_url = _oauth_callback_url(base_url, callback_path)

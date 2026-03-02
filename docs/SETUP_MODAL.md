@@ -78,6 +78,7 @@ Slack on Modal (optional):
   - `SLACK_CLIENT_SECRET=...`
   - `SLACK_APP_ID=A...`
   - `SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...` (App Configuration Token from `https://api.slack.com/apps`)
+  - `SLACK_APP_CONFIG_REFRESH_TOKEN=...` (for auto-rotating the short-lived config token)
   - optional fallback for one workspace: `SLACK_BOT_TOKEN=xoxb-...`
   - request URL + slash command URLs are synced automatically to `<BASE_URL>/api/slack/events`
   - OAuth callback URL is synced automatically to `<BASE_URL>/api/slack/oauth/callback`
@@ -151,7 +152,7 @@ The helper script:
 
 If using Slack on Modal:
 1. Keep `SLACK_MODE=http`.
-2. Set `ENABLE_SLACK_OAUTH=true`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_APP_ID`, and `SLACK_APP_CONFIG_TOKEN` in `.env`.
+2. Set `ENABLE_SLACK_OAUTH=true`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_APP_ID`, `SLACK_APP_CONFIG_TOKEN`, and `SLACK_APP_CONFIG_REFRESH_TOKEN` in `.env`.
 3. Run deploy helper (it syncs Events/Interactivity/Slash-command URLs and OAuth callback URL automatically).
 4. Share install link with external workspaces: `<BASE_URL>/api/slack/install`.
 5. Do not run the separate `slackbot` Socket Mode process in Modal for this mode.

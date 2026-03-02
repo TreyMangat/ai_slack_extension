@@ -46,6 +46,7 @@ Required:
 - `SLACK_SIGNING_SECRET=...`
 - `SLACK_APP_ID=A...`
 - `SLACK_APP_CONFIG_TOKEN=xoxe.xoxp-...` (App Configuration Token from `https://api.slack.com/apps`)
+- `SLACK_APP_CONFIG_REFRESH_TOKEN=...` (paired refresh token from the same page)
 - `ENABLE_SLACK_OAUTH=true`
 - `SLACK_CLIENT_ID=...`
 - `SLACK_CLIENT_SECRET=...`
@@ -63,7 +64,7 @@ Optional:
 Run:
 
 ```powershell
-py -3.12 .\scripts\sync_slack_manifest.py --env-file .env
+py -3.12 .\scripts\sync_slack_manifest.py --env-file .env --write-rotated-token-to-env
 ```
 
 This updates Slack manifest settings automatically:
@@ -78,6 +79,8 @@ The Modal production deploy script runs this automatically unless you pass `-Ski
 ## 4) Token scope and multi-user behavior
 
 - `SLACK_APP_CONFIG_TOKEN` is not channel-specific. It manages app configuration for your Slack app.
+- `SLACK_APP_CONFIG_TOKEN` is intentionally short-lived (about 12 hours). Use `SLACK_APP_CONFIG_REFRESH_TOKEN` + the sync script to rotate it automatically.
+- The App Configuration token is for manifest sync only. It is not the runtime bot token.
 - With `ENABLE_SLACK_OAUTH=true`, each workspace gets its own bot token after install.
 - In the same workspace, anyone can use PRFactory in any channel where the bot is invited.
 - Cross-workspace self-serve installs use your OAuth install URL: `<BASE_URL>/api/slack/install`.

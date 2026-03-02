@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     # Slack intake behavior
     slack_intake_minimal: bool = Field(default=True, alias="SLACK_INTAKE_MINIMAL")
     slack_require_prompt_confirmation: bool = Field(default=True, alias="SLACK_REQUIRE_PROMPT_CONFIRMATION")
+    build_status_heartbeat_seconds: int = Field(default=120, alias="BUILD_STATUS_HEARTBEAT_SECONDS")
 
     # Code runner strategy:
     # - opencode: run OpenClaw inside worker and open PR directly
@@ -183,6 +184,11 @@ class Settings(BaseSettings):
             return self.enable_api_docs_in_prod
         return self.enable_api_docs
 
+    @staticmethod
+    def _looks_like_app_config_token(value: str) -> bool:
+        token = (value or "").strip().lower()
+        return token.startswith("xoxe.")
+
     def validate_runtime_guardrails(self) -> None:
         if not self.enforce_production_security or not self.is_production():
             return
@@ -210,6 +216,16 @@ class Settings(BaseSettings):
 
     def validate_startup_prerequisites(self) -> None:
         failures: list[str] = []
+        bot_token = (self.slack_bot_token or "").strip()
+        if bot_token and self._looks_like_app_config_token(bot_token):
+            failures.append(
+                "SLACK_BOT_TOKEN appears to be a Slack App Configuration token (xoxe.*). "
+                "Use a bot token (xoxb-...) or enable Slack OAuth installation flow."
+            )
+        if self.slack_mode_normalized() == "socket":
+            app_token = (self.slack_app_token or "").strip()
+            if app_token and not app_token.startswith("xapp-"):
+                failures.append("SLACK_APP_TOKEN must be an app-level token (xapp-...) in socket mode")
         if self.github_enabled and self.github_auth_mode_normalized() == "app":
             key_path = (self.github_app_private_key_path or "").strip()
             inline_key = (self.github_app_private_key or "").strip()
@@ -283,6 +299,7 @@ class Settings(BaseSettings):
             "slack_oauth_install_url": self.slack_oauth_install_url_resolved(),
             "slack_app_redirect_url": self.slack_app_redirect_url_resolved(),
             "slack_require_prompt_confirmation": bool(self.slack_require_prompt_confirmation),
+            "build_status_heartbeat_seconds": int(max(self.build_status_heartbeat_seconds, 0)),
             "github_enabled": bool(self.github_enabled),
             "github_auth_mode": self.github_auth_mode_normalized() or "token",
             "github_app_slug": (self.github_app_slug or "").strip(),

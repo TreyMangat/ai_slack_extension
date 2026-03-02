@@ -38,12 +38,17 @@ $botToken = (Get-EnvValue -Key "SLACK_BOT_TOKEN").Trim()
 $appToken = (Get-EnvValue -Key "SLACK_APP_TOKEN").Trim()
 $signingSecret = (Get-EnvValue -Key "SLACK_SIGNING_SECRET").Trim()
 $appConfigToken = (Get-EnvValue -Key "SLACK_APP_CONFIG_TOKEN").Trim()
+$appConfigRefreshToken = (Get-EnvValue -Key "SLACK_APP_CONFIG_REFRESH_TOKEN").Trim()
 $appId = (Get-EnvValue -Key "SLACK_APP_ID").Trim()
 $channelRaw = (Get-EnvValue -Key "SLACK_ALLOWED_CHANNELS").Trim()
 $channelId = ($channelRaw -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)
 
 if (-not $oauthEnabled -and [string]::IsNullOrWhiteSpace($botToken)) {
   throw "SLACK_BOT_TOKEN is empty in .env (required when ENABLE_SLACK_OAUTH=false)"
+}
+
+if (-not [string]::IsNullOrWhiteSpace($botToken) -and $botToken.ToLowerInvariant().StartsWith("xoxe.")) {
+  throw "SLACK_BOT_TOKEN looks like an App Configuration token (xoxe.*). Use a bot token (xoxb-...) instead."
 }
 
 if ([string]::IsNullOrWhiteSpace($botToken)) {
@@ -67,6 +72,9 @@ if ($slackMode -eq "socket") {
   if ([string]::IsNullOrWhiteSpace($appToken)) {
     throw "SLACK_APP_TOKEN is empty in .env (required for SLACK_MODE=socket)"
   }
+  if (-not $appToken.ToLowerInvariant().StartsWith("xapp-")) {
+    throw "SLACK_APP_TOKEN must be an app-level token starting with xapp- for socket mode."
+  }
   Write-Host "Checking app-level socket token..." -ForegroundColor Cyan
   $conn = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/apps.connections.open" -Headers @{ Authorization = "Bearer $appToken" }
   if (-not $conn.ok) { throw "apps.connections.open failed: $($conn.error)" }
@@ -81,10 +89,41 @@ elseif ($slackMode -eq "http") {
   if (-not [string]::IsNullOrWhiteSpace($appConfigToken) -and -not [string]::IsNullOrWhiteSpace($appId)) {
     Write-Host "Checking Slack manifest config token..." -ForegroundColor Cyan
     $manifestBody = @{ app_id = $appId } | ConvertTo-Json -Compress
-    $manifest = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/apps.manifest.export" -Headers @{
-      Authorization = "Bearer $appConfigToken"
-      "Content-Type" = "application/json; charset=utf-8"
-    } -Body $manifestBody
+    $manifest = $null
+    try {
+      $manifest = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/apps.manifest.export" -Headers @{
+        Authorization = "Bearer $appConfigToken"
+        "Content-Type" = "application/json; charset=utf-8"
+      } -Body $manifestBody
+    }
+    catch {
+      if (-not [string]::IsNullOrWhiteSpace($appConfigRefreshToken)) {
+        Write-Warning "Manifest token check failed. Trying tooling.tokens.rotate with SLACK_APP_CONFIG_REFRESH_TOKEN..."
+        try {
+          $rotate = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/tooling.tokens.rotate" -Headers @{
+            Authorization = "Bearer $appConfigToken"
+            "Content-Type" = "application/x-www-form-urlencoded; charset=utf-8"
+          } -Body ("refresh_token=" + [System.Uri]::EscapeDataString($appConfigRefreshToken))
+          if ($rotate.ok -and -not [string]::IsNullOrWhiteSpace([string]$rotate.token)) {
+            $appConfigToken = [string]$rotate.token
+            if (-not [string]::IsNullOrWhiteSpace([string]$rotate.refresh_token)) {
+              $appConfigRefreshToken = [string]$rotate.refresh_token
+            }
+            $manifest = Invoke-RestMethod -Method Post -Uri "https://slack.com/api/apps.manifest.export" -Headers @{
+              Authorization = "Bearer $appConfigToken"
+              "Content-Type" = "application/json; charset=utf-8"
+            } -Body $manifestBody
+            Write-Warning "Rotated App Configuration token in-memory. Update .env with new token/refresh token."
+          }
+        }
+        catch {
+          throw $_
+        }
+      }
+      else {
+        throw $_
+      }
+    }
     if (-not $manifest.ok) {
       throw "apps.manifest.export failed: $($manifest.error)"
     }

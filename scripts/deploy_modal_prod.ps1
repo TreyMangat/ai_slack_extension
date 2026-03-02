@@ -905,7 +905,7 @@ try {
     }
     if ($slackEnabled -and $slackMode -eq "http" -and -not $SkipSlackManifestSync) {
       Write-Host "Syncing Slack manifest URLs/events/commands..." -ForegroundColor Cyan
-      & py -3.12 .\scripts\sync_slack_manifest.py --env-file $resolvedEnvFile --base-url $resolvedBaseUrl
+      & py -3.12 .\scripts\sync_slack_manifest.py --env-file $resolvedEnvFile --base-url $resolvedBaseUrl --write-rotated-token-to-env
       if ($LASTEXITCODE -ne 0) {
         throw "Slack manifest sync failed. Re-run with -SkipSlackManifestSync for manual Slack configuration."
       }
