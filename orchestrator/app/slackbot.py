@@ -60,6 +60,7 @@ except ImportError:
     check_github_connection = None
     HAS_GITHUB_CONNECTION_CHECKER = False
 
+print(f"[PRFACTORY DIAG] slackbot.py loaded. HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, HAS_ESCALATE={HAS_ESCALATE}, HAS_GITHUB_CONNECTION_CHECKER={HAS_GITHUB_CONNECTION_CHECKER}", flush=True)
 
 console = Console()
 module_logger = logging.getLogger("feature_factory.slackbot")
@@ -3402,6 +3403,7 @@ def _process_session_message(
             return
 
     # ---- Determine flow: model vs hardcoded ----
+    print(f"[PRFACTORY DIAG] _process_session_message: flow={session.answers.get('_flow')}, field={_next_field(session)}, HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, openrouter={_openrouter_enabled(settings)}", flush=True)
     session_flow = str(session.answers.get("_flow") or "").strip()
     _try_model = False
     if session_flow == "model":
@@ -3452,6 +3454,8 @@ def _process_session_message(
                 getattr(action, "action", ""),
             )
         except Exception:
+            import traceback as _tb
+            print(f"[PRFACTORY DIAG] Model reply FAILED:\n{_tb.format_exc()}", flush=True)
             logger.error(
                 "slack_model_intake_failed team=%s channel=%s thread=%s user=%s",
                 team_id,
@@ -3489,6 +3493,7 @@ def _start_create_intake(
     user_id: str,
     seed_prompt: str,
 ) -> None:
+    print(f"[PRFACTORY DIAG] _start_create_intake called. HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, openrouter_enabled={_openrouter_enabled(settings)}, seed_prompt={repr((seed_prompt or '')[:50])}", flush=True)
     msg = client.chat_postMessage(
         channel=channel_id,
         text=f"Got it - feature request intake started by <@{user_id}>. Reply in this thread.",
@@ -3529,6 +3534,7 @@ def _start_create_intake(
             # User typed "/prfactory I want to add dark mode..." — run the
             # model immediately with the seed prompt as the first message.
             try:
+                print(f"[PRFACTORY DIAG] About to call _classify_intake_message_sync with seed prompt", flush=True)
                 action = _classify_intake_message_sync(
                     message=normalized_seed_prompt,
                     conversation_history=[],
@@ -3546,6 +3552,8 @@ def _start_create_intake(
                 # Model returned an unrecognized action — fall through to
                 # open-ended greeting below.
             except Exception:
+                import traceback as _tb
+                print(f"[PRFACTORY DIAG] Model startup FAILED:\n{_tb.format_exc()}", flush=True)
                 module_logger.error(
                     "slack_model_intake_startup_failed team=%s channel=%s thread=%s user=%s",
                     team_id, channel_id, thread_ts, user_id,
