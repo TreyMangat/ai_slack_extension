@@ -167,6 +167,16 @@ def _github_status_section(github_status: GitHubConnectionCheck | None) -> str:
     return ""
 
 
+def _shortcut_phrases_section() -> str:
+    return (
+        "SHORTCUT PHRASES:\n"
+        "If the user says \"just send it\", \"just build it\", \"ship it\", \"go ahead\", "
+        "\"looks good\", \"that's fine\", \"skip the rest\", or similar, treat all remaining "
+        "fields as optional and set action=\"confirm\". Don't ask for more details \u2014 "
+        "the user wants to proceed with what they've given."
+    )
+
+
 def _escalation_rules_section() -> str:
     return (
         "ESCALATION RULES:\n"
@@ -264,6 +274,7 @@ def build_intake_system_prompt(
     if conventions:
         sections.append(conventions)
 
+    sections.append(_shortcut_phrases_section())
     sections.append(_escalation_rules_section())
     sections.append(_response_format_section())
     sections.append(_examples_section())

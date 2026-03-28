@@ -2343,6 +2343,25 @@ def _build_repo_select_blocks(
                 ],
             }
         )
+    # Hint when very few real repos are listed (GitHub App may be limited)
+    _special_values = {REPO_OPTION_NONE, REPO_OPTION_NEW, REPO_OPTION_CONNECT}
+    real_repo_count = sum(
+        1 for opt in options
+        if isinstance(opt, dict) and str(opt.get("value") or "").strip() not in _special_values
+    )
+    if real_repo_count <= 1:
+        install_url = str(getattr(settings, "github_app_install_url_resolved", lambda: "")() or "").strip()
+        hint_url = install_url or "https://github.com/settings/installations"
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": (
+                    ":information_source: _Only showing repos where the GitHub App is installed. "
+                    f"<{hint_url}|Add more repos>_"
+                ),
+            }],
+        })
     return blocks
 
 
@@ -2755,10 +2774,13 @@ def _build_update_queue(feature: dict[str, Any]) -> list[str]:
 
 
 def _peek_next_field(session: IntakeSession) -> str:
+    is_model_flow = str(session.answers.get("_flow") or "").strip() == "model"
     for current in list(session.queue):
         if current == "base_branch":
             repo_value = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
-            if _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
+            if is_model_flow and repo_value:
+                pass  # Model flow: keep base_branch when repo is set
+            elif _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
                 continue
         if current == "edit_scope":
             mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
@@ -2773,11 +2795,14 @@ def _peek_next_field(session: IntakeSession) -> str:
 
 
 def _next_field(session: IntakeSession) -> str:
+    is_model_flow = str(session.answers.get("_flow") or "").strip() == "model"
     while session.queue:
         current = session.queue[0]
         if current == "base_branch":
             repo_value = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
-            if _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
+            if is_model_flow and repo_value:
+                pass  # Model flow: keep base_branch when repo is set
+            elif _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
                 session.queue.pop(0)
                 continue
         if current == "edit_scope":
@@ -3170,6 +3195,15 @@ def _handle_model_intake_action(
             )
             return True
         if target_field == "repo":
+            # If repo is already collected, skip to next missing field
+            if str(session.answers.get("repo") or "").strip():
+                _drop_field_from_queue(session, "repo")
+                _store_session(session)
+                if _next_field(session):
+                    _ask_next_question(client, session)
+                    return True
+                _finalize_session(client, settings, session)
+                return True
             _show_repo_dropdown_message(
                 client,
                 settings,
@@ -3181,6 +3215,15 @@ def _handle_model_intake_action(
             )
             return True
         if target_field == "base_branch":
+            # If branch is already collected, skip to next missing field
+            if str(session.answers.get("base_branch") or "").strip():
+                _drop_field_from_queue(session, "base_branch")
+                _store_session(session)
+                if _next_field(session):
+                    _ask_next_question(client, session)
+                    return True
+                _finalize_session(client, settings, session)
+                return True
             _show_branch_dropdown_message(
                 client,
                 settings,

@@ -9,6 +9,7 @@ from app.slackbot import (
     IntakeSession,
     _build_thread_history,
     _handle_frontier_escalation,
+    _handle_model_intake_action,
     _post_thread_message_with_optional_model_context,
     _process_session_message,
     _start_create_intake,
@@ -920,3 +921,135 @@ def test_prfactory_hardcoded_when_no_model(monkeypatch) -> None:
     assert any("How can I help you?" in str(p.get("text", "")) for p in client.posted)
     # Flow is hardcoded
     assert any(s.answers.get("_flow") == "hardcoded" for s in stored_sessions)
+
+
+# ---------------------------------------------------------------------------
+# Bug fix tests: repo loop, branch step, installation hint, shortcuts
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_repo_ask_skipped(monkeypatch) -> None:
+    """When model asks for repo but session already has one, skip to next field."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["repo", "base_branch"])
+    session.answers["repo"] = "org/app"
+    session.answers["_flow"] = "model"
+    client = DummyClient()
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+
+    # Model asks for repo again
+    result = _handle_model_intake_action(
+        client,
+        settings,
+        session,
+        event={"text": "yes that one", "user": "U123", "team": "T123"},
+        action=_action(action="ask_field", field_name="repo"),
+    )
+
+    assert result is True
+    # Repo should NOT be re-asked — it's already collected
+    assert "repo" not in session.queue
+
+
+def test_repo_button_click_advances_to_branch(monkeypatch) -> None:
+    """After _apply_repo_selection sets the repo, branch is the next field."""
+    from app.slackbot import _apply_repo_selection
+
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["repo", "base_branch"])
+    session.answers["_flow"] = "model"
+    session.answers["_intake_mode"] = "developer"
+    client = DummyClient()
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_fetch_default_branch_for_repo",
+        lambda *a, **kw: "main",
+    )
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_fetch_branches_for_repo",
+        lambda *a, **kw: ["main", "develop"],
+    )
+
+    _apply_repo_selection(
+        client,
+        settings,
+        session,
+        team_id="T123",
+        channel_id="C123",
+        user_id="U123",
+        selected="TreyMangat/github_indexer",
+    )
+
+    assert session.answers["repo"] == "TreyMangat/github_indexer"
+    assert "repo" not in session.queue
+
+
+def test_few_repos_shows_installation_hint(monkeypatch) -> None:
+    """When repo dropdown has <= 1 real repo, show installation hint."""
+    from app.slackbot import _build_repo_select_blocks
+
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["repo"])
+
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_repo_options_for_slack",
+        lambda *a, **kw: [
+            {"text": {"type": "plain_text", "text": "None (use defaults)"}, "value": "__NONE__"},
+            {"text": {"type": "plain_text", "text": "New repo (I will type it)"}, "value": "__NEW__"},
+            {"text": {"type": "plain_text", "text": "TreyMangat/github_indexer"}, "value": "TreyMangat/github_indexer"},
+        ],
+    )
+
+    blocks = _build_repo_select_blocks(
+        settings,
+        session,
+        question="Pick a repo",
+        suggested=None,
+        user_skill="technical",
+    )
+
+    # Should have a context block with the installation hint
+    context_blocks = [b for b in blocks if b.get("type") == "context"]
+    hint_texts = [str(b) for b in context_blocks]
+    assert any("Add more repos" in t for t in hint_texts)
+
+
+def test_branch_selection_after_repo_in_model_flow(monkeypatch) -> None:
+    """In model flow, base_branch stays in queue when repo is set."""
+    from app.slackbot import _next_field
+
+    session = _session(queue=["base_branch"])
+    session.answers["_flow"] = "model"
+    session.answers["repo"] = "org/app"
+
+    field = _next_field(session)
+    assert field == "base_branch"
+
+
+def test_branch_skipped_in_normal_mode_without_developer() -> None:
+    """In normal mode (non-model, non-developer), base_branch is skipped."""
+    from app.slackbot import _next_field
+
+    session = _session(queue=["base_branch"])
+    session.answers["repo"] = "org/app"
+    # No _flow=model, no developer mode
+
+    field = _next_field(session)
+    assert field == ""  # base_branch was skipped
+
+
+def test_shortcut_phrase_in_prompt() -> None:
+    """The intake prompt includes shortcut phrases section."""
+    from app.services.intake_prompts import build_intake_system_prompt
+
+    prompt = build_intake_system_prompt()
+    assert "SHORTCUT PHRASES:" in prompt
+    assert "just build it" in prompt.lower()
+    assert "ship it" in prompt.lower()
+    assert 'action="confirm"' in prompt
