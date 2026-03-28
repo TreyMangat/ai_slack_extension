@@ -45,6 +45,10 @@ Required values for Modal:
 - `SECRET_KEY=...`
 - `INTEGRATION_WEBHOOK_SECRET=...`
 - `BASE_URL=<your modal api url>`
+- optional but recommended for hosted index usage:
+  - `INDEXER_BASE_URL=https://<your-repo-indexer-url>`
+  - `INDEXER_AUTH_TOKEN=...` (only if Repo_Indexer runs with token auth)
+  - `INDEXER_REQUIRED=true`
 
 Choose one runtime coding strategy:
 - `CODERUNNER_MODE=native_llm` (recommended on Modal) with:
@@ -133,7 +137,7 @@ This deploys:
 Production helper (recommended):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>"
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>" -RequireIndexer
 ```
 
 The helper script:
@@ -147,6 +151,7 @@ The helper script:
 - bundles `secrets/openclaw` into the Modal image when using `opencode/local_openclaw`
 - auto-syncs Slack manifest URLs/events/commands (unless `-SkipSlackManifestSync`)
 - deploys via Python 3.12 and verifies `/health`, `/health/ready`, and `/health/runtime`
+- when `INDEXER_BASE_URL` is set, also verifies Repo_Indexer `/health` and `/api/indexer/search`
 
 ## 5) Configure Slack (Optional)
 

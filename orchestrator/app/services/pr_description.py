@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from typing import Any
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _as_text(value: Any, fallback: str = "") -> str:
@@ -148,3 +154,94 @@ def build_standard_pr_body(
         f"- Model: `{runner_model or '(unspecified)'}`\n"
         f"{warning_block}"
     ).strip()
+
+
+# ---------------------------------------------------------------------------
+# LLM-enhanced PR body generation (FRONTIER tier via OpenRouter)
+# ---------------------------------------------------------------------------
+
+_PR_BODY_SYSTEM_PROMPT = (
+    "You are a senior engineer writing a pull request description. "
+    "Given a feature spec and build context, produce a clear, well-structured "
+    "PR body in GitHub-flavored Markdown.\n\n"
+    "Include these sections: ## Why, ## What Changed, ## Acceptance Criteria, "
+    "## How To Test Locally, ## Preview (if URL provided), ## Metadata.\n\n"
+    "Return the raw Markdown only — no JSON wrapping, no code fences around the whole body."
+)
+
+
+async def build_pr_body_with_llm(
+    *,
+    spec: dict[str, Any],
+    feature_id: str,
+    issue_number: int | None,
+    branch_name: str,
+    runner_name: str,
+    runner_model: str,
+    summary: str,
+    verification_output: str,
+    verification_command: str,
+    verification_warning: str,
+    preview_url: str,
+    cloudflare_project_name: str,
+    cloudflare_production_branch: str,
+    repo_path: Path | None = None,
+) -> str:
+    """Generate PR body using FRONTIER tier LLM, with template fallback."""
+    settings = get_settings()
+    if not (settings.openrouter_api_key or "").strip():
+        return build_standard_pr_body(
+            spec=spec, feature_id=feature_id, issue_number=issue_number,
+            branch_name=branch_name, runner_name=runner_name, runner_model=runner_model,
+            summary=summary, verification_output=verification_output,
+            verification_command=verification_command, verification_warning=verification_warning,
+            preview_url=preview_url, cloudflare_project_name=cloudflare_project_name,
+            cloudflare_production_branch=cloudflare_production_branch, repo_path=repo_path,
+        )
+
+    try:
+        from app.services.openrouter_provider import ModelTier, call_openrouter
+
+        context = {
+            "spec": {k: v for k, v in (spec or {}).items() if v},
+            "feature_id": feature_id,
+            "issue_number": issue_number,
+            "branch_name": branch_name,
+            "runner_name": runner_name,
+            "runner_model": runner_model,
+            "summary": _truncate(summary, max_chars=800),
+            "verification_command": verification_command,
+            "verification_warning": verification_warning,
+            "preview_url": preview_url,
+        }
+        prompt = (
+            "Generate a GitHub PR description for this feature build:\n\n"
+            f"```json\n{json.dumps(context, indent=2, default=str)}\n```"
+        )
+
+        response = await call_openrouter(
+            prompt=prompt,
+            tier=ModelTier.FRONTIER,
+            system_prompt=_PR_BODY_SYSTEM_PROMPT,
+            response_format="text",
+        )
+
+        logger.info(
+            "pr_description_llm",
+            extra={
+                "model": response.model,
+                "cost_estimate_usd": round(response.cost_estimate, 6),
+            },
+        )
+        return response.content.strip()
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pr_description: LLM generation failed, falling back to template: %s", exc)
+        return build_standard_pr_body(
+            spec=spec, feature_id=feature_id, issue_number=issue_number,
+            branch_name=branch_name, runner_name=runner_name, runner_model=runner_model,
+            summary=summary, verification_output=verification_output,
+            verification_command=verification_command, verification_warning=verification_warning,
+            preview_url=preview_url, cloudflare_project_name=cloudflare_project_name,
+            cloudflare_production_branch=cloudflare_production_branch, repo_path=repo_path,
+        )

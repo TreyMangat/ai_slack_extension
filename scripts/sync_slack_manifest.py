@@ -39,6 +39,12 @@ REQUIRED_COMMANDS = [
         "usage_hint": "Connect GitHub",
         "should_escape": False,
     },
+    {
+        "command": "/prfactory-indexer",
+        "description": "Search indexed repositories",
+        "usage_hint": "webhook retries",
+        "should_escape": False,
+    },
 ]
 
 

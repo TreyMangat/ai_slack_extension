@@ -121,6 +121,29 @@ def test_github_oauth_urls_resolve_from_base_url(monkeypatch: pytest.MonkeyPatch
     assert settings.github_oauth_install_url_resolved() == "https://example.modal.run/api/github/install"
 
 
+def test_repo_indexer_url_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://feature:feature@db:5432/feature_factory")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("INDEXER_BASE_URL", "http://indexer-api:8080/")
+
+    settings = Settings()
+    assert settings.repo_indexer_enabled() is True
+    assert settings.indexer_base_url_normalized() == "http://indexer-api:8080"
+
+
+def test_validate_startup_prerequisites_requires_indexer_when_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg2://feature:feature@db:5432/feature_factory")
+    monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    monkeypatch.setenv("INDEXER_REQUIRED", "true")
+    monkeypatch.delenv("INDEXER_BASE_URL", raising=False)
+
+    settings = Settings()
+    with pytest.raises(RuntimeError):
+        settings.validate_startup_prerequisites()
+
+
 def test_validate_startup_prerequisites_rejects_missing_github_oauth_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

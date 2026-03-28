@@ -10,6 +10,7 @@ Primary user command:
 Compatibility/utility commands:
 - `/feature <full context request>` (legacy alias)
 - `/prfactory-github` (GitHub account connect link for that Slack user)
+- `/prfactory-indexer <query>` (search Repo_Indexer when configured)
 
 ## 1) Create Slack app + scopes
 
@@ -37,6 +38,7 @@ Compatibility/utility commands:
 - `/prfactory`
 - `/feature`
 - `/prfactory-github`
+- `/prfactory-indexer`
 
 ## 2) Configure `.env`
 
@@ -95,6 +97,7 @@ Try:
 
 ```text
 /prfactory Add a button to export invoices
+/prfactory-indexer where do we handle webhook retries
 ```
 
 The slash command text is treated as full prompt context. PRFactory then asks for a short title as the first in-thread reply.

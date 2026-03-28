@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
-from app.models import FeatureRequest, FeatureRun
+from app.models import FeatureEvent, FeatureRequest, FeatureRun
 from app.queue import get_queue
 from app.security import (
     AuthenticatedUser,
@@ -26,6 +26,7 @@ from app.services.feature_service import (
     transition_feature_to_building,
     update_feature_spec,
 )
+from app.services.llm_costs import aggregate_llm_costs
 from app.state_machine import READY_FOR_BUILD, PREVIEW_READY
 from app.tasks.jobs import kickoff_build_job
 
@@ -33,6 +34,20 @@ router = APIRouter()
 
 templates = Jinja2Templates(directory="app/templates")
 templates.env.globals["app_display_name"] = (get_settings().app_display_name or "PRFactory").strip() or "PRFactory"
+
+
+def _feature_llm_costs(db: Session, feature_id: str) -> dict[str, object] | None:
+    llm_cost_events = (
+        db.execute(
+            select(FeatureEvent)
+            .where(FeatureEvent.feature_id == feature_id)
+            .where(FeatureEvent.event_type == "llm_cost")
+            .order_by(FeatureEvent.created_at.asc())
+        )
+        .scalars()
+        .all()
+    )
+    return aggregate_llm_costs(list(llm_cost_events))
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -109,6 +124,7 @@ def feature_detail(
         raise HTTPException(status_code=403)
 
     events = sorted(feature.events, key=lambda e: e.created_at)
+    llm_costs = _feature_llm_costs(db, feature.id)
 
     return templates.TemplateResponse(
         "feature_detail.html",
@@ -116,6 +132,7 @@ def feature_detail(
             "request": request,
             "feature": feature,
             "events": events,
+            "llm_costs": llm_costs,
             "ready_for_build": feature.status == READY_FOR_BUILD,
             "can_approve": feature.status == PREVIEW_READY,
         },

@@ -64,6 +64,12 @@ With Slack profile:
 powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack
 ```
 
+With Slack + Repo_Indexer profile:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack -WithIndexer
+```
+
 ### 4) Open the app
 
 - `http://localhost:8000`
@@ -161,68 +167,38 @@ Integrations:
 |- .env.example
 ```
 
-## Recommended location for the GitHub repo/branch indexer
+## Repo Indexer integration
 
-For your planned GitHub repository/branch indexer, the best fit is a **new top-level service folder**:
+PRFactory now supports an external Repo_Indexer deployment through HTTP, without sharing code between repos.
 
-`/indexer`
+Supported integration points:
 
-Why this is the best fit:
+- Slack command: `/prfactory-indexer <query>` for ranked repo/evidence search.
+- Slack intake repo/branch suggestions: uses Repo_Indexer catalog first, then falls back to direct GitHub API calls.
+- Graceful fallback: if indexer is unavailable, existing PRFactory behavior continues.
 
-- It has independent runtime behavior (scheduled sync/webhooks) from the build orchestrator.
-- It isolates GitHub API rate-limit pressure away from build jobs.
-- It can scale/deploy independently (or be disabled) without touching core request->build flow.
-- It keeps `orchestrator/app/services` focused on request lifecycle, not catalog ingestion.
+Environment variables:
 
-### Suggested indexer structure
+- `INDEXER_BASE_URL` (example: `http://indexer-api:8080` inside docker-compose, or `http://localhost:8080` from host tools)
+- `INDEXER_AUTH_TOKEN` (optional)
+- `INDEXER_TIMEOUT_SECONDS` (default `4`)
+- `INDEXER_TOP_K_REPOS` (default `5`)
+- `INDEXER_TOP_K_CHUNKS` (default `3`)
+- `INDEXER_TOP_K_BRANCHES_PER_REPO` (default `8`)
+- `INDEXER_REQUIRED` (optional; when true, startup/deploy fails if indexer URL is missing)
 
-```text
-indexer/
-|- app/
-|  |- __init__.py
-|  |- main.py                 # optional API (webhook + health)
-|  |- config.py               # INDEXER_* env vars
-|  |- db.py
-|  |- models.py               # repo/branch/index_run tables
-|  |- api/
-|  |  |- routes.py            # /health, /webhooks/github
-|  |- services/
-|  |  |- github_client.py
-|  |  |- repository_indexer.py
-|  |  |- branch_indexer.py
-|  |  |- sync_policy.py
-|  |- tasks/
-|  |  |- jobs.py              # enqueue + execution jobs
-|  |- worker.py               # RQ/cron-like worker entrypoint
-|- alembic/
-|- alembic.ini
-|- requirements.txt
-|- Dockerfile
+Hosted production deploy with indexer requirement:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>" -RequireIndexer
 ```
 
-### Data model suggestion
+Optional local compose extension for sibling repo checkout:
 
-Add indexer-owned tables:
+- `docker-compose.indexer.yml` (expects `../Repo_Indexer`)
+- helper script: `powershell -ExecutionPolicy Bypass -File .\scripts\run_local.ps1 -WithSlack -WithIndexer`
 
-- `github_repositories`
-- `github_branches`
-- `github_index_runs`
-
-Keep them separate from feature request tables to avoid coupling orchestration logic to index cache internals.
-
-### Integration contract with orchestrator
-
-The orchestrator should read index data as a cache/hint layer only:
-
-- repo validation during intake (`spec.repo`)
-- base branch suggestions (`spec.base_branch`)
-- optional Slack autocomplete support
-
-If indexer data is stale/unavailable, orchestrator should gracefully fall back to direct GitHub lookups or current behavior.
-
-### Docker Compose extension (planned)
-
-When you add the indexer, extend compose with an `indexer` service that shares Postgres/Redis and runs independently from `api`/`worker`.
+When using the compose extension, set `INDEXER_BASE_URL=http://indexer-api:8080` in PRFactory `.env`.
 
 ## Slack and GitHub setup docs
 

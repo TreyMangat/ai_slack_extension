@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,8 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProviderError(RuntimeError):
@@ -137,7 +140,38 @@ class LLMProvider:
             raise LLMProviderError("Gemini response was not a JSON object")
         return self._read_gemini_content(data)
 
+    def _chat_complete_openrouter(self, messages: list[dict[str, str]]) -> str:
+        """Route through OpenRouter using the sync FRONTIER tier call."""
+        from app.services.openrouter_provider import ModelTier, call_openrouter_sync
+
+        system_prompt = None
+        user_parts: list[str] = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = msg.get("content", "")
+            else:
+                content = msg.get("content", "")
+                if content:
+                    user_parts.append(content)
+
+        prompt = "\n\n".join(user_parts)
+        response = call_openrouter_sync(
+            prompt=prompt,
+            tier=ModelTier.FRONTIER,
+            system_prompt=system_prompt,
+            response_format="json_object",
+        )
+        logger.info(
+            "llm_provider_openrouter",
+            extra={"model": response.model, "cost_estimate_usd": round(response.cost_estimate, 6)},
+        )
+        return response.content
+
     def _chat_complete(self, messages: list[dict[str, str]]) -> str:
+        # If OpenRouter is configured, delegate there
+        if (self.settings.openrouter_api_key or "").strip():
+            return self._chat_complete_openrouter(messages)
+
         provider = (self.settings.llm_provider or "").strip().lower()
         if provider in {"", "openai"}:
             provider = "openai"

@@ -124,6 +124,7 @@ class FeatureRequestOut(BaseModel):
     product_approved_by: str
     product_approved_at: Optional[datetime]
 
+    llm_spec_analysis: dict[str, Any] | None = None
     last_error: str
 
     events: list[FeatureEventOut] = Field(default_factory=list)

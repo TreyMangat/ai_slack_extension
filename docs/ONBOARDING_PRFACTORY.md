@@ -41,6 +41,11 @@ ENABLE_GITHUB_USER_OAUTH=true
 GITHUB_OAUTH_CLIENT_ID=...
 GITHUB_OAUTH_CLIENT_SECRET=...
 GITHUB_USER_OAUTH_REQUIRED=true
+
+# Hosted Repo_Indexer integration (recommended)
+INDEXER_BASE_URL=https://<your-repo-indexer-url>
+INDEXER_AUTH_TOKEN=<optional-api-token>
+INDEXER_REQUIRED=true
 ```
 
 Keep these empty for multi-user portability:
@@ -59,7 +64,7 @@ GITHUB_APP_INSTALLATION_ID=
 Run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>"
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy_modal_prod.ps1 -BaseUrl "https://<your-modal-url>" -RequireIndexer
 ```
 
 This deploy path automatically:
@@ -98,6 +103,7 @@ Commands:
 - `/prfactory`
 - `/feature`
 - `/prfactory-github`
+- `/prfactory-indexer`
 
 ## 4) How to invite a coworker and use the bot
 

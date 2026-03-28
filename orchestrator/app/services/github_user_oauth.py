@@ -292,6 +292,29 @@ def resolve_github_user_access_token(*, slack_user_id: str, slack_team_id: str =
         return token
 
 
+def resolve_github_user_login(*, slack_user_id: str, slack_team_id: str = "") -> str:
+    user_id = (slack_user_id or "").strip()
+    team_id = (slack_team_id or "").strip()
+    if not user_id:
+        return ""
+
+    with db_session() as db:
+        stmt = select(GitHubUserConnection.github_login).where(GitHubUserConnection.slack_user_id == user_id)
+        if team_id:
+            stmt = stmt.where(
+                or_(
+                    GitHubUserConnection.slack_team_id == team_id,
+                    GitHubUserConnection.slack_team_id == "",
+                )
+            )
+        stmt = stmt.order_by(
+            desc(GitHubUserConnection.slack_team_id == team_id),
+            desc(GitHubUserConnection.updated_at),
+        ).limit(1)
+        value = db.execute(stmt).scalar_one_or_none()
+        return str(value or "").strip()
+
+
 def has_github_user_connection(*, slack_user_id: str, slack_team_id: str = "") -> bool:
     user_id = (slack_user_id or "").strip()
     team_id = (slack_team_id or "").strip()

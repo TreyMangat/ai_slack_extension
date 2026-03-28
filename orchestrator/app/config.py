@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 import shutil
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -107,6 +107,15 @@ class Settings(BaseSettings):
     github_user_oauth_required: bool = Field(default=True, alias="GITHUB_USER_OAUTH_REQUIRED")
     github_user_token_encryption_key: str = Field(default="", alias="GITHUB_USER_TOKEN_ENCRYPTION_KEY")
 
+    # Repo Indexer integration (external Repo_Indexer service)
+    indexer_base_url: str = Field(default="", alias="INDEXER_BASE_URL")
+    indexer_auth_token: str = Field(default="", alias="INDEXER_AUTH_TOKEN")
+    indexer_timeout_seconds: float = Field(default=4.0, alias="INDEXER_TIMEOUT_SECONDS")
+    indexer_top_k_repos: int = Field(default=5, alias="INDEXER_TOP_K_REPOS")
+    indexer_top_k_chunks: int = Field(default=3, alias="INDEXER_TOP_K_CHUNKS")
+    indexer_top_k_branches_per_repo: int = Field(default=8, alias="INDEXER_TOP_K_BRANCHES_PER_REPO")
+    indexer_required: bool = Field(default=False, alias="INDEXER_REQUIRED")
+
     # Slack intake behavior
     slack_intake_minimal: bool = Field(default=True, alias="SLACK_INTAKE_MINIMAL")
     slack_require_prompt_confirmation: bool = Field(default=True, alias="SLACK_REQUIRE_PROMPT_CONFIRMATION")
@@ -129,6 +138,14 @@ class Settings(BaseSettings):
     preview_provider: str = Field(default="cloudflare_pages", alias="PREVIEW_PROVIDER")
     cloudflare_pages_project_name: str = Field(default="", alias="CLOUDFLARE_PAGES_PROJECT_NAME")
     cloudflare_pages_production_branch: str = Field(default="main", alias="CLOUDFLARE_PAGES_PRODUCTION_BRANCH")
+
+    # OpenRouter (unified LLM provider with tiered routing)
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    openrouter_mini_model: str = Field(default="qwen/qwen3.5-9b", alias="OPENROUTER_MINI_MODEL")
+    openrouter_frontier_model: str = Field(default="anthropic/claude-opus-4-6", alias="OPENROUTER_FRONTIER_MODEL")
+    openrouter_budget_limit_usd: float = Field(default=5.0, alias="OPENROUTER_BUDGET_LIMIT_USD")
+    openrouter_referer: str = Field(default="https://github.com/your-org/PRFactory", alias="OPENROUTER_REFERER")
+    openrouter_app_title: str = Field(default="PRFactory", alias="OPENROUTER_APP_TITLE")
 
     # Native LLM runner settings (used when CODERUNNER_MODE=native_llm and MOCK_MODE=false)
     llm_provider: str = Field(default="openai", alias="LLM_PROVIDER")
@@ -209,6 +226,11 @@ class Settings(BaseSettings):
             failures.append("DISABLE_AUTOMERGE must stay true in production")
         if self.coderunner_mode_normalized() == "native_llm" and not (self.llm_api_key or "").strip():
             failures.append("LLM_API_KEY must be configured when CODERUNNER_MODE=native_llm in production")
+        if self.indexer_required and not self.repo_indexer_enabled():
+            failures.append("INDEXER_REQUIRED=true requires INDEXER_BASE_URL")
+        indexer_host = self.indexer_host()
+        if self.repo_indexer_enabled() and indexer_host in {"localhost", "127.0.0.1", "::1"}:
+            failures.append("INDEXER_BASE_URL must not point to localhost in production")
 
         if failures:
             joined = "; ".join(failures)
@@ -239,6 +261,8 @@ class Settings(BaseSettings):
                 failures.append("GitHub user OAuth requires GITHUB_OAUTH_CLIENT_ID")
             if not (self.github_oauth_client_secret or "").strip():
                 failures.append("GitHub user OAuth requires GITHUB_OAUTH_CLIENT_SECRET")
+        if self.indexer_required and not self.repo_indexer_enabled():
+            failures.append("INDEXER_REQUIRED=true requires INDEXER_BASE_URL")
         if self.enable_slack_bot and self.slack_mode_normalized() == "http":
             if not (self.slack_signing_secret or "").strip():
                 failures.append("ENABLE_SLACK_BOT=true and SLACK_MODE=http require SLACK_SIGNING_SECRET")
@@ -309,6 +333,10 @@ class Settings(BaseSettings):
             "github_user_oauth_enabled": bool(self.github_user_oauth_enabled()),
             "github_user_oauth_required": bool(self.github_user_oauth_required_effective()),
             "github_oauth_install_url": self.github_oauth_install_url_resolved(),
+            "repo_indexer_enabled": bool(self.repo_indexer_enabled()),
+            "repo_indexer_required": bool(self.indexer_required),
+            "repo_indexer_base_url": self.indexer_base_url_normalized(),
+            "repo_indexer_host": self.indexer_host(),
             "workspace_enable_git_clone": bool(self.workspace_enable_git_clone),
             "integration_webhook_configured": bool((self.integration_webhook_secret or "").strip()),
             "openclaw_auth_dir": str(auth_dir),
@@ -475,6 +503,22 @@ class Settings(BaseSettings):
         if not params:
             return base
         return f"{base}?{urlencode(params)}"
+
+    def indexer_base_url_normalized(self) -> str:
+        return (self.indexer_base_url or "").strip().rstrip("/")
+
+    def indexer_host(self) -> str:
+        base = self.indexer_base_url_normalized()
+        if not base:
+            return ""
+        try:
+            parsed = urlsplit(base)
+            return (parsed.hostname or "").strip().lower()
+        except Exception:
+            return ""
+
+    def repo_indexer_enabled(self) -> bool:
+        return bool(self.indexer_base_url_normalized())
 
 
 @lru_cache

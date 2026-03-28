@@ -209,6 +209,16 @@
         {% endfor %}
       </ul>
 
+      {% if llm_costs %}
+      <div class="card">
+        <h3>LLM Usage</h3>
+        <p>Total cost: ${{ "%.4f"|format(llm_costs.total_usd) }}</p>
+        <p>API calls: {{ llm_costs.calls }}</p>
+        <p>Mini tier: ${{ "%.4f"|format(llm_costs.by_tier.mini) }}</p>
+        <p>Frontier tier: ${{ "%.4f"|format(llm_costs.by_tier.frontier) }}</p>
+      </div>
+      {% endif %}
+
       <h3>Raw spec JSON</h3>
       <pre class="pre">{{ feature.spec | tojson(indent=2) }}</pre>
     </div>

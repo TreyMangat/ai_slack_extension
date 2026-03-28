@@ -1,0 +1,77 @@
+﻿services:
+  indexer-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: repo_recall
+      POSTGRES_USER: repo_recall
+      POSTGRES_PASSWORD: repo_recall
+    volumes:
+      - repo_recall_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U repo_recall -d repo_recall"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  indexer-api:
+    build:
+      context: ../Repo_Indexer
+    depends_on:
+      indexer-db:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${INDEXER_APP_ENV:-local}
+      MOCK_MODE: ${INDEXER_MOCK_MODE:-true}
+      AUTH_MODE: ${INDEXER_AUTH_MODE:-disabled}
+      API_TOKEN: ${INDEXER_AUTH_TOKEN:-}
+      DATABASE_URL: postgresql://repo_recall:repo_recall@indexer-db:5432/repo_recall
+      DIRECT_DATABASE_URL: postgresql://repo_recall:repo_recall@indexer-db:5432/repo_recall
+      INIT_DB_ON_STARTUP: ${INDEXER_INIT_DB_ON_STARTUP:-true}
+      ENABLE_UI: ${INDEXER_ENABLE_UI:-true}
+      ENABLE_CATALOG: ${INDEXER_ENABLE_CATALOG:-true}
+      CATALOG_TOKEN_ENCRYPTION_KEY: ${INDEXER_CATALOG_TOKEN_ENCRYPTION_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      INDEXER_GITHUB_TOKEN: ${INDEXER_GITHUB_TOKEN:-}
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GITHUB_OAUTH_REDIRECT_URL: ${GITHUB_OAUTH_REDIRECT_URL:-http://127.0.0.1:8080/connect/github/callback}
+      GITHUB_OAUTH_STATE_SECRET: ${GITHUB_OAUTH_STATE_SECRET:-}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - ../Repo_Indexer/.cache:/app/.cache
+
+  indexer-worker:
+    build:
+      context: ../Repo_Indexer
+    depends_on:
+      indexer-db:
+        condition: service_healthy
+      indexer-api:
+        condition: service_started
+    command: ["repo-recall", "worker", "--poll-interval-seconds", "2"]
+    environment:
+      APP_ENV: ${INDEXER_APP_ENV:-local}
+      MOCK_MODE: ${INDEXER_MOCK_MODE:-true}
+      AUTH_MODE: ${INDEXER_AUTH_MODE:-disabled}
+      API_TOKEN: ${INDEXER_AUTH_TOKEN:-}
+      DATABASE_URL: postgresql://repo_recall:repo_recall@indexer-db:5432/repo_recall
+      DIRECT_DATABASE_URL: postgresql://repo_recall:repo_recall@indexer-db:5432/repo_recall
+      ENABLE_CATALOG: ${INDEXER_ENABLE_CATALOG:-true}
+      CATALOG_TOKEN_ENCRYPTION_KEY: ${INDEXER_CATALOG_TOKEN_ENCRYPTION_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      INDEXER_GITHUB_TOKEN: ${INDEXER_GITHUB_TOKEN:-}
+      GITHUB_API_BASE_URL: ${GITHUB_API_BASE_URL:-https://api.github.com}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+
+volumes:
+  repo_recall_pgdata:

@@ -9,7 +9,7 @@ from app.schemas import FeatureRequestCreate, FeatureSpecUpdateRequest
 from app.services.event_logger import log_event
 from app.services.prompt_optimizer import attach_optimized_prompt
 from app.services.reviewer_service import ensure_approver_allowed
-from app.services.spec_validator import spec_completion_report, validate_spec
+from app.services.spec_validator import spec_completion_report, validate_spec_with_llm_sync
 from app.services.url_safety import normalize_external_url_list
 from app.state_machine import (
     BUILDING,
@@ -55,6 +55,41 @@ def _status_after_validation(current_status: str, *, is_valid: bool) -> str:
     return current_status
 
 
+def _apply_llm_validation_artifacts(
+    db: Session,
+    feature: FeatureRequest,
+    *,
+    llm_analysis: dict[str, object] | None,
+) -> None:
+    feature.llm_spec_analysis = llm_analysis if isinstance(llm_analysis, dict) else None
+    if not isinstance(llm_analysis, dict):
+        return
+
+    usage = llm_analysis.get("usage") if isinstance(llm_analysis.get("usage"), dict) else {}
+    cost_usd = float(llm_analysis.get("cost_estimate_usd") or 0.0)
+    model = str(llm_analysis.get("model") or "").strip()
+    tier = str(llm_analysis.get("tier") or "").strip().lower()
+
+    if not model and cost_usd <= 0.0:
+        return
+
+    log_event(
+        db,
+        feature,
+        event_type="llm_cost",
+        actor_type="system",
+        message=f"LLM call (spec_validation): {model or 'unknown model'} [{tier or 'unknown'}] ${cost_usd:.6f}",
+        data={
+            "tier": tier,
+            "model": model,
+            "tokens_in": int(usage.get("input_tokens") or 0),
+            "tokens_out": int(usage.get("output_tokens") or 0),
+            "cost_usd": round(cost_usd, 6),
+            "operation": "spec_validation",
+        },
+    )
+
+
 def create_feature_request(db: Session, payload: FeatureRequestCreate) -> FeatureRequest:
     spec_data = payload.spec.model_dump()
     spec_data["links"] = normalize_external_url_list(spec_data.get("links") or [])
@@ -88,8 +123,9 @@ def create_feature_request(db: Session, payload: FeatureRequestCreate) -> Featur
     )
 
     # Validate spec immediately and update state
-    is_valid, missing, warnings = validate_spec(feature.spec)
+    is_valid, missing, warnings, llm_analysis = validate_spec_with_llm_sync(feature.spec, feature_id=feature.id)
     _set_validation_metadata(feature, is_valid=is_valid, missing=missing, warnings=warnings)
+    _apply_llm_validation_artifacts(db, feature, llm_analysis=llm_analysis)
 
     new_status = _status_after_validation(feature.status, is_valid=is_valid)
     if new_status != feature.status:
@@ -111,8 +147,9 @@ def create_feature_request(db: Session, payload: FeatureRequestCreate) -> Featur
 
 
 def refresh_spec_validation(db: Session, feature: FeatureRequest) -> FeatureRequest:
-    is_valid, missing, warnings = validate_spec(feature.spec)
+    is_valid, missing, warnings, llm_analysis = validate_spec_with_llm_sync(feature.spec, feature_id=feature.id)
     _set_validation_metadata(feature, is_valid=is_valid, missing=missing, warnings=warnings)
+    _apply_llm_validation_artifacts(db, feature, llm_analysis=llm_analysis)
 
     # Move state based on validation only when a meaningful transition is allowed.
     new_status = _status_after_validation(feature.status, is_valid=is_valid)

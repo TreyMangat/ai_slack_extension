@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSON, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -47,6 +47,9 @@ class FeatureRequest(Base):
     # Approvals
     product_approved_by: Mapped[str] = mapped_column(String(128), default="")
     product_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # LLM-enhanced spec analysis (frontier model output, nullable)
+    llm_spec_analysis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Error handling
     last_error: Mapped[str] = mapped_column(Text, default="")

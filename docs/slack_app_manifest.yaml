@@ -22,6 +22,11 @@ features:
       usage_hint: Connect GitHub
       should_escape: false
       url: https://example.com/api/slack/events
+    - command: /prfactory-indexer
+      description: Search indexed repositories
+      usage_hint: webhook retries
+      should_escape: false
+      url: https://example.com/api/slack/events
 oauth_config:
   redirect_urls:
     - https://example.com/api/slack/oauth/callback

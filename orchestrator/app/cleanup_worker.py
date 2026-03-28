@@ -17,6 +17,8 @@ from app.state_machine import PR_OPENED
 
 
 console = Console()
+CALLBACK_STALE_ALERTED_EVENT = "callback_stale_alerted"
+CALLBACK_STALE_ALERTS_DISABLED_EVENT = "callback_stale_alerts_disabled"
 
 
 def _retention_hours_for_feature(feature: FeatureRequest | None) -> int:
@@ -52,11 +54,9 @@ def run_cleanup_once() -> None:
 def run_stale_callback_alerts_once() -> None:
     settings = get_settings()
     stale_minutes = max(settings.callback_stale_alert_minutes, 1)
-    cooldown_minutes = max(settings.callback_stale_alert_cooldown_minutes, 1)
     max_rows = max(settings.callback_stale_check_max_per_run, 1)
     now = datetime.now(timezone.utc)
     stale_cutoff = now - timedelta(minutes=stale_minutes)
-    cooldown_cutoff = now - timedelta(minutes=cooldown_minutes)
     slack = get_slack_adapter()
     alerted = 0
 
@@ -74,17 +74,25 @@ def run_stale_callback_alerts_once() -> None:
         )
 
         for feature in candidates:
-            recent_count = (
+            alerted_count = (
                 db.execute(
                     select(func.count())
                     .select_from(FeatureEvent)
                     .where(FeatureEvent.feature_id == feature.id)
-                    .where(FeatureEvent.event_type == "callback_stale_alerted")
-                    .where(FeatureEvent.created_at >= cooldown_cutoff)
+                    .where(FeatureEvent.event_type == CALLBACK_STALE_ALERTED_EVENT)
                 )
                 .scalar_one()
             )
-            if int(recent_count or 0) > 0:
+            disabled_count = (
+                db.execute(
+                    select(func.count())
+                    .select_from(FeatureEvent)
+                    .where(FeatureEvent.feature_id == feature.id)
+                    .where(FeatureEvent.event_type == CALLBACK_STALE_ALERTS_DISABLED_EVENT)
+                )
+                .scalar_one()
+            )
+            if int(alerted_count or 0) > 0 or int(disabled_count or 0) > 0:
                 continue
 
             message = (
@@ -93,7 +101,7 @@ def run_stale_callback_alerts_once() -> None:
             log_event(
                 db,
                 feature,
-                event_type="callback_stale_alerted",
+                event_type=CALLBACK_STALE_ALERTED_EVENT,
                 actor_type="system",
                 actor_id="cleanup-worker",
                 message=message,
@@ -111,7 +119,8 @@ def run_stale_callback_alerts_once() -> None:
                         thread_ts=feature.slack_thread_ts,
                         text=(
                             f"Build status is still `{feature.status}` for *{feature.title}*.\n"
-                            f"No preview callback received in {stale_minutes}+ minutes."
+                            f"No preview callback received in {stale_minutes}+ minutes.\n"
+                            "Reply `STOP` in this thread to mute stale callback reminders."
                         ),
                         team_id=feature.slack_team_id,
                     )

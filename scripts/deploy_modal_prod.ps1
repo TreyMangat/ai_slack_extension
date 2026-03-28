@@ -7,6 +7,8 @@
 #   -EnvFile .env
 #   -ModalSecretName feature-factory-env
 #   -ModalAppPath .\modal_app.py
+#   -IndexerBaseUrl https://<repo-indexer-url>
+#   -RequireIndexer
 #   -SkipSecretSync
 #   -SkipDeploy
 #   -SkipSlackManifestSync
@@ -16,6 +18,8 @@ param(
   [string]$ModalSecretName = "feature-factory-env",
   [string]$ModalAppPath = ".\modal_app.py",
   [string]$BaseUrl = "",
+  [string]$IndexerBaseUrl = "",
+  [switch]$RequireIndexer,
   [switch]$SkipSecretSync,
   [switch]$SkipDeploy,
   [switch]$SkipSlackManifestSync
@@ -520,6 +524,34 @@ if ($resolvedBaseUrl -match "localhost|127\.0\.0\.1") {
 }
 $config["ORCHESTRATOR_INTERNAL_URL"] = $resolvedBaseUrl
 
+if (-not [string]::IsNullOrWhiteSpace($IndexerBaseUrl)) {
+  $config["INDEXER_BASE_URL"] = $IndexerBaseUrl.Trim()
+}
+$indexerRequired = $RequireIndexer -or (Is-Truthy (Get-MapValue -Map $config -Key "INDEXER_REQUIRED" -Default "false"))
+if ($indexerRequired) {
+  $config["INDEXER_REQUIRED"] = "true"
+}
+$resolvedIndexerBaseUrl = (Get-MapValue -Map $config -Key "INDEXER_BASE_URL").Trim().TrimEnd("/")
+if ($indexerRequired -and [string]::IsNullOrWhiteSpace($resolvedIndexerBaseUrl)) {
+  throw "INDEXER_REQUIRED=true but INDEXER_BASE_URL is missing. Set INDEXER_BASE_URL or pass -IndexerBaseUrl."
+}
+if (-not [string]::IsNullOrWhiteSpace($resolvedIndexerBaseUrl)) {
+  try {
+    $indexerUri = [Uri]$resolvedIndexerBaseUrl
+  }
+  catch {
+    throw "INDEXER_BASE_URL is not a valid absolute URL: $resolvedIndexerBaseUrl"
+  }
+  if (-not $indexerUri.IsAbsoluteUri) {
+    throw "INDEXER_BASE_URL must be an absolute URL: $resolvedIndexerBaseUrl"
+  }
+  $indexerHost = ($indexerUri.Host | ForEach-Object { $_.ToLowerInvariant() })
+  if ($indexerHost -in @("localhost", "127.0.0.1", "::1")) {
+    throw "INDEXER_BASE_URL cannot be localhost for production deployment: $resolvedIndexerBaseUrl"
+  }
+  $config["INDEXER_BASE_URL"] = $resolvedIndexerBaseUrl
+}
+
 $databaseUrl = Get-MapValue -Map $config -Key "DATABASE_URL"
 $redisUrl = Get-MapValue -Map $config -Key "REDIS_URL"
 if ($databaseUrl -match "@(db|localhost|127\.0\.0\.1)(:|/)") {
@@ -623,6 +655,16 @@ $coderunnerMode = $coderunnerMode.Trim().ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($coderunnerMode)) {
   $coderunnerMode = "opencode"
   $config["CODERUNNER_MODE"] = $coderunnerMode
+}
+
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "OPENROUTER_MINI_MODEL"))) {
+  $config["OPENROUTER_MINI_MODEL"] = "qwen/qwen3.5-9b"
+}
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "OPENROUTER_FRONTIER_MODEL"))) {
+  $config["OPENROUTER_FRONTIER_MODEL"] = "anthropic/claude-opus-4-6"
+}
+if ([string]::IsNullOrWhiteSpace((Get-MapValue -Map $config -Key "OPENROUTER_API_KEY"))) {
+  Write-Warning "OPENROUTER_API_KEY not set - LLM routing will use fallback rule-based logic"
 }
 
 $deployOpenClawAuth = $false
@@ -835,6 +877,28 @@ try {
     Invoke-WithRetry -Name "health" -Action { Invoke-RestMethod -Method Get -Uri ($resolvedBaseUrl.TrimEnd("/") + "/health") -TimeoutSec 45 }
     Invoke-WithRetry -Name "health/ready" -Action { Invoke-RestMethod -Method Get -Uri ($resolvedBaseUrl.TrimEnd("/") + "/health/ready") -TimeoutSec 45 }
     Invoke-WithRetry -Name "health/runtime" -Action { Invoke-RestMethod -Method Get -Uri ($resolvedBaseUrl.TrimEnd("/") + "/health/runtime") -TimeoutSec 45 }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedIndexerBaseUrl)) {
+      Invoke-WithRetry -Name "indexer/health" -Action {
+        Invoke-RestMethod -Method Get -Uri ($resolvedIndexerBaseUrl.TrimEnd("/") + "/health") -TimeoutSec 45
+      }
+      Invoke-WithRetry -Name "indexer/search" -Action {
+        $headers = @{ "Content-Type" = "application/json" }
+        $indexerAuthToken = (Get-MapValue -Map $config -Key "INDEXER_AUTH_TOKEN").Trim()
+        if (-not [string]::IsNullOrWhiteSpace($indexerAuthToken)) {
+          $headers["Authorization"] = "Bearer $indexerAuthToken"
+          $headers["X-FF-Token"] = $indexerAuthToken
+        }
+        $body = @{
+          query = "production indexer health probe"
+          top_k_repos = 1
+          top_k_chunks = 1
+        } | ConvertTo-Json -Depth 4 -Compress
+        $response = Invoke-RestMethod -Method Post -Uri ($resolvedIndexerBaseUrl.TrimEnd("/") + "/api/indexer/search") -Headers $headers -Body $body -TimeoutSec 45
+        if ($null -eq $response) {
+          throw "Indexer search probe returned empty response."
+        }
+      }
+    }
     if ($slackEnabled -and $slackMode -eq "http") {
       Invoke-WithRetry -Name "slack/events route" -Action {
         $probeUrl = $resolvedBaseUrl.TrimEnd("/") + "/api/slack/events"

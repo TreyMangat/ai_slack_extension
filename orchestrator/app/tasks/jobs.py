@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import datetime
+import logging
 import re
 from typing import Any
 
@@ -13,6 +14,7 @@ from app.config import get_settings
 from app.db import db_session
 from app.models import FeatureRequest, FeatureRun
 from app.observability import metrics
+from app.slackbot import _thread_blocks_with_cost_summary
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
@@ -28,6 +30,13 @@ from app.state_machine import BUILDING, perform_action, validate_transition
 
 
 console = Console()
+logger = logging.getLogger(__name__)
+
+
+def _extract_pr_number(pr_url: str) -> int | None:
+    """Extract the pull request number from a GitHub PR URL."""
+    match = re.search(r"/pull/(\d+)", pr_url or "")
+    return int(match.group(1)) if match else None
 
 
 def _truncate_for_event(value: Any, *, max_chars: int = 4000) -> str:
@@ -432,6 +441,44 @@ async def kickoff_build(feature_id: str) -> None:
                 data={"pr_url": safe_pr_url},
             )
 
+            # Try to enhance PR body with frontier LLM
+            pr_body_source = "template"
+            try:
+                from app.services.pr_description import build_pr_body_with_llm
+
+                runner_name_for_pr = str(runner_metadata.get("execution_mode", "")).strip() if runner_metadata else ""
+                runner_model_for_pr = str(runner_metadata.get("model", "")).strip() if runner_metadata else ""
+                llm_body = await build_pr_body_with_llm(
+                    spec=spec,
+                    feature_id=feature.id,
+                    issue_number=None,
+                    branch_name=str(spec.get("branch") or spec.get("base_branch") or ""),
+                    runner_name=runner_name_for_pr or settings.coderunner_mode_normalized(),
+                    runner_model=runner_model_for_pr,
+                    summary="",
+                    verification_output="",
+                    verification_command=str(spec.get("test_command") or ""),
+                    verification_warning="",
+                    preview_url=result.preview_url or "",
+                    cloudflare_project_name=settings.cloudflare_pages_project_name,
+                    cloudflare_production_branch=settings.cloudflare_pages_production_branch,
+                )
+                if llm_body and safe_pr_url:
+                    pr_number = _extract_pr_number(safe_pr_url)
+                    if pr_number:
+                        await github.update_pull_request_body(pr_number, llm_body)
+                        pr_body_source = "llm"
+            except Exception as exc:  # noqa: BLE001
+                logger.info("LLM PR body enhancement skipped (non-fatal): %s", exc)
+
+            log_event(
+                db,
+                feature,
+                event_type="pr_body_generated",
+                message=f"PR body source: {pr_body_source}",
+                data={"source": pr_body_source},
+            )
+
             if feature.slack_channel_id and feature.slack_thread_ts:
                 runner_line = ""
                 if runner_metadata:
@@ -449,6 +496,15 @@ async def kickoff_build(feature_id: str) -> None:
                         f"Repo: {target_repo or '(none)'}\n"
                         f"PR: {feature.github_pr_url or '(pending)'}"
                         f"{runner_line}"
+                    ),
+                    blocks=_thread_blocks_with_cost_summary(
+                        (
+                            f"PR step complete for *{feature.title}*\n"
+                            f"Repo: {target_repo or '(none)'}\n"
+                            f"PR: {feature.github_pr_url or '(pending)'}"
+                            f"{runner_line}"
+                        ),
+                        list(feature.events or []),
                     ),
                     team_id=feature.slack_team_id,
                 )
@@ -474,6 +530,10 @@ async def kickoff_build(feature_id: str) -> None:
                         channel=feature.slack_channel_id,
                         thread_ts=feature.slack_thread_ts,
                         text=f"Preview ready: {safe_preview_url}",
+                        blocks=_thread_blocks_with_cost_summary(
+                            f"Preview ready: {safe_preview_url}",
+                            list(feature.events or []),
+                        ),
                         team_id=feature.slack_team_id,
                     )
 

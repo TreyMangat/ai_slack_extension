@@ -16,6 +16,7 @@ Everything that touches an external system is behind an adapter interface:
 - SlackAdapter
 - GitHubAdapter
 - CodeRunnerAdapter
+- RepoIndexerAdapter (HTTP; optional)
 
 This lets you:
 - run locally in MOCK_MODE

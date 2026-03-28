@@ -48,6 +48,7 @@ from app.services.pr_description import build_standard_pr_body
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
+from app.slackbot import _thread_blocks_with_cost_summary
 from app.state_machine import (
     FAILED_BUILD,
     FAILED_SPEC,
@@ -85,6 +86,7 @@ def _feature_to_out(feature: FeatureRequest, *, include_events: bool = True) -> 
         active_build_job_id=feature.active_build_job_id,
         product_approved_by=feature.product_approved_by,
         product_approved_at=feature.product_approved_at,
+        llm_spec_analysis=feature.llm_spec_analysis,
         last_error=feature.last_error,
         events=[] if not include_events else [
             {
@@ -786,10 +788,16 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
 
     slack = get_slack_adapter()
     if feature.slack_channel_id and feature.slack_thread_ts:
+        callback_text = _callback_status_text(feature, payload)
         slack.post_thread_message(
             channel=feature.slack_channel_id,
             thread_ts=feature.slack_thread_ts,
-            text=_callback_status_text(feature, payload),
+            text=callback_text,
+            blocks=(
+                _thread_blocks_with_cost_summary(callback_text, list(feature.events or []))
+                if payload.event in {"pr_opened", "preview_ready"}
+                else None
+            ),
             team_id=feature.slack_team_id,
         )
 
