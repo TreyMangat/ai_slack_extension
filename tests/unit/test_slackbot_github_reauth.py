@@ -292,6 +292,7 @@ def test_connected_status_shown_at_intake_start(monkeypatch) -> None:
     settings = _settings()
     client = DummyClient()
 
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", False)
     monkeypatch.setattr(slackbot_mod, "_store_session", lambda session_obj: None)
     monkeypatch.setattr(
         slackbot_mod,
@@ -318,6 +319,7 @@ def test_expired_status_shown_at_intake_start(monkeypatch) -> None:
     settings = _settings()
     client = DummyClient()
 
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", False)
     monkeypatch.setattr(slackbot_mod, "_store_session", lambda session_obj: None)
     monkeypatch.setattr(
         slackbot_mod,

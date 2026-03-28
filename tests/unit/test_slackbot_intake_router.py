@@ -11,6 +11,7 @@ from app.slackbot import (
     _handle_frontier_escalation,
     _post_thread_message_with_optional_model_context,
     _process_session_message,
+    _start_create_intake,
     _thread_blocks_with_cost_summary,
 )
 
@@ -647,3 +648,275 @@ def test_special_fields_not_stored_as_feature_data(monkeypatch) -> None:
     assert "github_reauth" not in session.answers
     assert "github_connect" not in session.answers
     assert session.answers["_waiting_for_github"] is True
+
+
+# ---------------------------------------------------------------------------
+# Model-aware /prfactory startup
+# ---------------------------------------------------------------------------
+
+
+def test_prfactory_with_seed_prompt_uses_model(monkeypatch) -> None:
+    """When model is available and user typed '/prfactory I want dark mode',
+    classify_intake_message is called with the seed prompt."""
+    settings = _settings(openrouter_api_key="sk-test")
+    client = DummyClient()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda session_obj: None)
+
+    def fake_classify(*, message, conversation_history, current_fields, slack_user_id=""):
+        captured["message"] = message
+        captured["slack_user_id"] = slack_user_id
+        return _action(
+            action="ask_field",
+            field_name="title",
+            field_value="Add dark mode",
+            next_question="Which repo should this go in?",
+            model="qwen/qwen3.5-9b",
+        )
+
+    monkeypatch.setattr(slackbot_mod, "_classify_intake_message_sync", fake_classify)
+
+    _start_create_intake(
+        client,
+        settings,
+        team_id="T123",
+        channel_id="C123",
+        user_id="U123",
+        seed_prompt="I want to add dark mode to the settings page",
+    )
+
+    # Model was called with the seed prompt
+    assert captured["message"] == "I want to add dark mode to the settings page"
+    assert captured["slack_user_id"] == "U123"
+    # Hardcoded title question ("How can I help you?") should NOT appear
+    hardcoded_title_q = "How can I help you?"
+    posted_texts = [str(p.get("text", "")) for p in client.posted]
+    assert hardcoded_title_q not in posted_texts
+
+
+def test_prfactory_without_seed_prompt_uses_model_greeting(monkeypatch) -> None:
+    """When model is available and user typed just '/prfactory',
+    an open-ended greeting is posted and _flow is set to 'model'."""
+    settings = _settings(openrouter_api_key="sk-test")
+    client = DummyClient()
+    stored_sessions: list[IntakeSession] = []
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: stored_sessions.append(s))
+
+    _start_create_intake(
+        client,
+        settings,
+        team_id="T123",
+        channel_id="C123",
+        user_id="U123",
+        seed_prompt="",
+    )
+
+    # Check the open-ended model greeting is posted (not the hardcoded title question)
+    assert any("What would you like to build?" in str(p.get("text", "")) for p in client.posted)
+    hardcoded_title_q = "How can I help you?"
+    assert hardcoded_title_q not in [str(p.get("text", "")) for p in client.posted]
+    # Session flow marker is "model"
+    assert any(s.answers.get("_flow") == "model" for s in stored_sessions)
+
+
+def test_prfactory_falls_back_on_model_error(monkeypatch, caplog) -> None:
+    """When model classify raises, fall back to hardcoded flow."""
+    settings = _settings(openrouter_api_key="sk-test")
+    client = DummyClient()
+    stored_sessions: list[IntakeSession] = []
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: stored_sessions.append(s))
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_classify_intake_message_sync",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("model exploded")),
+    )
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_github_connection_context_block",
+        lambda **kwargs: None,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        _start_create_intake(
+            client,
+            settings,
+            team_id="T123",
+            channel_id="C123",
+            user_id="U123",
+            seed_prompt="I want dark mode",
+        )
+
+    # Fell back to hardcoded — title question posted
+    assert any("How can I help you?" in str(p.get("text", "")) or
+               "What should this request be titled?" in str(p.get("text", ""))
+               for p in client.posted)
+    # Error logged
+    assert "slack_model_intake_startup_failed" in caplog.text
+    # Session flow switched to hardcoded
+    assert any(s.answers.get("_flow") == "hardcoded" for s in stored_sessions)
+
+
+def test_model_failure_shows_transition_message(monkeypatch, caplog) -> None:
+    """In _process_session_message, model failure posts a transition message."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["title"])
+    session.answers["_flow"] = "model"
+    client = DummyClient()
+    fallback_calls: list[object] = []
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_classify_intake_message_sync",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("model crash")),
+    )
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_handle_hardcoded_intake_message",
+        lambda *args, **kwargs: fallback_calls.append(True),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        _process_session_message(
+            client,
+            _logger(),
+            settings,
+            session,
+            event={"text": "dark mode"},
+            user_id="U123",
+            team_id="T123",
+            channel_id="C123",
+            thread_ts="1.0",
+            text="dark mode",
+            subtype=None,
+        )
+
+    # Transition message posted
+    assert any("trouble processing" in str(p.get("text", "")).lower() for p in client.posted)
+    # Hardcoded fallback ran
+    assert fallback_calls == [True]
+    # Error logged
+    assert "slack_model_intake_failed" in caplog.text
+
+
+def test_seed_prompt_passed_to_model(monkeypatch) -> None:
+    """The seed prompt is included as 'original_request' in current_fields."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["title"])
+    session.answers["_flow"] = "model"
+    session.answers["_seed_prompt"] = "I want dark mode on the settings page"
+    client = DummyClient(
+        thread_messages=[{"text": "I want dark mode on the settings page", "user": "U123"}]
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+
+    def fake_classify(*, message, conversation_history, current_fields, slack_user_id=""):
+        captured["current_fields"] = current_fields
+        return _action(
+            action="ask_field",
+            field_name="title",
+            field_value="Add dark mode",
+            next_question="Which repo?",
+        )
+
+    monkeypatch.setattr(slackbot_mod, "_classify_intake_message_sync", fake_classify)
+
+    _process_session_message(
+        client,
+        _logger(),
+        settings,
+        session,
+        event={"text": "yes that's right"},
+        user_id="U123",
+        team_id="T123",
+        channel_id="C123",
+        thread_ts="1.0",
+        text="yes that's right",
+        subtype=None,
+    )
+
+    assert captured["current_fields"]["original_request"] == "I want dark mode on the settings page"
+
+
+def test_flow_marker_prevents_flip_flop(monkeypatch) -> None:
+    """_flow='model' forces model path; _flow='hardcoded' forces hardcoded."""
+    settings = _settings(openrouter_api_key="sk-test")
+    client = DummyClient()
+
+    # --- Model flow: classify IS called ---
+    session_model = _session(queue=["title"])
+    session_model.answers["_flow"] = "model"
+    classify_called: list[bool] = []
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+
+    def fake_classify(**kwargs):
+        classify_called.append(True)
+        return _action(action="clarify", next_question="Need more detail.")
+
+    monkeypatch.setattr(slackbot_mod, "_classify_intake_message_sync", fake_classify)
+
+    _process_session_message(
+        client, _logger(), settings, session_model,
+        event={"text": "test"}, user_id="U123", team_id="T123",
+        channel_id="C123", thread_ts="1.0", text="test", subtype=None,
+    )
+    assert classify_called == [True]
+
+    # --- Hardcoded flow: classify is NOT called ---
+    session_hardcoded = _session(queue=["title"])
+    session_hardcoded.answers["_flow"] = "hardcoded"
+    classify_called.clear()
+    fallback_calls: list[bool] = []
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_handle_hardcoded_intake_message",
+        lambda *args, **kwargs: fallback_calls.append(True),
+    )
+
+    _process_session_message(
+        client, _logger(), settings, session_hardcoded,
+        event={"text": "test"}, user_id="U123", team_id="T123",
+        channel_id="C123", thread_ts="1.0", text="test", subtype=None,
+    )
+    assert classify_called == []  # Model was NOT called
+    assert fallback_calls == [True]
+
+
+def test_prfactory_hardcoded_when_no_model(monkeypatch) -> None:
+    """When model is not available, /prfactory uses the hardcoded flow."""
+    settings = _settings(openrouter_api_key="")
+    client = DummyClient()
+    stored_sessions: list[IntakeSession] = []
+
+    monkeypatch.setattr(slackbot_mod, "HAS_INTAKE_ROUTER", True)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: stored_sessions.append(s))
+    monkeypatch.setattr(
+        slackbot_mod,
+        "_github_connection_context_block",
+        lambda **kwargs: None,
+    )
+
+    _start_create_intake(
+        client,
+        settings,
+        team_id="T123",
+        channel_id="C123",
+        user_id="U123",
+        seed_prompt="",
+    )
+
+    # Hardcoded title question posted
+    assert any("How can I help you?" in str(p.get("text", "")) for p in client.posted)
+    # Flow is hardcoded
+    assert any(s.answers.get("_flow") == "hardcoded" for s in stored_sessions)

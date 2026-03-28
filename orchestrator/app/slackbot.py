@@ -3401,7 +3401,18 @@ def _process_session_message(
             )
             return
 
-    if HAS_INTAKE_ROUTER and _openrouter_enabled(settings):
+    # ---- Determine flow: model vs hardcoded ----
+    session_flow = str(session.answers.get("_flow") or "").strip()
+    _try_model = False
+    if session_flow == "model":
+        _try_model = True
+    elif session_flow == "hardcoded":
+        _try_model = False
+    else:
+        # Legacy session (no _flow marker) — try model if available
+        _try_model = HAS_INTAKE_ROUTER and _openrouter_enabled(settings)
+
+    if _try_model:
         logger.info(
             "slack_intake_path=model_assisted team=%s channel=%s thread=%s user=%s",
             team_id,
@@ -3413,11 +3424,21 @@ def _process_session_message(
         conversation_history = _build_thread_history(thread_messages)
         if not conversation_history:
             conversation_history = _build_thread_history([event])
+
+        # Build current fields — include seed prompt as context for the model
+        current_fields = {
+            k: v for k, v in dict(session.answers or {}).items()
+            if not str(k).startswith("_") and v is not None
+        }
+        seed = str(session.answers.get("_seed_prompt") or "").strip()
+        if seed:
+            current_fields["original_request"] = seed
+
         try:
             action = _classify_intake_message_sync(
                 message=text,
                 conversation_history=conversation_history,
-                current_fields={k: v for k, v in dict(session.answers or {}).items() if not str(k).startswith("_")},
+                current_fields=current_fields,
                 slack_user_id=user_id,
             )
             if _handle_model_intake_action(client, settings, session, event=event, action=action):
@@ -3439,6 +3460,15 @@ def _process_session_message(
                 user_id,
                 exc_info=True,
             )
+            # Post a visible transition so the UX switch isn't jarring
+            try:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text="I had trouble processing that. Let me ask you directly instead.",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     logger.info(
         "slack_intake_path=hardcoded team=%s channel=%s thread=%s user=%s",
@@ -3472,6 +3502,8 @@ def _start_create_intake(
         answers["_seed_prompt"] = normalized_seed_prompt[:2000]
 
     require_repo = _repo_required_for_slack_intake(settings)
+    use_model = HAS_INTAKE_ROUTER and _openrouter_enabled(settings)
+
     session = IntakeSession(
         mode="create",
         feature_id="",
@@ -3480,7 +3512,6 @@ def _start_create_intake(
         channel_id=channel_id,
         thread_ts=thread_ts,
         message_ts=thread_ts,
-        # Minimal intake is default: title + mode + repo (+ optional branch in developer mode).
         queue=_build_create_queue(
             has_title=False,
             require_repo=require_repo,
@@ -3489,11 +3520,91 @@ def _start_create_intake(
         answers=answers,
     )
 
-    _store_session(session)
+    # ---- Model-assisted startup ----
+    if use_model:
+        session.answers["_flow"] = "model"
+        _store_session(session)
 
+        if normalized_seed_prompt:
+            # User typed "/prfactory I want to add dark mode..." — run the
+            # model immediately with the seed prompt as the first message.
+            try:
+                action = _classify_intake_message_sync(
+                    message=normalized_seed_prompt,
+                    conversation_history=[],
+                    current_fields={},
+                    slack_user_id=user_id,
+                )
+                if _handle_model_intake_action(
+                    client,
+                    settings,
+                    session,
+                    event={"text": normalized_seed_prompt, "user": user_id, "team": team_id},
+                    action=action,
+                ):
+                    return
+                # Model returned an unrecognized action — fall through to
+                # open-ended greeting below.
+            except Exception:
+                module_logger.error(
+                    "slack_model_intake_startup_failed team=%s channel=%s thread=%s user=%s",
+                    team_id, channel_id, thread_ts, user_id,
+                    exc_info=True,
+                )
+                module_logger.info("slack_model_intake_falling_back_to_hardcoded team=%s channel=%s", team_id, channel_id)
+                session.answers["_flow"] = "hardcoded"
+                session.answers.pop("_seed_prompt", None)
+                _store_session(session)
+                # Fall through to the hardcoded path below.
+                return _start_create_intake_hardcoded(
+                    client, settings, session,
+                    normalized_seed_prompt=normalized_seed_prompt,
+                    user_id=user_id, team_id=team_id,
+                )
+
+        # No seed prompt — post an open-ended model greeting.
+        controls_message = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="What would you like to build? Describe the feature and I'll collect the details.",
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "What would you like to build? Describe the feature and I'll collect the details.",
+                    },
+                },
+                *_intake_controls_blocks(mode=_session_intake_mode(session)),
+            ],
+        )
+        session.answers["_controls_message_ts"] = str(controls_message.get("ts") or "").strip()
+        _store_session(session)
+        return
+
+    # ---- Hardcoded startup (no model available) ----
+    session.answers["_flow"] = "hardcoded"
+    _store_session(session)
+    _start_create_intake_hardcoded(
+        client, settings, session,
+        normalized_seed_prompt=normalized_seed_prompt,
+        user_id=user_id, team_id=team_id,
+    )
+
+
+def _start_create_intake_hardcoded(
+    client: Any,
+    settings: Any,
+    session: IntakeSession,
+    *,
+    normalized_seed_prompt: str,
+    user_id: str,
+    team_id: str,
+) -> None:
+    """Post the original hardcoded title question and control blocks."""
     controls_message = client.chat_postMessage(
-        channel=channel_id,
-        thread_ts=thread_ts,
+        channel=session.channel_id,
+        thread_ts=session.thread_ts,
         text=QUESTION_BY_FIELD["title"],
         blocks=_title_prompt_blocks(
             mode=_session_intake_mode(session),
