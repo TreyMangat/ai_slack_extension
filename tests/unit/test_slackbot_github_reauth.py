@@ -5,13 +5,16 @@ from types import SimpleNamespace
 from app.config import Settings
 import app.slackbot as slackbot_mod
 from app.slackbot import (
-    GitHubAuthError,
     IntakeSession,
-    _build_github_oauth_url,
     _handle_model_intake_action,
     _process_session_message,
     _show_repo_dropdown_message,
     _start_create_intake,
+)
+import app.services.branch_catalog as branch_catalog_mod
+from app.services.branch_catalog import (
+    GitHubAuthError,
+    build_github_oauth_url,
 )
 
 
@@ -252,10 +255,10 @@ def test_manual_repo_entry_during_wait(monkeypatch) -> None:
 def test_oauth_url_built_correctly(monkeypatch) -> None:
     settings = _settings(base_url="https://app.example")
 
-    monkeypatch.setattr(slackbot_mod, "get_settings", lambda: settings)
-    monkeypatch.setattr(slackbot_mod, "_github_connect_url_for_user", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(branch_catalog_mod, "get_settings", lambda: settings)
+    monkeypatch.setattr(branch_catalog_mod, "github_connect_url_for_user", lambda *_args, **_kwargs: "")
 
-    url = _build_github_oauth_url("U123", "T123")
+    url = build_github_oauth_url("U123", "T123")
 
     assert url.startswith("https://app.example/api/github/install?")
     assert "slack_user_id=U123" in url

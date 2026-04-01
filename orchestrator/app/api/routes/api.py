@@ -48,7 +48,7 @@ from app.services.pr_description import build_standard_pr_body
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
-from app.slackbot import _thread_blocks_with_cost_summary
+from app.services.block_builders import thread_blocks_with_cost_summary
 from app.state_machine import (
     FAILED_BUILD,
     FAILED_SPEC,
@@ -800,7 +800,7 @@ async def execution_callback(request: Request, db: Session = Depends(get_db)):
             thread_ts=feature.slack_thread_ts,
             text=callback_text,
             blocks=(
-                _thread_blocks_with_cost_summary(callback_text, list(feature.events or []))
+                thread_blocks_with_cost_summary(callback_text, list(feature.events or []))
                 if payload.event in {"pr_opened", "preview_ready"}
                 else None
             ),

@@ -13,8 +13,8 @@ from app.slackbot import (
     _post_thread_message_with_optional_model_context,
     _process_session_message,
     _start_create_intake,
-    _thread_blocks_with_cost_summary,
 )
+from app.services.block_builders import thread_blocks_with_cost_summary
 
 
 class DummyClient:
@@ -427,7 +427,7 @@ def test_cost_context_block_shown_on_build_complete() -> None:
         SimpleNamespace(data={"cost_usd": 0.0, "tier": "frontier", "model": "anthropic/claude-opus-4-6"}),
     ]
 
-    blocks = _thread_blocks_with_cost_summary("PR step complete", events)
+    blocks = thread_blocks_with_cost_summary("PR step complete", events)
 
     assert isinstance(blocks, list)
     assert blocks[0]["type"] == "section"
@@ -435,7 +435,7 @@ def test_cost_context_block_shown_on_build_complete() -> None:
 
 
 def test_no_cost_block_when_no_events() -> None:
-    assert _thread_blocks_with_cost_summary("PR step complete", []) is None
+    assert thread_blocks_with_cost_summary("PR step complete", []) is None
 
 
 def test_escalate_shows_two_buttons(monkeypatch) -> None:
@@ -976,12 +976,12 @@ def test_repo_button_click_advances_to_branch(monkeypatch) -> None:
     monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
     monkeypatch.setattr(
         slackbot_mod,
-        "_fetch_default_branch_for_repo",
+        "fetch_default_branch_for_repo",
         lambda *a, **kw: "main",
     )
     monkeypatch.setattr(
         slackbot_mod,
-        "_fetch_branches_for_repo",
+        "fetch_branches_for_repo",
         lambda *a, **kw: ["main", "develop"],
     )
 

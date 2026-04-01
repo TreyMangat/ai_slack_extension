@@ -13,7 +13,7 @@ from app.config import get_settings
 from app.db import db_session
 from app.models import FeatureRequest, FeatureRun
 from app.observability import metrics
-from app.slackbot import _thread_blocks_with_cost_summary
+from app.services.block_builders import thread_blocks_with_cost_summary
 from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
@@ -494,7 +494,7 @@ async def kickoff_build(feature_id: str) -> None:
                         f"PR: {feature.github_pr_url or '(pending)'}"
                         f"{runner_line}"
                     ),
-                    blocks=_thread_blocks_with_cost_summary(
+                    blocks=thread_blocks_with_cost_summary(
                         (
                             f"PR step complete for *{feature.title}*\n"
                             f"Repo: {target_repo or '(none)'}\n"
@@ -527,7 +527,7 @@ async def kickoff_build(feature_id: str) -> None:
                         channel=feature.slack_channel_id,
                         thread_ts=feature.slack_thread_ts,
                         text=f"Preview ready: {safe_preview_url}",
-                        blocks=_thread_blocks_with_cost_summary(
+                        blocks=thread_blocks_with_cost_summary(
                             f"Preview ready: {safe_preview_url}",
                             list(feature.events or []),
                         ),
