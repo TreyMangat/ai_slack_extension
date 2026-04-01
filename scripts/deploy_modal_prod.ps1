@@ -775,7 +775,15 @@ Require-NonEmptyKeys -Map $config -Keys @(
 
 Write-Host "Validating Modal CLI with Python 3.12..." -ForegroundColor Cyan
 & py -3.12 -m modal --version | Out-Null
-& py -3.12 -m modal profile current | Out-Null
+
+# Verify correct Modal profile
+$currentProfile = (py -3.12 -m modal profile current 2>&1) | Out-String
+if ($currentProfile -notmatch "tmangat02") {
+    Write-Host "ERROR: Modal profile is not tmangat02. Run:" -ForegroundColor Red
+    Write-Host "  py -3.12 -m modal profile activate tmangat02" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "Modal profile verified: tmangat02" -ForegroundColor Green
 
 $tempSecretJson = Join-Path $env:TEMP ("feature-factory-modal-secret-" + [guid]::NewGuid().ToString("N") + ".json")
 $tempSlackSecretJson = Join-Path $env:TEMP ("feature-factory-slack-secret-" + [guid]::NewGuid().ToString("N") + ".json")
