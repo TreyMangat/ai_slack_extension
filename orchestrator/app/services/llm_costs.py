@@ -28,9 +28,36 @@ def _coerce_float(value: Any) -> float:
         return 0.0
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _event_token_counts(data: dict[str, Any]) -> tuple[int, int]:
+    usage = data.get("usage")
+    usage_dict = usage if isinstance(usage, dict) else {}
+    tokens_in = _coerce_int(
+        data.get("tokens_in")
+        or data.get("input_tokens")
+        or usage_dict.get("input_tokens")
+        or usage_dict.get("prompt_tokens")
+    )
+    tokens_out = _coerce_int(
+        data.get("tokens_out")
+        or data.get("output_tokens")
+        or usage_dict.get("output_tokens")
+        or usage_dict.get("completion_tokens")
+    )
+    return tokens_in, tokens_out
+
+
 def aggregate_llm_costs(events: list[Any]) -> dict[str, Any] | None:
     total_usd = 0.0
     calls = 0
+    total_tokens_in = 0
+    total_tokens_out = 0
     by_tier = {"mini": 0.0, "frontier": 0.0}
     by_tier_calls = {"mini": 0, "frontier": 0}
     models: list[str] = []
@@ -46,9 +73,12 @@ def aggregate_llm_costs(events: list[Any]) -> dict[str, Any] | None:
         )
         tier = str(data.get("tier") or data.get("model_tier") or "").strip().lower()
         model = str(data.get("model") or "").strip()
+        tokens_in, tokens_out = _event_token_counts(data)
 
         total_usd += cost
         calls += 1
+        total_tokens_in += tokens_in
+        total_tokens_out += tokens_out
 
         if tier in by_tier:
             by_tier[tier] += cost
@@ -63,6 +93,9 @@ def aggregate_llm_costs(events: list[Any]) -> dict[str, Any] | None:
     return {
         "total_usd": round(total_usd, 6),
         "calls": calls,
+        "tokens_in": total_tokens_in,
+        "tokens_out": total_tokens_out,
+        "total_tokens": total_tokens_in + total_tokens_out,
         "by_tier": {
             "mini": round(by_tier["mini"], 6),
             "frontier": round(by_tier["frontier"], 6),

@@ -91,7 +91,7 @@ def test_fetch_user_recent_features_reads_items_payload(mock_settings, monkeypat
 
     assert len(recent) == 5
     assert captured["url"] == "http://api:8000/api/feature-requests"
-    assert captured["params"] == {"limit": 5, "mine": True}
+    assert captured["params"] == {"limit": 5, "offset": 0, "mine": True, "include_events": True}
     assert captured["timeout"] == 10
     assert captured["headers"]["X-FF-Token"] == "test-token"
     assert "U123" in captured["headers"].values()

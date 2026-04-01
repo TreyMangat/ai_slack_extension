@@ -77,6 +77,9 @@ def test_feature_detail_passes_llm_costs_when_events_exist(monkeypatch) -> None:
     assert response["llm_costs"] == {
         "total_usd": 0.0579,
         "calls": 2,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "total_tokens": 0,
         "by_tier": {"mini": 0.0123, "frontier": 0.0456},
         "by_tier_calls": {"mini": 1, "frontier": 1},
         "models": ["qwen/qwen3.5-9b", "anthropic/claude-opus-4-6"],

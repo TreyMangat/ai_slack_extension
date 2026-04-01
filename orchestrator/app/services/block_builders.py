@@ -125,6 +125,7 @@ def build_app_home_blocks(
     user_id: str,
     recent_features: list[dict[str, Any]],
     github_status: str,
+    total_cost: float = 0.0,
     slash_command: str = "/prfactory",
     new_request_url: str = "",
 ) -> list[dict[str, Any]]:
@@ -196,6 +197,18 @@ def build_app_home_blocks(
             ],
         }
     )
+    if float(total_cost or 0.0) > 0:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f":moneybag: Total OpenRouter spend: ${float(total_cost):.4f}",
+                    }
+                ],
+            }
+        )
     return blocks
 
 

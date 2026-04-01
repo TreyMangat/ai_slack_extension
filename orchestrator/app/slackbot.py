@@ -25,6 +25,7 @@ from app.services.github_user_oauth import (
     resolve_github_user_access_token,
     resolve_github_user_login,
 )
+from app.services.llm_costs import aggregate_llm_costs
 from app.services.repo_indexer_adapter import RepoIndexerError, get_repo_indexer_client
 from app.services.slack_oauth import get_slack_oauth_runtime
 from app.services.reviewer_service import is_approver_allowed
@@ -1368,32 +1369,132 @@ def _fetch_feature(settings: Any, feature_id: str) -> dict[str, Any]:
     return r.json()
 
 
-def _fetch_user_recent_features(settings: Any, user_id: str) -> list[dict[str, Any]]:
-    """Fetch up to five recent feature requests for the Slack user."""
+def _feature_cost_summary(feature: dict[str, Any]) -> dict[str, Any] | None:
+    events = feature.get("events") or []
+    if not isinstance(events, list):
+        return None
+    return aggregate_llm_costs(events)
+
+
+def _feature_cost_amount(feature: dict[str, Any]) -> float:
+    try:
+        return float(feature.get("total_cost") or feature.get("cost") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _attach_feature_costs(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        item = dict(feature)
+        summary = _feature_cost_summary(item)
+        if summary:
+            item["llm_cost_summary"] = summary
+            item["total_cost"] = float(summary.get("total_usd") or 0.0)
+            item["cost"] = float(summary.get("total_usd") or 0.0)
+            item["total_calls"] = int(summary.get("calls") or 0)
+            item["total_tokens"] = int(summary.get("total_tokens") or 0)
+        enriched.append(item)
+    return enriched
+
+
+def _feature_list_items_from_payload(payload: Any) -> tuple[list[dict[str, Any]], bool]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)], False
+    if isinstance(payload, dict):
+        items = payload.get("items") or payload.get("features") or []
+        has_more = bool(payload.get("has_more"))
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)], has_more
+    return [], False
+
+
+def _fetch_user_features_page(
+    settings: Any,
+    user_id: str,
+    *,
+    limit: int,
+    offset: int = 0,
+    include_events: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch one page of feature requests for the Slack user."""
 
     normalized_user_id = str(user_id or "").strip()
     if not normalized_user_id:
-        return []
+        return [], False
 
     try:
         headers = _api_headers(settings, actor=normalized_user_id)
+        params: dict[str, Any] = {
+            "limit": max(int(limit), 1),
+            "offset": max(int(offset), 0),
+            "mine": True,
+        }
+        if include_events:
+            params["include_events"] = True
         r = httpx.get(
             f"{settings.orchestrator_internal_url}/api/feature-requests",
-            params={"limit": 5, "mine": True},
+            params=params,
             timeout=10,
             headers=headers,
         )
         r.raise_for_status()
-        payload = r.json()
-        if isinstance(payload, list):
-            return payload[:5]
-        if isinstance(payload, dict):
-            items = payload.get("items") or payload.get("features") or []
-            if isinstance(items, list):
-                return items[:5]
+        items, has_more = _feature_list_items_from_payload(r.json())
+        if include_events:
+            items = _attach_feature_costs(items)
+        return items[: max(int(limit), 1)], has_more
     except Exception:
-        logger.exception("fetch_user_recent_features_failed user=%s", normalized_user_id)
-    return []
+        logger.exception(
+            "fetch_user_features_failed user=%s limit=%s offset=%s include_events=%s",
+            normalized_user_id,
+            limit,
+            offset,
+            include_events,
+        )
+    return [], False
+
+
+def _fetch_user_recent_features(settings: Any, user_id: str) -> list[dict[str, Any]]:
+    """Fetch up to five recent feature requests for the Slack user."""
+
+    items, _has_more = _fetch_user_features_page(
+        settings,
+        user_id,
+        limit=5,
+        include_events=True,
+    )
+    return items[:5]
+
+
+def _fetch_all_user_features_with_costs(settings: Any, user_id: str) -> list[dict[str, Any]]:
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id:
+        return []
+
+    offset = 0
+    page_size = 100
+    all_features: list[dict[str, Any]] = []
+    while True:
+        page, has_more = _fetch_user_features_page(
+            settings,
+            normalized_user_id,
+            limit=page_size,
+            offset=offset,
+            include_events=True,
+        )
+        if not page:
+            break
+        all_features.extend(page)
+        if not has_more:
+            break
+        offset += len(page)
+    return all_features
+
+
+def _aggregate_feature_spend(features: list[dict[str, Any]]) -> float:
+    return round(sum(_feature_cost_amount(feature) for feature in features), 6)
 
 
 def _handle_status_subcommand(body: dict[str, Any], client: Any, settings: Any) -> None:
@@ -1416,8 +1517,10 @@ def _handle_status_subcommand(body: dict[str, Any], client: Any, settings: Any) 
         status = str(feature.get("status") or "UNKNOWN").strip() or "UNKNOWN"
         title = str(feature.get("title") or "(untitled)").strip() or "(untitled)"
         feature_id = str(feature.get("id") or "").strip()
+        cost = _feature_cost_amount(feature)
+        cost_str = f" - ${cost:.4f}" if cost > 0 else ""
         lines.append(
-            f"{_status_emoji(status)} *{title}* - `{status}` (id: `{feature_id}`)"
+            f"{_status_emoji(status)} *{title}* - `{status}`{cost_str} (id: `{feature_id}`)"
         )
 
     client.chat_postEphemeral(
@@ -1425,6 +1528,33 @@ def _handle_status_subcommand(body: dict[str, Any], client: Any, settings: Any) 
         user=user_id,
         text="\n".join(lines),
     )
+
+
+def _handle_cost_subcommand(body: dict[str, Any], client: Any, settings: Any) -> None:
+    user_id = str(body.get("user_id") or "").strip()
+    channel_id = str(body.get("channel_id") or "").strip()
+    if not user_id or not channel_id:
+        return
+
+    try:
+        features = _fetch_all_user_features_with_costs(settings, user_id)
+        total = _aggregate_feature_spend(features)
+        breakdown = [
+            f"- {str(feature.get('title') or '(untitled)').strip() or '(untitled)'}: ${_feature_cost_amount(feature):.4f}"
+            for feature in features
+            if _feature_cost_amount(feature) > 0
+        ]
+        if total > 0:
+            text = f":moneybag: *Your OpenRouter spend: ${total:.4f}*"
+            if breakdown:
+                text += "\n" + "\n".join(breakdown)
+        else:
+            text = "No OpenRouter costs recorded for your requests yet."
+    except Exception:
+        logger.exception("cost_subcommand_failed user=%s", user_id)
+        text = "Could not fetch cost data."
+
+    client.chat_postEphemeral(channel=channel_id, user=user_id, text=text)
 
 
 def _update_feature_message(client: Any, feature: dict[str, Any], *, channel_id: str, message_ts: str) -> None:
@@ -3279,11 +3409,13 @@ def create_slack_bolt_app(settings: Any):
         app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
         github_status = _github_status_line_for_user(settings, user_id=user_id, team_id=team_id)
         recent_features = _fetch_user_recent_features(settings, user_id)
+        total_cost = _aggregate_feature_spend(_fetch_all_user_features_with_costs(settings, user_id))
         blocks = build_app_home_blocks(
             app_name=app_name,
             user_id=user_id,
             recent_features=recent_features,
             github_status=github_status,
+            total_cost=total_cost,
             slash_command=PRIMARY_SLASH_COMMAND,
             new_request_url=settings.slack_app_redirect_url_resolved(),
         )
@@ -3318,6 +3450,9 @@ def create_slack_bolt_app(settings: Any):
 
         if text.lower().startswith("status"):
             _handle_status_subcommand(body, client, settings)
+            return
+        if text.lower().startswith("cost"):
+            _handle_cost_subcommand(body, client, settings)
             return
 
         _ensure_bot_in_channel(client, channel_id, logger)

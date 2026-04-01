@@ -18,6 +18,7 @@ from app.services.coderunner_adapter import get_coderunner_adapter
 from app.services.event_logger import log_event
 from app.services.github_adapter import get_github_adapter
 from app.services.github_repo import resolve_repo_for_spec
+from app.services.llm_costs import aggregate_llm_costs
 from app.services.reviewer_service import notify_reviewer_for_approval
 from app.services.slack_adapter import get_slack_adapter
 from app.services.url_safety import normalize_external_url
@@ -63,6 +64,15 @@ def _build_timeout_window_seconds(settings: Any) -> int:
     return 0
 
 
+def _slack_message_timestamp(response: Any) -> str:
+    if isinstance(response, dict):
+        return str(response.get("ts") or "").strip()
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        return str(data.get("ts") or "").strip()
+    return str(getattr(response, "ts", "") or "").strip()
+
+
 async def _build_heartbeat_loop(
     *,
     slack: Any,
@@ -76,6 +86,7 @@ async def _build_heartbeat_loop(
     interval_seconds: int,
     timeout_window_seconds: int,
 ) -> None:
+    heartbeat_message_ts = ""
     while True:
         await asyncio.sleep(max(interval_seconds, 1))
         elapsed = int((datetime.utcnow() - started_at).total_seconds())
@@ -87,15 +98,28 @@ async def _build_heartbeat_loop(
                 f"(~`{_format_duration_seconds(remaining)}` remaining)"
             )
         repo_note = f"\nRepo: `{target_repo}`" if target_repo else ""
-        slack.post_thread_message(
+        text = (
+            f"Still building *{feature_title}* (`{mode}`).{repo_note}\n"
+            f"Elapsed: `{_format_duration_seconds(elapsed)}`{timeout_note}"
+        )
+        if heartbeat_message_ts:
+            try:
+                slack.update_message(
+                    channel=channel_id,
+                    ts=heartbeat_message_ts,
+                    text=text,
+                    team_id=team_id,
+                )
+                continue
+            except Exception:
+                heartbeat_message_ts = ""
+        response = slack.post_thread_message(
             channel=channel_id,
             thread_ts=thread_ts,
-            text=(
-                f"Still building *{feature_title}* (`{mode}`).{repo_note}\n"
-                f"Elapsed: `{_format_duration_seconds(elapsed)}`{timeout_note}"
-            ),
+            text=text,
             team_id=team_id,
         )
+        heartbeat_message_ts = _slack_message_timestamp(response)
 
 
 def _mode_strategy_label(mode: str) -> str:
@@ -111,6 +135,41 @@ def _feature_reference(feature: FeatureRequest) -> str:
     slug = "-".join([part for part in slug.split("-") if part][:3]) or "request"
     short = str(feature.id or "")[:8]
     return f"{slug}-{short}" if short else slug
+
+
+def _build_cost_summary_text(events: list[Any]) -> str | None:
+    summary = aggregate_llm_costs(events)
+    if not summary:
+        return None
+
+    total_usd = float(summary.get("total_usd") or 0.0)
+    if total_usd <= 0:
+        return None
+
+    calls = int(summary.get("calls") or 0)
+    total_tokens = int(summary.get("total_tokens") or 0)
+    return (
+        f":moneybag: *Cost summary:* ${total_usd:.4f} "
+        f"({calls} API calls, {total_tokens:,} tokens)"
+    )
+
+
+def _post_build_cost_summary(slack: Any, feature: FeatureRequest) -> None:
+    if not feature.slack_channel_id or not feature.slack_thread_ts:
+        return
+
+    try:
+        cost_text = _build_cost_summary_text(list(feature.events or []))
+        if not cost_text:
+            return
+        slack.post_thread_message(
+            channel=feature.slack_channel_id,
+            thread_ts=feature.slack_thread_ts,
+            text=cost_text,
+            team_id=getattr(feature, "slack_team_id", "") or "",
+        )
+    except Exception:
+        logger.exception("build_cost_summary_failed feature=%s", feature.id)
 
 
 def _workspace_plan(
@@ -291,6 +350,7 @@ async def kickoff_build(feature_id: str) -> None:
                     text=f"Build failed for *{feature.title}*: `{message}`",
                     team_id=feature.slack_team_id,
                 )
+                _post_build_cost_summary(slack, feature)
             return
 
         owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
@@ -317,6 +377,7 @@ async def kickoff_build(feature_id: str) -> None:
                     text=f"Build failed for *{feature.title}*: `{message}`{install_hint}",
                     team_id=feature.slack_team_id,
                 )
+                _post_build_cost_summary(slack, feature)
             return
 
         if feature.slack_channel_id and feature.slack_thread_ts:
@@ -544,6 +605,7 @@ async def kickoff_build(feature_id: str) -> None:
             else:
                 # Preview URL will be set later via signed integration callback.
                 feature.active_build_job_id = ""
+            _post_build_cost_summary(slack, feature)
             feature_run.status = "SUCCEEDED"
             feature_run.pr_url = feature.github_pr_url or feature_run.pr_url
             feature_run.preview_url = feature.preview_url or feature_run.preview_url
@@ -600,6 +662,7 @@ async def kickoff_build(feature_id: str) -> None:
                     text=f"Build failed for *{feature.title}*: {error_text}{guidance}",
                     team_id=feature.slack_team_id,
                 )
+                _post_build_cost_summary(slack, feature)
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
