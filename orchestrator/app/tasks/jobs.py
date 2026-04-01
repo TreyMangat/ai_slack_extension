@@ -7,7 +7,6 @@ import logging
 import re
 from typing import Any
 
-from rich.console import Console
 from sqlalchemy import select
 
 from app.config import get_settings
@@ -28,8 +27,6 @@ from app.services.workspace_service import (
 )
 from app.state_machine import BUILDING, perform_action, validate_transition
 
-
-console = Console()
 logger = logging.getLogger(__name__)
 
 
@@ -170,7 +167,7 @@ async def kickoff_build(feature_id: str) -> None:
     with db_session() as db:
         feature = db.get(FeatureRequest, feature_id)
         if not feature:
-            console.print(f"[red]Feature {feature_id} not found[/red]")
+            logger.error("build_feature_not_found feature_id=%s", feature_id)
             return
 
         active_job_id = (feature.active_build_job_id or "").strip()

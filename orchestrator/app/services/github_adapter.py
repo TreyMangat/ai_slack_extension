@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from rich.console import Console
 
 from app.config import get_settings
 from app.services.github_auth import get_github_token_provider
 
-
-console = Console()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,23 +38,26 @@ class MockGitHubAdapter(GitHubAdapter):
     async def create_issue(self, *, title: str, body: str, labels: list[str] | None = None) -> GitHubIssue:
         fake_number = int(time.time()) % 100000
         fake_url = f"https://example.local/github/issues/{fake_number}"
-        console.print(f"[bold cyan][MOCK GitHub][/bold cyan] create_issue #{fake_number}: {title}")
+        logger.info("mock_github_create_issue issue_number=%s title=%s", fake_number, title)
         return GitHubIssue(number=fake_number, html_url=fake_url)
 
     async def comment_issue(self, *, issue_number: int, body: str) -> None:
-        console.print(f"[bold cyan][MOCK GitHub][/bold cyan] comment_issue #{issue_number}: {body}")
+        logger.info("mock_github_comment_issue issue_number=%s body=%s", issue_number, body)
 
     async def create_pull_request(self, *, title: str, body: str, head: str, base: str) -> str:
         fake_number = int(time.time()) % 100000
         fake_url = f"https://example.local/github/pull/{fake_number}"
-        console.print(
-            f"[bold cyan][MOCK GitHub][/bold cyan] create_pull_request #{fake_number}: "
-            f"{title} (head={head}, base={base})"
+        logger.info(
+            "mock_github_create_pull_request pr_number=%s title=%s head=%s base=%s",
+            fake_number,
+            title,
+            head,
+            base,
         )
         return fake_url
 
     async def update_pull_request_body(self, *, pr_number: int, body: str) -> None:
-        console.print(f"[bold cyan][MOCK GitHub][/bold cyan] update_pull_request_body #{pr_number}")
+        logger.info("mock_github_update_pull_request_body pr_number=%s", pr_number)
 
 
 class RealGitHubAdapter(GitHubAdapter):
@@ -286,7 +288,7 @@ def get_github_adapter(
         message = "GitHub enabled but missing owner/repo."
         if strict:
             raise RuntimeError(message)
-        console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
+        logger.warning("github_adapter_fallback_to_mock reason=%s", message)
         return MockGitHubAdapter()
 
     mode = settings.github_auth_mode_normalized()
@@ -296,26 +298,26 @@ def get_github_adapter(
             message = "GitHub token auth selected but GITHUB_TOKEN is empty."
             if strict:
                 raise RuntimeError(message)
-            console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
+            logger.warning("github_adapter_fallback_to_mock reason=%s", message)
             return MockGitHubAdapter()
         if mode == "app":
             if not settings.github_app_id:
                 message = "GitHub App auth selected but GITHUB_APP_ID is missing."
                 if strict:
                     raise RuntimeError(message)
-                console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
+                logger.warning("github_adapter_fallback_to_mock reason=%s", message)
                 return MockGitHubAdapter()
             if not settings.github_app_private_key and not settings.github_app_private_key_path:
                 message = "GitHub App auth selected but private key is missing."
                 if strict:
                     raise RuntimeError(message)
-                console.print(f"[yellow]{message} Falling back to mock adapter.[/yellow]")
+                logger.warning("github_adapter_fallback_to_mock reason=%s", message)
                 return MockGitHubAdapter()
     if mode not in {"", "token", "pat", "app"}:
         message = f"Unsupported GITHUB_AUTH_MODE={settings.github_auth_mode}."
         if strict:
             raise RuntimeError(message)
-        console.print(f"[yellow]{message} Falling back to mock.[/yellow]")
+        logger.warning("github_adapter_fallback_to_mock reason=%s", message)
         return MockGitHubAdapter()
 
     return RealGitHubAdapter(

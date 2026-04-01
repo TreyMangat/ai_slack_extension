@@ -24,5 +24,14 @@ def test_no_bare_pass_in_except_handlers():
                 if len(body) == 1 and isinstance(body[0], ast.Pass):
                     assert False, (
                         f"{filepath}:{node.lineno} has bare 'pass' "
-                        f"in except handler — should use logger.exception()"
+                        f"in except handler - should use logger.exception()"
                     )
+
+
+def test_no_diagnostic_print_statements():
+    """No diagnostic print statements should remain in production code."""
+    for filepath in pathlib.Path("orchestrator/app").rglob("*.py"):
+        source = filepath.read_text()
+        assert "PRFACTORY DIAG" not in source, (
+            f"{filepath} still has diagnostic print statements"
+        )

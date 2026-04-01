@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
-
-from rich.console import Console
 
 from app.config import get_settings
 from app.services.slack_oauth import resolve_slack_bot_token
 
-
-console = Console()
+logger = logging.getLogger(__name__)
 
 
 class SlackAdapter:
@@ -45,9 +43,9 @@ class MockSlackAdapter(SlackAdapter):
         blocks: list[dict] | None = None,
         team_id: str = "",
     ) -> None:
-        console.print(f"[bold cyan][MOCK Slack][/bold cyan] #{channel} thread={thread_ts}: {text}")
+        logger.info("mock_slack_thread_post channel=%s thread_ts=%s text=%s", channel, thread_ts, text)
         if blocks:
-            console.print(json.dumps(blocks, indent=2))
+            logger.debug("mock_slack_thread_blocks channel=%s thread_ts=%s blocks=%s", channel, thread_ts, json.dumps(blocks, indent=2))
 
     def post_channel_message(
         self,
@@ -57,9 +55,9 @@ class MockSlackAdapter(SlackAdapter):
         blocks: list[dict] | None = None,
         team_id: str = "",
     ) -> None:
-        console.print(f"[bold cyan][MOCK Slack][/bold cyan] #{channel}: {text}")
+        logger.info("mock_slack_channel_post channel=%s text=%s", channel, text)
         if blocks:
-            console.print(json.dumps(blocks, indent=2))
+            logger.debug("mock_slack_channel_blocks channel=%s blocks=%s", channel, json.dumps(blocks, indent=2))
 
 
 class RealSlackAdapter(SlackAdapter):
@@ -105,13 +103,19 @@ class RealSlackAdapter(SlackAdapter):
         team_id: str = "",
     ) -> None:
         if not self._allowed(channel):
-            console.print(f"[yellow]Slack post blocked by allowlist (channel={channel}).[/yellow]")
+            logger.warning("slack_thread_post_blocked_by_allowlist channel=%s", channel)
             return
         try:
             client = self._resolve_client(team_id=team_id)
             client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
         except Exception as e:  # noqa: BLE001
-            console.print(f"[yellow]Slack thread post failed (team={team_id}, channel={channel}): {e}[/yellow]")
+            logger.warning(
+                "slack_thread_post_failed team=%s channel=%s error=%s",
+                team_id,
+                channel,
+                e,
+                exc_info=True,
+            )
 
     def post_channel_message(
         self,
@@ -122,13 +126,19 @@ class RealSlackAdapter(SlackAdapter):
         team_id: str = "",
     ) -> None:
         if not self._allowed(channel):
-            console.print(f"[yellow]Slack post blocked by allowlist (channel={channel}).[/yellow]")
+            logger.warning("slack_channel_post_blocked_by_allowlist channel=%s", channel)
             return
         try:
             client = self._resolve_client(team_id=team_id)
             client.chat_postMessage(channel=channel, text=text, blocks=blocks)
         except Exception as e:  # noqa: BLE001
-            console.print(f"[yellow]Slack channel post failed (team={team_id}, channel={channel}): {e}[/yellow]")
+            logger.warning(
+                "slack_channel_post_failed team=%s channel=%s error=%s",
+                team_id,
+                channel,
+                e,
+                exc_info=True,
+            )
 
 
 def get_slack_adapter() -> SlackAdapter:

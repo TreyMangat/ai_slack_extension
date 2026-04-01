@@ -208,12 +208,11 @@ async def test_kickoff_build_returns_when_feature_missing():
         patch("app.tasks.jobs.get_coderunner_adapter", return_value=MagicMock()),
         patch("app.tasks.jobs.get_slack_adapter", return_value=MagicMock()),
         patch("app.tasks.jobs.db_session", return_value=_DbSessionContext(db)),
-        patch("app.tasks.jobs.console.print") as console_mock,
+        patch("app.tasks.jobs.logger.error") as logger_error_mock,
     ):
         await kickoff_build("missing-feature")
 
-    console_mock.assert_called_once()
-    assert "missing-feature" in console_mock.call_args.args[0]
+    logger_error_mock.assert_called_once_with("build_feature_not_found feature_id=%s", "missing-feature")
 
 
 @pytest.mark.asyncio

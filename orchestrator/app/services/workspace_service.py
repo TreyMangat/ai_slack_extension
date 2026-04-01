@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -10,13 +11,10 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
-from rich.console import Console
-
 from app.config import get_settings
 from app.services.github_auth import get_github_token_provider
 
-
-console = Console()
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -216,9 +214,9 @@ def cleanup_old_workspaces(
             errors.append(f"{path}: {e}")
 
     if removed_paths:
-        console.print(f"[cyan]Workspace cleanup removed {len(removed_paths)} stale directories[/cyan]")
+        logger.info("workspace_cleanup_removed count=%s", len(removed_paths))
     if errors:
-        console.print(f"[yellow]Workspace cleanup encountered {len(errors)} errors[/yellow]")
+        logger.warning("workspace_cleanup_errors count=%s", len(errors))
 
     return WorkspaceCleanupResult(
         workspace_root=str(workspace_root),
@@ -373,8 +371,10 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    console.print(
-        f"[cyan]Prepared workspace {result.workspace_id} for feature {feature_id} "
-        f"with {len(prepared_references)} reference entries[/cyan]"
+    logger.info(
+        "workspace_prepared workspace_id=%s feature_id=%s reference_count=%s",
+        result.workspace_id,
+        feature_id,
+        len(prepared_references),
     )
     return result

@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from rich.console import Console
 from sqlalchemy import delete, func, select
+
+logger = logging.getLogger("feature_factory.slackbot")
+module_logger = logger
 
 from app.config import get_settings
 from app.db import db_session
@@ -60,11 +62,12 @@ except ImportError:
     check_github_connection = None
     HAS_GITHUB_CONNECTION_CHECKER = False
 
-print(f"[PRFACTORY DIAG] slackbot.py loaded. HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, HAS_ESCALATE={HAS_ESCALATE}, HAS_GITHUB_CONNECTION_CHECKER={HAS_GITHUB_CONNECTION_CHECKER}", flush=True)
-
-console = Console()
-logger = logging.getLogger("feature_factory.slackbot")
-module_logger = logger
+logger.info(
+    "slackbot_loaded has_intake_router=%s has_escalate=%s has_github_connection_checker=%s",
+    HAS_INTAKE_ROUTER,
+    HAS_ESCALATE,
+    HAS_GITHUB_CONNECTION_CHECKER,
+)
 
 
 class GitHubAuthError(RuntimeError):
@@ -852,7 +855,7 @@ def _cleanup_expired_sessions() -> None:
         with db_session() as db:
             db.execute(delete(SlackIntakeSession).where(SlackIntakeSession.expires_at <= datetime.now(timezone.utc)))
     except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB cleanup failed: {e}[/yellow]")
+        logger.warning("slack_intake_db_cleanup_failed error=%s", e, exc_info=True)
 
 
 def _session_from_record(record: SlackIntakeSession) -> IntakeSession:
@@ -912,7 +915,7 @@ def _store_session(session: IntakeSession) -> None:
             row.updated_at = now
             row.expires_at = now + timedelta(seconds=SESSION_TTL_SECONDS)
     except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB persistence failed: {e}[/yellow]")
+        logger.warning("slack_intake_db_persistence_failed error=%s", e, exc_info=True)
 
 
 def _get_session(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
@@ -935,7 +938,7 @@ def _get_session(*, team_id: str, channel_id: str, thread_ts: str, user_id: str)
             ACTIVE_INTAKES[key] = session
             return session
     except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB read failed: {e}[/yellow]")
+        logger.warning("slack_intake_db_read_failed error=%s", e, exc_info=True)
         return None
 
 
@@ -953,7 +956,7 @@ def _drop_session(session: IntakeSession) -> None:
             if row:
                 db.delete(row)
     except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB delete failed: {e}[/yellow]")
+        logger.warning("slack_intake_db_delete_failed error=%s", e, exc_info=True)
 
 
 def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
@@ -1555,8 +1558,12 @@ def _fetch_branches_via_worktree_catalog(
         except Exception:
             logger.exception("slack_github_branch_catalog_set_head_failed")
     except Exception as e:
-        console.print(
-            f"[yellow]github_branch_catalog_sync_failed repo={owner}/{repo} error={e}[/yellow]"
+        logger.warning(
+            "slack_github_branch_catalog_sync_failed owner=%s repo=%s error=%s",
+            owner,
+            repo,
+            e,
+            exc_info=True,
         )
         return "", []
 
@@ -1673,13 +1680,20 @@ def _fetch_indexer_catalog_payload(
             top_k_branches_per_repo=max(int(top_k_branches_per_repo), 1),
         )
     except RepoIndexerError as e:
-        console.print(
-            f"[yellow]indexer_catalog_suggest_failed actor={actor_id} query={query!r} error={e}[/yellow]"
+        logger.warning(
+            "slack_indexer_catalog_suggest_failed actor=%s query=%s error=%s",
+            actor_id,
+            query,
+            e,
         )
         return {}
     except Exception as e:  # noqa: BLE001
-        console.print(
-            f"[yellow]indexer_catalog_suggest_failed actor={actor_id} query={query!r} error={e}[/yellow]"
+        logger.warning(
+            "slack_indexer_catalog_suggest_failed actor=%s query=%s error=%s",
+            actor_id,
+            query,
+            e,
+            exc_info=True,
         )
         return {}
 
@@ -1848,9 +1862,13 @@ def _fetch_repositories_for_user(
     except GitHubAuthError:
         raise
     except Exception as e:
-        console.print(
-            f"[yellow]github_repo_fetch_failed user={user_id} team={team_id} "
-            f"url={settings.github_api_base.rstrip('/')}/user/repos error={e}[/yellow]"
+        logger.warning(
+            "slack_github_repo_fetch_failed user=%s team=%s url=%s error=%s",
+            user_id,
+            team_id,
+            f"{settings.github_api_base.rstrip('/')}/user/repos",
+            e,
+            exc_info=True,
         )
         repos = []
 
@@ -1940,9 +1958,14 @@ def _fetch_branches_for_repo(
     except GitHubAuthError:
         raise
     except Exception as e:
-        console.print(
-            f"[yellow]github_branch_fetch_failed user={user_id} team={team_id} repo={owner}/{repo} "
-            f"error={e}[/yellow]"
+        logger.warning(
+            "slack_github_branch_fetch_failed user=%s team=%s repo=%s/%s error=%s",
+            user_id,
+            team_id,
+            owner,
+            repo,
+            e,
+            exc_info=True,
         )
         branches = []
 
@@ -2031,9 +2054,14 @@ def _fetch_default_branch_for_repo(
     except GitHubAuthError:
         raise
     except Exception as e:
-        console.print(
-            f"[yellow]github_default_branch_fetch_failed user={user_id} team={team_id} repo={owner}/{repo} "
-            f"error={e}[/yellow]"
+        logger.warning(
+            "slack_github_default_branch_fetch_failed user=%s team=%s repo=%s/%s error=%s",
+            user_id,
+            team_id,
+            owner,
+            repo,
+            e,
+            exc_info=True,
         )
         default_branch = ""
 
@@ -2141,9 +2169,12 @@ def _repo_options_for_slack(
             team_id=team_id,
         )
     if not repos and settings.github_user_oauth_enabled() and not has_user_token:
-        console.print(
-            f"[yellow]slack_repo_options_empty user={user_id} team={team_id} "
-            f"has_token=false has_saved_connection={str(has_saved_connection).lower()}[/yellow]"
+        logger.warning(
+            "slack_repo_options_empty user=%s team=%s has_token=%s has_saved_connection=%s",
+            user_id,
+            team_id,
+            False,
+            has_saved_connection,
         )
         if has_saved_connection:
             options.append(_slack_option(text="Reconnect GitHub (refresh token)", value=REPO_OPTION_CONNECT))
@@ -2153,9 +2184,12 @@ def _repo_options_for_slack(
             options.append(_slack_option(text="Connect GitHub to load repos", value=REPO_OPTION_CONNECT))
         return _dedupe_options(options)[:100]
     if not repos and settings.github_user_oauth_enabled() and has_user_token:
-        console.print(
-            f"[yellow]slack_repo_options_empty user={user_id} team={team_id} "
-            "has_token=true has_saved_connection=true[/yellow]"
+        logger.warning(
+            "slack_repo_options_empty user=%s team=%s has_token=%s has_saved_connection=%s",
+            user_id,
+            team_id,
+            True,
+            True,
         )
         options.append(_slack_option(text="No repos returned - type org/repo", value=REPO_OPTION_NEW))
         return _dedupe_options(options)[:100]
@@ -3477,7 +3511,13 @@ def _process_session_message(
             return
 
     # ---- Determine flow: model vs hardcoded ----
-    print(f"[PRFACTORY DIAG] _process_session_message: flow={session.answers.get('_flow')}, field={_next_field(session)}, HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, openrouter={_openrouter_enabled(settings)}", flush=True)
+    logger.debug(
+        "slack_process_session_message flow=%s field=%s has_intake_router=%s openrouter_enabled=%s",
+        session.answers.get("_flow"),
+        _next_field(session),
+        HAS_INTAKE_ROUTER,
+        _openrouter_enabled(settings),
+    )
     session_flow = str(session.answers.get("_flow") or "").strip()
     _try_model = False
     if session_flow == "model":
@@ -3541,8 +3581,14 @@ def _process_session_message(
                 getattr(action, "action", ""),
             )
         except Exception:
-            import traceback as _tb
-            print(f"[PRFACTORY DIAG] Model reply FAILED:\n{_tb.format_exc()}", flush=True)
+            logger.debug(
+                "slack_model_reply_failed_trace team=%s channel=%s thread=%s user=%s",
+                team_id,
+                channel_id,
+                thread_ts,
+                user_id,
+                exc_info=True,
+            )
             logger.error(
                 "slack_model_intake_failed team=%s channel=%s thread=%s user=%s",
                 team_id,
@@ -3580,7 +3626,12 @@ def _start_create_intake(
     user_id: str,
     seed_prompt: str,
 ) -> None:
-    print(f"[PRFACTORY DIAG] _start_create_intake called. HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, openrouter_enabled={_openrouter_enabled(settings)}, seed_prompt={repr((seed_prompt or '')[:50])}", flush=True)
+    logger.debug(
+        "slack_start_create_intake has_intake_router=%s openrouter_enabled=%s seed_prompt_preview=%s",
+        HAS_INTAKE_ROUTER,
+        _openrouter_enabled(settings),
+        repr((seed_prompt or "")[:50]),
+    )
     msg = client.chat_postMessage(
         channel=channel_id,
         text=f"Got it - feature request intake started by <@{user_id}>. Reply in this thread.",
@@ -3627,7 +3678,13 @@ def _start_create_intake(
             )
             thinking_ts = str(thinking_msg.get("ts") or "").strip()
             try:
-                print(f"[PRFACTORY DIAG] About to call _classify_intake_message_sync with seed prompt", flush=True)
+                logger.debug(
+                    "slack_seed_prompt_classify_begin team=%s channel=%s thread=%s user=%s",
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    user_id,
+                )
                 action = _classify_intake_message_sync(
                     message=normalized_seed_prompt,
                     conversation_history=[],
@@ -3654,8 +3711,14 @@ def _start_create_intake(
                 # Model returned an unrecognized action — fall through to
                 # open-ended greeting below.
             except Exception:
-                import traceback as _tb
-                print(f"[PRFACTORY DIAG] Model startup FAILED:\n{_tb.format_exc()}", flush=True)
+                logger.debug(
+                    "slack_model_startup_failed_trace team=%s channel=%s thread=%s user=%s",
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    user_id,
+                    exc_info=True,
+                )
                 # Remove thinking indicator on failure too
                 if thinking_ts:
                     try:
@@ -4358,9 +4421,13 @@ def _finalize_create_session(client: Any, settings: Any, session: IntakeSession)
             blocks=blocks,
         )
     except Exception as e:  # noqa: BLE001
-        console.print(
-            f"[yellow]slack_feature_message_update_failed feature={feature.get('id')} "
-            f"channel={session.channel_id} ts={session.message_ts} error={e}[/yellow]"
+        logger.warning(
+            "slack_feature_message_update_failed feature=%s channel=%s ts=%s error=%s",
+            feature.get("id"),
+            session.channel_id,
+            session.message_ts,
+            e,
+            exc_info=True,
         )
 
     _post_thread_message_with_optional_model_context(
@@ -5218,7 +5285,7 @@ def _socket_mode_handler_cls():
 def _start_socket_mode_handler(settings: Any) -> None:
     handler_cls = _socket_mode_handler_cls()
     app = create_slack_bolt_app(settings)
-    console.print("[green]Starting Slack Socket Mode handler...[/green]")
+    module_logger.info("slack_socket_mode_handler_starting")
     handler_cls(app, settings.slack_app_token).start()
 
 
@@ -5226,27 +5293,23 @@ def main() -> None:
     settings = get_settings()
 
     if not settings.enable_slack_bot:
-        console.print("[yellow]Slack bot is disabled (ENABLE_SLACK_BOT=false). Sleeping...[/yellow]")
+        module_logger.warning("slackbot_disabled enable_slack_bot=%s", settings.enable_slack_bot)
         while True:
             time.sleep(3600)
 
     if settings.slack_mode_normalized() != "socket":
         module_logger.warning(
-            "slackbot container started but SLACK_MODE=%s (not 'socket'). "
-            "Set SLACK_MODE=socket in .env or use the API's HTTP Slack handler. "
-            "Exiting instead of sleeping forever.",
+            "slackbot_socket_mode_required configured_mode=%s",
             settings.slack_mode,
-        )
-        console.print(
-            "[yellow]Slack bot process only runs in socket mode; set SLACK_MODE=socket or run HTTP mode in FastAPI.[/yellow]"
         )
         sys.exit(0)
 
     if not settings.slack_bot_token or not settings.slack_app_token:
         module_logger.error(
-            "slackbot socket mode cannot start because SLACK_BOT_TOKEN or SLACK_APP_TOKEN is missing"
+            "slackbot_socket_mode_missing_tokens has_bot_token=%s has_app_token=%s",
+            bool(settings.slack_bot_token),
+            bool(settings.slack_app_token),
         )
-        console.print("[red]Missing SLACK_BOT_TOKEN or SLACK_APP_TOKEN. Exiting.[/red]")
         sys.exit(1)
 
     _start_socket_mode_handler(settings)

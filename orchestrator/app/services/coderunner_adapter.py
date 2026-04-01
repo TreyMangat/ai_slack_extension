@@ -13,8 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rich.console import Console
-
 from app.config import Settings, get_settings
 from app.services.github_auth import get_github_token_provider
 from app.services.github_adapter import GitHubAdapter
@@ -23,8 +21,6 @@ from app.services.llm_provider import LLMProvider, LLMProviderError
 from app.services.pr_description import build_standard_pr_body
 from app.services.prompt_optimizer import build_optimized_prompt
 
-
-console = Console()
 logger = logging.getLogger("feature_factory.coderunner_adapter")
 STABLE_BASE_BRANCH_CANDIDATES = ("main", "master", "develop", "dev", "trunk")
 
@@ -66,8 +62,11 @@ class MockCodeRunnerAdapter(CodeRunnerAdapter):
         fake_pr = f"https://example.local/github/pull/{tracking_ref}"
         fake_preview = f"http://localhost:8000/preview/{tracking_ref}"
         mode = (build_context or {}).get("implementation_mode", "new_feature")
-        console.print(
-            f"[bold cyan][MOCK CodeRunner][/bold cyan] kickoff {tracking_ref} mode={mode} -> PR {fake_pr}"
+        logger.info(
+            "mock_coderunner_kickoff tracking_ref=%s mode=%s pr_url=%s",
+            tracking_ref,
+            mode,
+            fake_pr,
         )
         return CodeRunResult(
             github_pr_url=fake_pr,
@@ -1026,7 +1025,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
 
         provider = str((openclaw_meta.get("agentMeta") or {}).get("provider") or "openai-codex")
         model = str((openclaw_meta.get("agentMeta") or {}).get("model") or settings.opencode_model)
-        console.print(f"[green]Local OpenClaw runner opened PR: {pr_url}[/green]")
+        logger.info("coderunner_local_openclaw_pr_opened pr_url=%s", pr_url)
         return CodeRunResult(
             github_pr_url=pr_url,
             preview_url="",
@@ -1216,7 +1215,7 @@ class NativeLLMCodeRunnerAdapter(CodeRunnerAdapter):
             head=branch_name,
             base=pr_base,
         )
-        console.print(f"[green]Native LLM runner opened PR: {pr_url}[/green]")
+        logger.info("coderunner_native_llm_pr_opened pr_url=%s", pr_url)
         return CodeRunResult(
             github_pr_url=pr_url,
             preview_url="",

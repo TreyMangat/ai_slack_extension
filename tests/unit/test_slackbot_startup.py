@@ -28,7 +28,6 @@ def test_slackbot_exits_on_wrong_mode(monkeypatch, caplog) -> None:
     settings = _settings(slack_mode="http")
 
     monkeypatch.setattr(slackbot_mod, "get_settings", lambda: settings)
-    monkeypatch.setattr(slackbot_mod.console, "print", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         slackbot_mod.time,
         "sleep",
@@ -40,14 +39,13 @@ def test_slackbot_exits_on_wrong_mode(monkeypatch, caplog) -> None:
             slackbot_mod.main()
 
     assert excinfo.value.code == 0
-    assert "not 'socket'" in caplog.text
+    assert "slackbot_socket_mode_required" in caplog.text
 
 
 def test_slackbot_exits_on_missing_token(monkeypatch, caplog) -> None:
     settings = _settings(slack_bot_token="", slack_app_token="")
 
     monkeypatch.setattr(slackbot_mod, "get_settings", lambda: settings)
-    monkeypatch.setattr(slackbot_mod.console, "print", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         slackbot_mod.time,
         "sleep",
@@ -59,7 +57,7 @@ def test_slackbot_exits_on_missing_token(monkeypatch, caplog) -> None:
             slackbot_mod.main()
 
     assert excinfo.value.code == 1
-    assert "SLACK_BOT_TOKEN or SLACK_APP_TOKEN is missing" in caplog.text
+    assert "slackbot_socket_mode_missing_tokens" in caplog.text
 
 
 def test_slackbot_starts_on_correct_config(monkeypatch) -> None:
@@ -76,7 +74,6 @@ def test_slackbot_starts_on_correct_config(monkeypatch) -> None:
             observed["started"] = True
 
     monkeypatch.setattr(slackbot_mod, "get_settings", lambda: settings)
-    monkeypatch.setattr(slackbot_mod.console, "print", lambda *args, **kwargs: None)
     monkeypatch.setattr(slackbot_mod, "create_slack_bolt_app", lambda cfg: sentinel_app)
     monkeypatch.setattr(slackbot_mod, "_socket_mode_handler_cls", lambda: DummySocketModeHandler)
 
