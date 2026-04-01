@@ -272,7 +272,11 @@ def update_from_ui(
 
 
 @router.get("/preview/{preview_id}", response_class=HTMLResponse)
-def preview_page(preview_id: str, request: Request):
+def preview_page(
+    preview_id: str,
+    request: Request,
+    user: AuthenticatedUser = Depends(require_authenticated_user),
+):
     return templates.TemplateResponse(
         "preview.html",
         {

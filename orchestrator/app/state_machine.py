@@ -1,23 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 
 
-# States
-NEW = "NEW"
-NEEDS_INFO = "NEEDS_INFO"
-READY_FOR_BUILD = "READY_FOR_BUILD"
-BUILDING = "BUILDING"
-PR_OPENED = "PR_OPENED"
-PREVIEW_READY = "PREVIEW_READY"
-PRODUCT_APPROVED = "PRODUCT_APPROVED"
-READY_TO_MERGE = "READY_TO_MERGE"
-MERGED = "MERGED"
+class FeatureStatus(StrEnum):
+    NEW = "NEW"
+    NEEDS_INFO = "NEEDS_INFO"
+    READY_FOR_BUILD = "READY_FOR_BUILD"
+    BUILDING = "BUILDING"
+    PR_OPENED = "PR_OPENED"
+    PREVIEW_READY = "PREVIEW_READY"
+    PRODUCT_APPROVED = "PRODUCT_APPROVED"
+    READY_TO_MERGE = "READY_TO_MERGE"
+    MERGED = "MERGED"
+    FAILED_SPEC = "FAILED_SPEC"
+    FAILED_BUILD = "FAILED_BUILD"
+    FAILED_PREVIEW = "FAILED_PREVIEW"
+    NEEDS_HUMAN = "NEEDS_HUMAN"
 
-FAILED_SPEC = "FAILED_SPEC"
-FAILED_BUILD = "FAILED_BUILD"
-FAILED_PREVIEW = "FAILED_PREVIEW"
-NEEDS_HUMAN = "NEEDS_HUMAN"
+
+# Backward-compatible aliases
+NEW = FeatureStatus.NEW
+NEEDS_INFO = FeatureStatus.NEEDS_INFO
+READY_FOR_BUILD = FeatureStatus.READY_FOR_BUILD
+BUILDING = FeatureStatus.BUILDING
+PR_OPENED = FeatureStatus.PR_OPENED
+PREVIEW_READY = FeatureStatus.PREVIEW_READY
+PRODUCT_APPROVED = FeatureStatus.PRODUCT_APPROVED
+READY_TO_MERGE = FeatureStatus.READY_TO_MERGE
+MERGED = FeatureStatus.MERGED
+FAILED_SPEC = FeatureStatus.FAILED_SPEC
+FAILED_BUILD = FeatureStatus.FAILED_BUILD
+FAILED_PREVIEW = FeatureStatus.FAILED_PREVIEW
+NEEDS_HUMAN = FeatureStatus.NEEDS_HUMAN
 
 
 TERMINAL_STATES = {MERGED}
@@ -30,7 +46,7 @@ class ActionResult:
     message: str = ""
 
 
-def validate_transition(current: str, new: str) -> None:
+def validate_transition(current: str | FeatureStatus, new: str | FeatureStatus) -> None:
     allowed = {
         NEW: {NEEDS_INFO, READY_FOR_BUILD, FAILED_SPEC},
         NEEDS_INFO: {READY_FOR_BUILD, FAILED_SPEC},
