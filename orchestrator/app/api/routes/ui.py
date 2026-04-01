@@ -162,7 +162,13 @@ def build_from_ui(
 
     q = get_queue()
     try:
-        job = q.enqueue(kickoff_build_job, feature.id)
+        job = q.enqueue(
+            kickoff_build_job,
+            feature.id,
+            job_timeout=1800,
+            result_ttl=86400,
+            failure_ttl=604800,
+        )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=503, detail=f"Failed to enqueue build: {e}")
