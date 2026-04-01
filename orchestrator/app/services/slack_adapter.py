@@ -6,6 +6,7 @@ from typing import Any
 
 from app.config import get_settings
 from app.services.slack_oauth import resolve_slack_bot_token
+from app.services.slack_retry import slack_retry
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,36 @@ class SlackAdapter:
         channel: str,
         text: str,
         blocks: list[dict] | None = None,
+        team_id: str = "",
+    ) -> None:
+        raise NotImplementedError
+
+    def update_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        team_id: str = "",
+    ) -> None:
+        raise NotImplementedError
+
+    def delete_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        team_id: str = "",
+    ) -> None:
+        raise NotImplementedError
+
+    def add_reaction(
+        self,
+        *,
+        channel: str,
+        timestamp: str,
+        name: str,
         team_id: str = "",
     ) -> None:
         raise NotImplementedError
@@ -58,6 +89,36 @@ class MockSlackAdapter(SlackAdapter):
         logger.info("mock_slack_channel_post channel=%s text=%s", channel, text)
         if blocks:
             logger.debug("mock_slack_channel_blocks channel=%s blocks=%s", channel, json.dumps(blocks, indent=2))
+
+    def update_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        team_id: str = "",
+    ) -> None:
+        logger.info("mock_slack_update channel=%s ts=%s text=%s", channel, ts, text)
+
+    def delete_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        team_id: str = "",
+    ) -> None:
+        logger.info("mock_slack_delete channel=%s ts=%s", channel, ts)
+
+    def add_reaction(
+        self,
+        *,
+        channel: str,
+        timestamp: str,
+        name: str,
+        team_id: str = "",
+    ) -> None:
+        logger.info("mock_slack_reaction channel=%s timestamp=%s name=%s", channel, timestamp, name)
 
 
 class RealSlackAdapter(SlackAdapter):
@@ -107,7 +168,10 @@ class RealSlackAdapter(SlackAdapter):
             return
         try:
             client = self._resolve_client(team_id=team_id)
-            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
+            slack_retry(
+                client.chat_postMessage,
+                channel=channel, thread_ts=thread_ts, text=text, blocks=blocks,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "slack_thread_post_failed team=%s channel=%s error=%s",
@@ -130,12 +194,93 @@ class RealSlackAdapter(SlackAdapter):
             return
         try:
             client = self._resolve_client(team_id=team_id)
-            client.chat_postMessage(channel=channel, text=text, blocks=blocks)
+            slack_retry(
+                client.chat_postMessage,
+                channel=channel, text=text, blocks=blocks,
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "slack_channel_post_failed team=%s channel=%s error=%s",
                 team_id,
                 channel,
+                e,
+                exc_info=True,
+            )
+
+    def update_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        text: str,
+        blocks: list[dict] | None = None,
+        team_id: str = "",
+    ) -> None:
+        if not self._allowed(channel):
+            logger.warning("slack_update_blocked_by_allowlist channel=%s", channel)
+            return
+        try:
+            client = self._resolve_client(team_id=team_id)
+            slack_retry(
+                client.chat_update,
+                channel=channel, ts=ts, text=text, blocks=blocks,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "slack_update_failed team=%s channel=%s ts=%s error=%s",
+                team_id,
+                channel,
+                ts,
+                e,
+                exc_info=True,
+            )
+
+    def delete_message(
+        self,
+        *,
+        channel: str,
+        ts: str,
+        team_id: str = "",
+    ) -> None:
+        if not self._allowed(channel):
+            logger.warning("slack_delete_blocked_by_allowlist channel=%s", channel)
+            return
+        try:
+            client = self._resolve_client(team_id=team_id)
+            slack_retry(
+                client.chat_delete,
+                channel=channel, ts=ts,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "slack_delete_failed team=%s channel=%s ts=%s error=%s",
+                team_id,
+                channel,
+                ts,
+                e,
+                exc_info=True,
+            )
+
+    def add_reaction(
+        self,
+        *,
+        channel: str,
+        timestamp: str,
+        name: str,
+        team_id: str = "",
+    ) -> None:
+        try:
+            client = self._resolve_client(team_id=team_id)
+            slack_retry(
+                client.reactions_add,
+                channel=channel, timestamp=timestamp, name=name,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "slack_reaction_failed team=%s channel=%s name=%s error=%s",
+                team_id,
+                channel,
+                name,
                 e,
                 exc_info=True,
             )
