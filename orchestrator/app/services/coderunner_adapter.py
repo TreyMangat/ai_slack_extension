@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import subprocess
@@ -24,6 +25,7 @@ from app.services.prompt_optimizer import build_optimized_prompt
 
 
 console = Console()
+logger = logging.getLogger("feature_factory.coderunner_adapter")
 STABLE_BASE_BRANCH_CANDIDATES = ("main", "master", "develop", "dev", "trunk")
 
 
@@ -520,7 +522,7 @@ def _apply_patch(repo_path: Path, patch_text: str) -> None:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
-            pass
+            logger.exception("coderunner_temp_patch_cleanup_failed")
 
 
 def _sanitize_agent_id(raw: str) -> str:
@@ -809,7 +811,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
                         timeout_seconds=60,
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.exception("coderunner_openclaw_stale_agent_cleanup_failed")
 
                 _run_openclaw_command(
                     [
@@ -913,7 +915,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
                             timeout_seconds=60,
                         )
                     except Exception:  # noqa: BLE001
-                        pass
+                        logger.exception("coderunner_openclaw_temp_agent_cleanup_failed")
 
         has_repo_changes, status_text, current_head = _repo_has_changes(
             repo_path=target_path,
@@ -975,7 +977,7 @@ class RealOpenCodeRunnerAdapter(CodeRunnerAdapter):
                     timeout_seconds=30,
                 ).strip()
             except Exception:
-                pass
+                logger.exception("coderunner_last_commit_subject_fetch_failed")
 
         _run_command(
             [

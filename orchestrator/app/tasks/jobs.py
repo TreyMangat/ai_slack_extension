@@ -560,7 +560,7 @@ async def kickoff_build(feature_id: str) -> None:
                 validate_transition(feature.status, action_result.new_status)
                 feature.status = action_result.new_status
             except Exception:
-                pass
+                logger.exception("build_job_fail_transition_failed")
             feature.active_build_job_id = ""
             feature_run.status = "FAILED"
             feature_run.error_text = str(e)

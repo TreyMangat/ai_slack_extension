@@ -63,7 +63,8 @@ except ImportError:
 print(f"[PRFACTORY DIAG] slackbot.py loaded. HAS_INTAKE_ROUTER={HAS_INTAKE_ROUTER}, HAS_ESCALATE={HAS_ESCALATE}, HAS_GITHUB_CONNECTION_CHECKER={HAS_GITHUB_CONNECTION_CHECKER}", flush=True)
 
 console = Console()
-module_logger = logging.getLogger("feature_factory.slackbot")
+logger = logging.getLogger("feature_factory.slackbot")
+module_logger = logger
 
 
 class GitHubAuthError(RuntimeError):
@@ -1552,7 +1553,7 @@ def _fetch_branches_via_worktree_catalog(
                 timeout_seconds=timeout,
             )
         except Exception:
-            pass
+            logger.exception("slack_github_branch_catalog_set_head_failed")
     except Exception as e:
         console.print(
             f"[yellow]github_branch_catalog_sync_failed repo={owner}/{repo} error={e}[/yellow]"
@@ -1564,7 +1565,7 @@ def _fetch_branches_via_worktree_catalog(
         try:
             _run_git_command(cmd=["git", "worktree", "prune"], cwd=repo_path, timeout_seconds=10)
         except Exception:
-            pass
+            logger.exception("slack_github_branch_catalog_worktree_prune_failed")
         # Keep one detached selection worktree per repo so branch selection can use git-worktree state.
         if not selection_worktree.exists():
             try:
@@ -1581,7 +1582,7 @@ def _fetch_branches_via_worktree_catalog(
                     timeout_seconds=20,
                 )
             except Exception:
-                pass
+                logger.exception("slack_github_branch_catalog_worktree_seed_failed")
 
     raw_branches = _list_remote_branches_sorted_by_recent_commit(repo_path=repo_path)
     worktree_branches = _list_worktree_branches(repo_path=repo_path)
@@ -2076,7 +2077,7 @@ def _warm_repo_cache(settings: Any, *, user_id: str, team_id: str) -> None:
             timeout_seconds=8.0,
         )
     except Exception:
-        pass
+        logger.exception("slack_repo_cache_warm_failed")
 
 
 def _warm_branch_cache(settings: Any, *, user_id: str, team_id: str, repo_slug: str) -> None:
@@ -2096,7 +2097,7 @@ def _warm_branch_cache(settings: Any, *, user_id: str, team_id: str, repo_slug: 
             timeout_seconds=8.0,
         )
     except Exception:
-        pass
+        logger.exception("slack_branch_cache_warm_failed")
 
 
 def _repo_options_for_slack(
@@ -3558,7 +3559,7 @@ def _process_session_message(
                     text="I had trouble processing that. Let me ask you directly instead.",
                 )
             except Exception:  # noqa: BLE001
-                pass
+                logger.exception("slack_model_intake_fallback_notice_failed")
 
     logger.info(
         "slack_intake_path=hardcoded team=%s channel=%s thread=%s user=%s",
@@ -3641,7 +3642,7 @@ def _start_create_intake(
                         try:
                             client.chat_update(channel=channel_id, ts=thinking_ts, text=" ")
                         except Exception:
-                            pass
+                            logger.exception("slack_model_intake_thinking_indicator_update_failed")
                 if _handle_model_intake_action(
                     client,
                     settings,
@@ -3663,7 +3664,7 @@ def _start_create_intake(
                         try:
                             client.chat_update(channel=channel_id, ts=thinking_ts, text=" ")
                         except Exception:
-                            pass
+                            logger.exception("slack_model_intake_error_indicator_update_failed")
                 module_logger.error(
                     "slack_model_intake_startup_failed team=%s channel=%s thread=%s user=%s",
                     team_id, channel_id, thread_ts, user_id,
@@ -4768,7 +4769,7 @@ def create_slack_bolt_app(settings: Any):
                     blocks=_title_prompt_blocks(mode=next_mode, seed_prompt=seed_prompt),
                 )
             except Exception:
-                pass
+                logger.exception("slack_intake_controls_prompt_update_failed")
         if _next_field(session) in {"repo", "base_branch"}:
             _ask_next_question(client, session)
 
@@ -5133,7 +5134,7 @@ def create_slack_bolt_app(settings: Any):
                 if root_message_ts:
                     _update_feature_message(client, refreshed, channel_id=channel_id, message_ts=root_message_ts)
             except Exception:
-                pass
+                logger.exception("slack_build_feature_message_refresh_failed")
         else:
             install_url = str((payload or {}).get("install_url") or "").strip()
             _post_build_retry_message(
