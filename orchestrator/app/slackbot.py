@@ -138,6 +138,11 @@ BRANCH_WORKTREE_PATH_NAME = "selection"
 CALLBACK_STALE_ALERTS_DISABLED_EVENT = "callback_stale_alerts_disabled"
 OPENROUTER_MINI_MODEL_DEFAULT = "qwen/qwen3.5-9b"
 OPENROUTER_FRONTIER_MODEL_DEFAULT = "anthropic/claude-opus-4-6"
+AFFIRMATION_PHRASES = {
+    "yes", "yeah", "yep", "yup", "correct", "right", "that's right",
+    "thats right", "that one", "the right one", "yes thats right",
+    "yes that's right", "ya", "sure", "ok", "okay", "confirmed",
+}
 
 
 @dataclass
@@ -2452,6 +2457,8 @@ def _show_repo_dropdown_message(
         user_skill=normalized_skill,
         model_name=model_name,
     )
+    if suggested:
+        session.answers["_suggested_repo"] = str(suggested).strip()
     _store_session(session)
     _post_model_next_question(
         client,
@@ -2528,6 +2535,29 @@ def _show_branch_dropdown_message(
         model_name=model_name,
         blocks=blocks,
     )
+
+
+def _advance_to_next_field(
+    client: Any,
+    settings: Any,
+    session: IntakeSession,
+) -> None:
+    """After a field is confirmed, move to the next missing field or finalize."""
+    next_field = _peek_next_field(session)
+    if next_field == "base_branch":
+        _show_branch_dropdown_message(
+            client,
+            settings,
+            session,
+            question="Which branch should we build from?",
+            suggested=None,
+            user_skill=_stored_model_user_skill(session),
+            model_name=_stored_model_name(session),
+        )
+    elif next_field:
+        _ask_next_question(client, session)
+    else:
+        _finalize_session(client, settings, session)
 
 
 def _truncate_inline_text(text: str, *, limit: int = 160) -> str:
@@ -3458,6 +3488,19 @@ def _process_session_message(
         _try_model = HAS_INTAKE_ROUTER and _openrouter_enabled(settings)
 
     if _try_model:
+        # ---- Affirmation shortcut: accept a previously suggested repo ----
+        normalized_text = text.strip().lower().rstrip(".!,")
+        if normalized_text in AFFIRMATION_PHRASES:
+            suggested_repo = session.answers.get("_suggested_repo")
+            if suggested_repo and not session.answers.get("repo"):
+                session.answers["repo"] = suggested_repo
+                session.asked_fields.add("repo")
+                _drop_field_from_queue(session, "repo")
+                session.answers.pop("_suggested_repo", None)
+                _store_session(session)
+                _advance_to_next_field(client, settings, session)
+                return
+
         logger.info(
             "slack_intake_path=model_assisted team=%s channel=%s thread=%s user=%s",
             team_id,
@@ -3576,6 +3619,12 @@ def _start_create_intake(
         if normalized_seed_prompt:
             # User typed "/prfactory I want to add dark mode..." — run the
             # model immediately with the seed prompt as the first message.
+            thinking_msg = client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=":hourglass_flowing_sand: Analyzing your request...",
+            )
+            thinking_ts = str(thinking_msg.get("ts") or "").strip()
             try:
                 print(f"[PRFACTORY DIAG] About to call _classify_intake_message_sync with seed prompt", flush=True)
                 action = _classify_intake_message_sync(
@@ -3584,6 +3633,15 @@ def _start_create_intake(
                     current_fields={},
                     slack_user_id=user_id,
                 )
+                # Remove thinking indicator
+                if thinking_ts:
+                    try:
+                        client.chat_delete(channel=channel_id, ts=thinking_ts)
+                    except Exception:
+                        try:
+                            client.chat_update(channel=channel_id, ts=thinking_ts, text=" ")
+                        except Exception:
+                            pass
                 if _handle_model_intake_action(
                     client,
                     settings,
@@ -3597,6 +3655,15 @@ def _start_create_intake(
             except Exception:
                 import traceback as _tb
                 print(f"[PRFACTORY DIAG] Model startup FAILED:\n{_tb.format_exc()}", flush=True)
+                # Remove thinking indicator on failure too
+                if thinking_ts:
+                    try:
+                        client.chat_delete(channel=channel_id, ts=thinking_ts)
+                    except Exception:
+                        try:
+                            client.chat_update(channel=channel_id, ts=thinking_ts, text=" ")
+                        except Exception:
+                            pass
                 module_logger.error(
                     "slack_model_intake_startup_failed team=%s channel=%s thread=%s user=%s",
                     team_id, channel_id, thread_ts, user_id,
@@ -4433,7 +4500,10 @@ def create_slack_bolt_app(settings: Any):
     from slack_bolt import App
 
     oauth_runtime = get_slack_oauth_runtime()
-    app_kwargs: dict[str, Any] = {"signing_secret": settings.slack_signing_secret or ""}
+    app_kwargs: dict[str, Any] = {
+        "signing_secret": settings.slack_signing_secret or "",
+        "process_before_response": True,
+    }
     if oauth_runtime is not None:
         app_kwargs["oauth_settings"] = oauth_runtime.oauth_settings
         app_kwargs["installation_store"] = oauth_runtime.installation_store
@@ -4729,6 +4799,8 @@ def create_slack_bolt_app(settings: Any):
         if not _repo_selection_mutable(session):
             client.chat_postEphemeral(channel=channel_id, user=user_id, text="Repo selection is locked after build starts.")
             return
+        session.answers.pop("_suggested_repo", None)
+        _store_session(session)
         _apply_repo_selection(
             client,
             settings,
