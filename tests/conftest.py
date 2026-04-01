@@ -1,18 +1,20 @@
 """Shared test fixtures for the PRFactory test suite.
 
-Provides mock settings, OpenRouter response factories, and an in-memory
-SQLAlchemy session with all tables created (SQLite-compatible).
+Provides environment-backed settings, OpenRouter response factories,
+lightweight fake objects, and an in-memory SQLAlchemy session with all
+tables created (SQLite-compatible).
 """
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+import uuid
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
-from app.config import Settings, get_settings
+from app.config import get_settings
 from app.models import Base
 
 
@@ -55,11 +57,23 @@ def _clear_settings_cache():
 def mock_settings(monkeypatch):
     """Settings with OpenRouter configured, mock mode, auth disabled."""
     env = {
+        "APP_ENV": "test",
+        "BASE_URL": "http://localhost:8000",
+        "ORCHESTRATOR_INTERNAL_URL": "http://api:8000",
         "DATABASE_URL": "sqlite:///:memory:",
         "REDIS_URL": "redis://localhost:6379",
         "SECRET_KEY": "test-secret",
         "MOCK_MODE": "true",
         "AUTH_MODE": "disabled",
+        "ENABLE_SLACK_BOT": "false",
+        "SLACK_MODE": "socket",
+        "SLACK_BOT_TOKEN": "",
+        "SLACK_APP_TOKEN": "",
+        "SLACK_SIGNING_SECRET": "",
+        "GITHUB_ENABLED": "false",
+        "API_AUTH_TOKEN": "test-token",
+        "DISABLE_AUTOMERGE": "true",
+        "CODERUNNER_MODE": "opencode",
         "OPENROUTER_API_KEY": "sk-or-test-key",
         "OPENROUTER_MINI_MODEL": "qwen/qwen3.5-9b",
         "OPENROUTER_FRONTIER_MODEL": "anthropic/claude-opus-4-6",
@@ -93,3 +107,39 @@ def mock_db_session():
     session = _Session()
     yield session
     session.close()
+
+
+@pytest.fixture
+def fake_feature():
+    """Return a minimal FeatureRequest-like dict."""
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": str(uuid.uuid4()),
+        "status": "NEW",
+        "title": "Test feature",
+        "created_at": now,
+        "updated_at": now,
+        "requester_user_id": "U_TEST",
+        "spec": {
+            "title": "Test feature",
+            "problem": "Test problem description",
+            "business_justification": "Test business value",
+            "acceptance_criteria": ["It works"],
+        },
+        "slack_channel_id": "C_TEST",
+        "slack_thread_ts": "1234567890.123456",
+        "github_issue_url": "",
+        "github_pr_url": "",
+        "preview_url": "",
+    }
+
+
+@pytest.fixture
+def fake_db():
+    """Return a mock DB session."""
+    db = MagicMock()
+    db.add = MagicMock()
+    db.flush = MagicMock()
+    db.commit = MagicMock()
+    db.rollback = MagicMock()
+    return db
