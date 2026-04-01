@@ -101,6 +101,104 @@ def feature_reference(*, feature_id: str, title: str) -> str:
     return f"{slug}-{str(feature_id or '')[:8]}"
 
 
+def _status_emoji(status: str) -> str:
+    return {
+        "NEW": ":new:",
+        "NEEDS_INFO": ":question:",
+        "READY_FOR_BUILD": ":white_check_mark:",
+        "BUILDING": ":hammer_and_wrench:",
+        "PR_OPENED": ":git-pull-request:",
+        "PREVIEW_READY": ":eyes:",
+        "PRODUCT_APPROVED": ":heavy_check_mark:",
+        "READY_TO_MERGE": ":rocket:",
+        "MERGED": ":tada:",
+        "FAILED_SPEC": ":x:",
+        "FAILED_BUILD": ":x:",
+        "FAILED_PREVIEW": ":warning:",
+        "NEEDS_HUMAN": ":bust_in_silhouette:",
+    }.get(str(status or "").strip().upper(), ":grey_question:")
+
+
+def build_app_home_blocks(
+    *,
+    app_name: str,
+    user_id: str,
+    recent_features: list[dict[str, Any]],
+    github_status: str,
+    slash_command: str = "/prfactory",
+    new_request_url: str = "",
+) -> list[dict[str, Any]]:
+    """Build Block Kit blocks for the Slack App Home tab."""
+
+    del user_id
+
+    intro_block: dict[str, Any] = {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": f"Run `{slash_command}` in any channel to start a new feature request.",
+        },
+    }
+    if new_request_url:
+        intro_block["accessory"] = {
+            "type": "button",
+            "text": {"type": "plain_text", "text": "New request"},
+            "url": new_request_url,
+        }
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{app_name}"},
+        },
+        intro_block,
+        {"type": "divider"},
+    ]
+
+    if recent_features:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "*Your recent requests*"},
+            }
+        )
+        for feature in recent_features[:5]:
+            status = str(feature.get("status") or "UNKNOWN").strip() or "UNKNOWN"
+            title = str(feature.get("title") or "(untitled)").strip() or "(untitled)"
+            feature_id = str(feature.get("id") or "").strip()
+            emoji = _status_emoji(status)
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"{emoji} *{title}*\n`{feature_id}` - {status}",
+                    },
+                }
+            )
+    else:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "_No feature requests yet. Run the slash command to get started!_",
+                },
+            }
+        )
+
+    blocks.append({"type": "divider"})
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"GitHub: {github_status}"},
+            ],
+        }
+    )
+    return blocks
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:

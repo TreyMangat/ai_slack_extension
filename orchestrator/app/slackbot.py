@@ -60,6 +60,8 @@ from app.services.block_builders import (
     REPO_OPTION_CONNECT,
     REPO_OPTION_NEW,
     REPO_OPTION_NONE,
+    _status_emoji,
+    build_app_home_blocks,
     dedupe_options,
     developer_mode_branch_blocks,
     developer_mode_repo_blocks,
@@ -1364,6 +1366,65 @@ def _fetch_feature(settings: Any, feature_id: str) -> dict[str, Any]:
     )
     r.raise_for_status()
     return r.json()
+
+
+def _fetch_user_recent_features(settings: Any, user_id: str) -> list[dict[str, Any]]:
+    """Fetch up to five recent feature requests for the Slack user."""
+
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id:
+        return []
+
+    try:
+        headers = _api_headers(settings, actor=normalized_user_id)
+        r = httpx.get(
+            f"{settings.orchestrator_internal_url}/api/feature-requests",
+            params={"limit": 5, "mine": True},
+            timeout=10,
+            headers=headers,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        if isinstance(payload, list):
+            return payload[:5]
+        if isinstance(payload, dict):
+            items = payload.get("items") or payload.get("features") or []
+            if isinstance(items, list):
+                return items[:5]
+    except Exception:
+        logger.exception("fetch_user_recent_features_failed user=%s", normalized_user_id)
+    return []
+
+
+def _handle_status_subcommand(body: dict[str, Any], client: Any, settings: Any) -> None:
+    user_id = str(body.get("user_id") or "").strip()
+    channel_id = str(body.get("channel_id") or "").strip()
+    if not user_id or not channel_id:
+        return
+
+    recent = _fetch_user_recent_features(settings, user_id)
+    if not recent:
+        client.chat_postEphemeral(
+            channel=channel_id,
+            user=user_id,
+            text="You don't have any feature requests yet.",
+        )
+        return
+
+    lines = ["*Your recent feature requests:*"]
+    for feature in recent[:5]:
+        status = str(feature.get("status") or "UNKNOWN").strip() or "UNKNOWN"
+        title = str(feature.get("title") or "(untitled)").strip() or "(untitled)"
+        feature_id = str(feature.get("id") or "").strip()
+        lines.append(
+            f"{_status_emoji(status)} *{title}* - `{status}` (id: `{feature_id}`)"
+        )
+
+    client.chat_postEphemeral(
+        channel=channel_id,
+        user=user_id,
+        text="\n".join(lines),
+    )
 
 
 def _update_feature_message(client: Any, feature: dict[str, Any], *, channel_id: str, message_ts: str) -> None:
@@ -3211,23 +3272,31 @@ def create_slack_bolt_app(settings: Any):
     def handle_app_home_opened(event, body, client, logger):
         user_id = str(event.get("user") or "").strip()
         team_id = str(body.get("team_id") or event.get("team") or "").strip()
-        if not _should_send_app_home_welcome(team_id=team_id, user_id=user_id):
+        tab = str(event.get("tab") or "").strip()
+        if tab != "home" or not user_id:
             return
 
         app_name = (settings.app_display_name or "PRFactory").strip() or "PRFactory"
-        github_help_line = _github_status_line_for_user(settings, user_id=user_id, team_id=team_id)
-        text = "\n".join(
-            [
-                f"Welcome to {app_name}.",
-                f"To start in a channel: invite me, then run `{PRIMARY_SLASH_COMMAND} <full context request>`.",
-                "I will capture that prompt and ask for a short title first.",
-                github_help_line,
-            ]
+        github_status = _github_status_line_for_user(settings, user_id=user_id, team_id=team_id)
+        recent_features = _fetch_user_recent_features(settings, user_id)
+        blocks = build_app_home_blocks(
+            app_name=app_name,
+            user_id=user_id,
+            recent_features=recent_features,
+            github_status=github_status,
+            slash_command=PRIMARY_SLASH_COMMAND,
+            new_request_url=settings.slack_app_redirect_url_resolved(),
         )
         try:
-            client.chat_postMessage(channel=user_id, text=text)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("slack_app_home_welcome_failed user=%s error=%s", user_id, e)
+            client.views_publish(
+                user_id=user_id,
+                view={
+                    "type": "home",
+                    "blocks": blocks,
+                },
+            )
+        except Exception:
+            logger.exception("app_home_publish_failed user=%s", user_id)
 
     def _handle_create_command(ack, body, client, logger) -> None:
         ack()
@@ -3245,6 +3314,10 @@ def create_slack_bolt_app(settings: Any):
 
         if allowed_users and user_id not in allowed_users:
             client.chat_postEphemeral(channel=channel_id, user=user_id, text="You are not allowlisted.")
+            return
+
+        if text.lower().startswith("status"):
+            _handle_status_subcommand(body, client, settings)
             return
 
         _ensure_bot_in_channel(client, channel_id, logger)
