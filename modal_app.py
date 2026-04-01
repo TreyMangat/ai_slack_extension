@@ -76,15 +76,14 @@ _shared_kwargs = {
 }
 
 
-@modal.concurrent(max_inputs=_api_concurrency)
 @app.function(
     **_shared_kwargs,
     env=_common_env,
-    min_containers=_api_min_containers,
+    min_containers=max(_api_min_containers, 1),
     max_containers=_api_max_containers,
     timeout=60 * 60 * 24,
-    keep_warm=1,
 )
+@modal.concurrent(max_inputs=_api_concurrency)
 @modal.asgi_app()
 def api():
     from app.main import app as fastapi_app
