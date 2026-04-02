@@ -91,8 +91,8 @@ class TestPromptIncludesExamples:
     def test_prompt_includes_response_format(self) -> None:
         prompt = build_intake_system_prompt()
         assert "RESPONSE FORMAT:" in prompt
-        assert "suggested_repo" in prompt
-        assert "suggested_branch" in prompt
+        assert '"fields"' in prompt
+        assert '"action"' in prompt
 
 
 class TestPromptOrgConventions:
@@ -114,15 +114,14 @@ class TestPromptOrgConventions:
 class TestPromptAssembly:
     def test_role_always_present(self) -> None:
         prompt = build_intake_system_prompt()
-        assert "ROLE:" in prompt
         assert "PRFactory" in prompt
+        assert "FIELDS TO COLLECT:" in prompt
 
-    def test_required_fields_always_present(self) -> None:
+    def test_field_definitions_always_present(self) -> None:
         prompt = build_intake_system_prompt()
-        assert "REQUIRED FIELDS" in prompt
-        assert "OPTIONAL FIELDS" in prompt
+        assert "problem:" in prompt
+        assert "repo:" in prompt
         assert "title:" in prompt
-        assert "acceptance_criteria:" in prompt
 
     def test_full_context_prompt_includes_all_sections(self) -> None:
         repos = [{"full_name": "org/app", "description": "Main app"}]
@@ -136,8 +135,7 @@ class TestPromptAssembly:
             user_history=history,
             org_conventions=conventions,
         )
-        assert "ROLE:" in prompt
-        assert "REQUIRED FIELDS" in prompt
+        assert "PRFactory" in prompt
         assert "SKILL DETECTION:" in prompt
         assert "AVAILABLE REPOS:" in prompt
         assert "AVAILABLE BRANCHES:" in prompt
@@ -147,10 +145,10 @@ class TestPromptAssembly:
         assert "RESPONSE FORMAT:" in prompt
         assert "EXAMPLES:" in prompt
 
-    def test_repo_hint_in_required_fields_when_repos_available(self) -> None:
+    def test_repo_hint_when_repos_available(self) -> None:
         repos = [{"full_name": "org/app"}]
         prompt = build_intake_system_prompt(available_repos=repos)
-        assert "Suggest from the repo catalog" in prompt
+        assert "Repo catalog" in prompt or "repo catalog" in prompt
 
 
 class TestPromptGitHubStatus:

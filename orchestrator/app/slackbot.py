@@ -1619,208 +1619,120 @@ def _handle_model_intake_action(
     tier: str = "mini",
 ) -> bool:
     action_name = str(getattr(action, "action", "") or "").strip().lower()
-    model_name = str(
-        getattr(action, "model", "")
-        or getattr(action, "model_name", "")
-        or getattr(action, "resolved_model", "")
-        or ""
-    ).strip()
     user_skill = normalize_user_skill(str(getattr(action, "user_skill", "technical") or "technical"))
-    target_field = normalize_router_field_name(
-        str(getattr(action, "field_name", "") or _next_field(session) or "").strip()
-    )
-    field_value = str(getattr(action, "field_value", "") or "").strip()
     next_question = str(getattr(action, "next_question", "") or "").strip()
     reasoning = str(getattr(action, "reasoning", "") or "").strip()
-    suggested_repo = str(
-        getattr(action, "suggested_repo", "")
-        or (field_value if target_field == "repo" else "")
-        or ""
-    ).strip()
-    suggested_branch = str(
-        getattr(action, "suggested_branch", "")
-        or (field_value if target_field == "base_branch" else "")
-        or ""
-    ).strip()
+    target_field = normalize_router_field_name(
+        str(getattr(action, "field_name", "") or "").strip()
+    )
+
+    # ---- Extract all fields the model found ----
+    extracted_fields: dict[str, Any] = dict(getattr(action, "fields", {}) or {})
+    if not extracted_fields:
+        # Backward compat: single field_name/field_value
+        fn = str(getattr(action, "field_name", "") or "").strip()
+        fv = str(getattr(action, "field_value", "") or "").strip()
+        if fn and fv:
+            extracted_fields = {fn: fv}
+
+    # Normalize field name aliases (description -> problem, branch -> base_branch)
+    alias_map = {"description": "problem", "branch": "base_branch"}
+    extracted_fields = {alias_map.get(k, k): v for k, v in extracted_fields.items()}
+
+    # Store every extracted field into session answers
+    stored_any = False
+    for field_name, field_value in extracted_fields.items():
+        if not field_name or str(field_name).startswith("_"):
+            continue
+        if isinstance(field_value, list):
+            if field_value:
+                session.answers[field_name] = field_value
+                stored_any = True
+        else:
+            value = str(field_value).strip() if field_value else ""
+            if value:
+                session.answers[field_name] = value
+                stored_any = True
+
+    if stored_any:
+        _store_session(session)
+
+    # ---- Handle special github actions ----
+    if action_name == "ask_field" and target_field in ("github_reauth", "github_connect"):
+        _post_github_connection_prompt(
+            client, settings, session,
+            user_id=str(event.get("user") or session.user_id or "").strip(),
+            team_id=str(event.get("team") or session.team_id or "").strip(),
+            mode="reauth" if target_field == "github_reauth" else "connect",
+        )
+        return True
+
+    # ---- Handle actions ----
+    if action_name == "confirm":
+        _finalize_session(client, settings, session)
+        return True
 
     if action_name == "ask_field":
-        if target_field == "github_reauth":
-            _post_github_connection_prompt(
-                client,
-                settings,
-                session,
-                user_id=str(event.get("user") or session.user_id or "").strip(),
-                team_id=str(event.get("team") or session.team_id or "").strip(),
-                mode="reauth",
-            )
-            return True
-        if target_field == "github_connect":
-            _post_github_connection_prompt(
-                client,
-                settings,
-                session,
-                user_id=str(event.get("user") or session.user_id or "").strip(),
-                team_id=str(event.get("team") or session.team_id or "").strip(),
-                mode="connect",
-            )
-            return True
-        if target_field == "repo":
-            # If repo is already collected, skip to next missing field
-            if str(session.answers.get("repo") or "").strip():
-                _drop_field_from_queue(session, "repo")
-                _store_session(session)
-                if _next_field(session):
-                    _ask_next_question(client, session)
-                    return True
+        # If the model asks for a field that's already collected, skip it
+        if target_field in ("repo", "base_branch") and str(session.answers.get(target_field) or "").strip():
+            if next_question:
+                client.chat_postMessage(
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts,
+                    text=next_question,
+                )
+                return True
+            # No question and field already set — check if we can finalize
+            if session.answers.get("problem") and session.answers.get("repo"):
                 _finalize_session(client, settings, session)
                 return True
-            # High-confidence model fill — capture directly, skip dropdown
-            confidence = float(getattr(action, "confidence", 0) or 0)
-            if field_value and confidence >= 0.8:
-                require_repo = session.mode == "create" and _repo_required_for_slack_intake(settings)
-                ok, note = _capture_field_answer(
-                    session,
-                    field="repo",
-                    event={"text": field_value, "files": []},
-                    require_repo=require_repo,
-                )
-                if ok:
-                    _drop_field_from_queue(session, "repo")
-                    _store_session(session)
-                    client.chat_postMessage(
-                        channel=session.channel_id,
-                        thread_ts=session.thread_ts,
-                        text=next_question or f"Using repo `{field_value}`.",
-                    )
-                    if _next_field(session):
-                        _ask_next_question(client, session)
-                    else:
-                        _finalize_session(client, settings, session)
-                    return True
-            _show_repo_dropdown_message(
-                client,
-                settings,
-                session,
-                question=next_question or "Which repository should this go in?",
-                suggested=suggested_repo or None,
-                user_skill=user_skill,
-                model_name=model_name,
-            )
             return True
-        if target_field == "base_branch":
-            # If branch is already collected, skip to next missing field
-            if str(session.answers.get("base_branch") or "").strip():
-                _drop_field_from_queue(session, "base_branch")
-                _store_session(session)
-                if _next_field(session):
-                    _ask_next_question(client, session)
-                    return True
-                _finalize_session(client, settings, session)
-                return True
-            # High-confidence model fill — capture directly, skip dropdown
-            confidence = float(getattr(action, "confidence", 0) or 0)
-            if field_value and confidence >= 0.8:
-                ok, note = _capture_field_answer(
-                    session,
-                    field="base_branch",
-                    event={"text": field_value, "files": []},
-                )
-                if ok:
-                    _drop_field_from_queue(session, "base_branch")
-                    _store_session(session)
-                    client.chat_postMessage(
-                        channel=session.channel_id,
-                        thread_ts=session.thread_ts,
-                        text=next_question or f"Using branch `{field_value}`.",
-                    )
-                    if _next_field(session):
-                        _ask_next_question(client, session)
-                    else:
-                        _finalize_session(client, settings, session)
-                    return True
-            _show_branch_dropdown_message(
-                client,
-                settings,
-                session,
-                question=next_question or "Which branch should we build from?",
-                suggested=suggested_branch or None,
-                user_skill=user_skill,
-                model_name=model_name,
-            )
-            return True
-        if target_field and field_value:
-            require_repo = target_field == "repo" and session.mode == "create" and _repo_required_for_slack_intake(settings)
-            ok, note = _capture_field_answer(
-                session,
-                field=target_field,
-                event={"text": field_value, "files": event.get("files") or []},
-                require_repo=require_repo,
-            )
-            if not ok:
-                client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=note)
-                _ask_next_question(client, session)
-                return True
-            _drop_field_from_queue(session, target_field)
-            _store_session(session)
-        if next_question:
-            _post_model_next_question(
-                client,
-                session=session,
-                settings=settings,
-                question=next_question,
-                user_skill=user_skill,
-                field_name=target_field,
-                tier=tier,
-                model_name=model_name,
-            )
-            return True
-        if _next_field(session):
-            _ask_next_question(client, session)
-            return True
-        _finalize_session(client, settings, session)
-        return True
 
-    if action_name == "confirm":
-        if target_field and field_value:
-            require_repo = target_field == "repo" and session.mode == "create" and _repo_required_for_slack_intake(settings)
-            ok, note = _capture_field_answer(
-                session,
-                field=target_field,
-                event={"text": field_value, "files": event.get("files") or []},
-                require_repo=require_repo,
+        if target_field == "repo" and not str(session.answers.get("repo") or "").strip():
+            _show_repo_dropdown_message(
+                client, settings, session,
+                question=next_question or "Which repository should this go in?",
+                suggested=extracted_fields.get("repo") or getattr(action, "suggested_repo", None),
+                user_skill=user_skill,
+                model_name="",
             )
-            if not ok:
-                client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=note)
-                _ask_next_question(client, session)
-                return True
-            _drop_field_from_queue(session, target_field)
-            _store_session(session)
-        _finalize_session(client, settings, session)
-        return True
+            return True
+        if target_field == "base_branch" and not str(session.answers.get("base_branch") or "").strip():
+            _show_branch_dropdown_message(
+                client, settings, session,
+                question=next_question or "Which branch should we build from?",
+                suggested=extracted_fields.get("base_branch") or getattr(action, "suggested_branch", None),
+                user_skill=user_skill,
+                model_name="",
+            )
+            return True
+        if next_question:
+            client.chat_postMessage(
+                channel=session.channel_id,
+                thread_ts=session.thread_ts,
+                text=next_question,
+            )
+            return True
+        # Model extracted fields but no question — check if we have enough
+        if session.answers.get("problem") and session.answers.get("repo"):
+            _finalize_session(client, settings, session)
+            return True
+        return False  # Fall through to hardcoded path
 
     if action_name == "clarify":
-        _post_model_next_question(
-            client,
-            session=session,
-            settings=settings,
-            question=next_question or "I need a little more detail before I can continue.",
-            user_skill=user_skill,
-            field_name=target_field,
-            tier=tier,
-            model_name=model_name,
+        client.chat_postMessage(
+            channel=session.channel_id,
+            thread_ts=session.thread_ts,
+            text=next_question or "Could you give me a bit more detail?",
         )
         return True
 
     if action_name == "cancel":
         _drop_session(session)
-        _post_thread_message_with_optional_model_context(
-            client,
-            channel_id=session.channel_id,
+        client.chat_postMessage(
+            channel=session.channel_id,
             thread_ts=session.thread_ts,
             text=f"Intake cancelled. Use `{PRIMARY_SLASH_COMMAND}` to start again.",
-            settings=settings,
-            tier=tier,
-            model_name=model_name,
         )
         return True
 
@@ -1834,13 +1746,13 @@ def _handle_model_intake_action(
             user_skill=user_skill,
             field_name=target_field,
             tier=tier,
-            model_name=model_name,
+            model_name="",
             blocks=[
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": ":rotating_light: *This request needs a deeper look.*\n" f"_{escalation_text}_",
+                        "text": f":rotating_light: *This request needs a deeper look.*\n_{escalation_text}_",
                     },
                 },
                 {

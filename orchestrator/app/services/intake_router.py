@@ -35,6 +35,8 @@ _CANCEL_KEYWORDS = frozenset({"cancel", "stop", "quit", "nevermind", "never mind
 
 class IntakeAction(BaseModel):
     action: Literal["ask_field", "confirm", "clarify", "cancel", "escalate"] = "clarify"
+    fields: dict[str, Any] = {}
+    # Legacy single-field (backward compat with older prompts/tests):
     field_name: Optional[str] = None
     field_value: Optional[str] = None
     next_question: Optional[str] = None

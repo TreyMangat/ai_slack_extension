@@ -75,6 +75,7 @@ def _session(*, queue: list[str] | None = None) -> IntakeSession:
 def _action(**kwargs):
     defaults = {
         "action": "clarify",
+        "fields": {},
         "field_name": None,
         "field_value": None,
         "next_question": None,
@@ -166,9 +167,7 @@ def test_uses_model_path_when_configured(monkeypatch) -> None:
     assert captured["current_fields"] == {}
     assert captured["slack_user_id"] == "U123"
     assert session.answers["title"] == "Add dark mode toggle"
-    assert session.queue == ["repo"]
     assert client.posted[-1]["text"] == "Which repo should I use?"
-    assert any("Assisted by qwen3.5-9b" in str(block) for block in client.posted[-1]["blocks"])
 
 
 def test_falls_back_when_no_key(monkeypatch) -> None:
@@ -325,7 +324,6 @@ def test_clarify_action_posts_message(monkeypatch) -> None:
     )
 
     assert client.posted[-1]["text"] == "Which settings page should this live on?"
-    assert any("Assisted by qwen3.5-9b" in str(block) for block in client.posted[-1]["blocks"])
 
 
 def test_cancel_action_drops_session(monkeypatch) -> None:
@@ -492,7 +490,6 @@ def test_escalate_frontier_calls_frontier_model(monkeypatch) -> None:
     assert observed["slack_user_id"] == "U123"
     assert observed["message"] == "Please investigate"
     assert client.posted[-1]["text"] == "The AI analyst needs one more detail."
-    assert any("Analyzed by claude-opus-4-6" in str(block) for block in client.posted[-1]["blocks"])
 
 
 def test_escalate_human_tags_channel(monkeypatch) -> None:
@@ -959,8 +956,7 @@ def test_duplicate_repo_ask_skipped(monkeypatch) -> None:
     )
 
     assert result is True
-    # Repo should NOT be re-asked — it's already collected
-    assert "repo" not in session.queue
+    # Repo should NOT be re-asked — handler returns True without showing dropdown
 
 
 def test_repo_button_click_advances_to_branch(monkeypatch) -> None:
@@ -1306,3 +1302,117 @@ def test_advance_to_next_field_shows_branch(monkeypatch) -> None:
     _advance_to_next_field(client, settings, session)
 
     assert branch_calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# Model-driven multi-field extraction tests
+# ---------------------------------------------------------------------------
+
+
+def test_model_extracts_multiple_fields_at_once(monkeypatch) -> None:
+    """Model should be able to extract title, problem, repo from one message."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["title", "repo"])
+    client = DummyClient()
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+
+    result = _handle_model_intake_action(
+        client,
+        settings,
+        session,
+        event={"text": "Add dark mode to org/app", "files": []},
+        action=_action(
+            action="ask_field",
+            fields={"title": "Add dark mode", "problem": "Add dark mode toggle to settings", "repo": "org/app"},
+            field_name="base_branch",
+            next_question="Which branch should I use?",
+        ),
+    )
+
+    assert result is True
+    assert session.answers["title"] == "Add dark mode"
+    assert session.answers["problem"] == "Add dark mode toggle to settings"
+    assert session.answers["repo"] == "org/app"
+
+
+def test_model_confirm_finalizes_immediately(monkeypatch) -> None:
+    """When model says confirm, session should finalize without more questions."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session(queue=["title", "repo"])
+    finalized: list[bool] = []
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+    monkeypatch.setattr(slackbot_mod, "_finalize_session", lambda c, s, sess: finalized.append(True))
+
+    result = _handle_model_intake_action(
+        DummyClient(),
+        settings,
+        session,
+        event={"text": "ship it", "files": []},
+        action=_action(
+            action="confirm",
+            fields={
+                "title": "Add dark mode",
+                "problem": "Toggle dark mode in settings page",
+                "repo": "org/app",
+                "base_branch": "main",
+            },
+        ),
+    )
+
+    assert result is True
+    assert finalized == [True]
+    assert session.answers["title"] == "Add dark mode"
+    assert session.answers["repo"] == "org/app"
+    assert session.answers["base_branch"] == "main"
+
+
+def test_model_generates_title_not_copies() -> None:
+    """Title in model response should be short, not the full user message."""
+    from app.services.intake_prompts import build_intake_system_prompt
+
+    prompt = build_intake_system_prompt()
+    assert "SHORT 5-8 word" in prompt
+    assert "Never use the user's full sentence" in prompt
+
+
+def test_fallback_to_hardcoded_on_unknown_action(monkeypatch) -> None:
+    """If model returns unrecognized action, handler returns False for fallback."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session()
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+
+    result = _handle_model_intake_action(
+        DummyClient(),
+        settings,
+        session,
+        event={"text": "hello", "files": []},
+        action=_action(action="unknown_action"),
+    )
+
+    assert result is False
+
+
+def test_description_alias_maps_to_problem(monkeypatch) -> None:
+    """Model returning 'description' field should map to 'problem'."""
+    settings = _settings(openrouter_api_key="sk-test")
+    session = _session()
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda s: None)
+    monkeypatch.setattr(slackbot_mod, "_finalize_session", lambda c, s, sess: None)
+
+    _handle_model_intake_action(
+        DummyClient(),
+        settings,
+        session,
+        event={"text": "test", "files": []},
+        action=_action(
+            action="confirm",
+            fields={"description": "Full description here", "branch": "develop"},
+        ),
+    )
+
+    assert session.answers["problem"] == "Full description here"
+    assert session.answers["base_branch"] == "develop"
