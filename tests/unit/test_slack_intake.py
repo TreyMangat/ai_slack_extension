@@ -676,6 +676,7 @@ def test_finalize_create_session_continues_when_header_update_fails(monkeypatch)
 
     monkeypatch.setattr(slackbot_mod.httpx, "post", lambda *args, **kwargs: DummyResponse())
     monkeypatch.setattr(slackbot_mod, "_drop_session", lambda _session: None)
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda _session: None)
 
     posted: list[dict[str, object]] = []
 
@@ -704,7 +705,19 @@ def test_finalize_create_session_continues_when_header_update_fails(monkeypatch)
         "base_branch": "main",
     }
 
-    _finalize_create_session(DummyClient(), settings, session)
+    dummy_client = DummyClient()
+
+    # First call posts spec summary for confirmation (no API call yet)
+    _finalize_create_session(dummy_client, settings, session)
+    texts_after_summary = [str(item.get("text") or "") for item in posted]
+    assert any("review" in text.lower() or "summary" in text.lower() for text in texts_after_summary)
+
+    # Simulate user clicking "Looks good, create it"
+    session.answers["_spec_confirmed"] = True
+    session.answers.pop("_awaiting_confirmation", None)
+    posted.clear()
+
+    _finalize_create_session(dummy_client, settings, session)
 
     texts = [str(item.get("text") or "") for item in posted]
     assert any("Created request" in text for text in texts)

@@ -5,6 +5,7 @@ from contextlib import suppress
 from datetime import datetime
 import logging
 import re
+import threading
 from typing import Any
 
 from sqlalchemy import select
@@ -64,6 +65,50 @@ def _build_timeout_window_seconds(settings: Any) -> int:
     return 0
 
 
+BUILD_STAGES = [
+    ("workspace", "Preparing workspace..."),
+    ("repo", "Resolving repository..."),
+    ("codegen", "Generating code..."),
+    ("tests", "Running tests..."),
+    ("push", "Pushing branch..."),
+    ("pr", "Opening pull request..."),
+    ("preview", "Waiting for preview..."),
+    ("done", "Build complete!"),
+]
+
+
+def _stage_progress_text(current_stage: str, elapsed: float) -> str:
+    """Build a progress string showing completed/current/pending stages."""
+    lines = []
+    found_current = False
+    for stage_key, stage_label in BUILD_STAGES:
+        if stage_key == current_stage:
+            lines.append(f":hourglass_flowing_sand: *{stage_label}*")
+            found_current = True
+        elif not found_current:
+            lines.append(f":white_check_mark: ~{stage_label}~")
+        else:
+            lines.append(f":white_circle: {stage_label}")
+
+    elapsed_str = _format_duration_seconds(elapsed)
+    lines.append(f"\n_Elapsed: {elapsed_str}_")
+    return "\n".join(lines)
+
+
+class BuildProgress:
+    def __init__(self) -> None:
+        self.stage = "workspace"
+        self._lock = threading.Lock()
+
+    def set_stage(self, stage: str) -> None:
+        with self._lock:
+            self.stage = stage
+
+    def get_stage(self) -> str:
+        with self._lock:
+            return self.stage
+
+
 def _slack_message_timestamp(response: Any) -> str:
     if isinstance(response, dict):
         return str(response.get("ts") or "").strip()
@@ -85,23 +130,27 @@ async def _build_heartbeat_loop(
     started_at: datetime,
     interval_seconds: int,
     timeout_window_seconds: int,
+    progress: BuildProgress | None = None,
 ) -> None:
     heartbeat_message_ts = ""
     while True:
         await asyncio.sleep(max(interval_seconds, 1))
         elapsed = int((datetime.utcnow() - started_at).total_seconds())
-        timeout_note = ""
-        if timeout_window_seconds > 0:
-            remaining = max(timeout_window_seconds - elapsed, 0)
-            timeout_note = (
-                f" | Timeout window: `{_format_duration_seconds(timeout_window_seconds)}` total "
-                f"(~`{_format_duration_seconds(remaining)}` remaining)"
+        if progress is not None:
+            text = _stage_progress_text(progress.get_stage(), elapsed)
+        else:
+            timeout_note = ""
+            if timeout_window_seconds > 0:
+                remaining = max(timeout_window_seconds - elapsed, 0)
+                timeout_note = (
+                    f" | Timeout window: `{_format_duration_seconds(timeout_window_seconds)}` total "
+                    f"(~`{_format_duration_seconds(remaining)}` remaining)"
+                )
+            repo_note = f"\nRepo: `{target_repo}`" if target_repo else ""
+            text = (
+                f"Still building *{feature_title}* (`{mode}`).{repo_note}\n"
+                f"Elapsed: `{_format_duration_seconds(elapsed)}`{timeout_note}"
             )
-        repo_note = f"\nRepo: `{target_repo}`" if target_repo else ""
-        text = (
-            f"Still building *{feature_title}* (`{mode}`).{repo_note}\n"
-            f"Elapsed: `{_format_duration_seconds(elapsed)}`{timeout_note}"
-        )
         if heartbeat_message_ts:
             try:
                 slack.update_message(
@@ -274,9 +323,12 @@ async def kickoff_build(feature_id: str) -> None:
 
         log_event(db, feature, event_type="build_started", message="Build started")
 
+        progress = BuildProgress()
+
         spec = feature.spec or {}
         github_actor_id = str(spec.get("_last_build_actor_id") or feature.requester_user_id or "").strip()
 
+        progress.set_stage("workspace")
         workspace_result = prepare_workspace(feature.id, spec)
         log_event(
             db,
@@ -353,6 +405,7 @@ async def kickoff_build(feature_id: str) -> None:
                 _post_build_cost_summary(slack, feature)
             return
 
+        progress.set_stage("repo")
         owner, repo = resolve_repo_for_spec(spec=spec, settings=settings)
         target_repo = f"{owner}/{repo}" if owner and repo else ""
         feature.github_issue_url = ""
@@ -417,6 +470,7 @@ async def kickoff_build(feature_id: str) -> None:
                     started_at=datetime.utcnow(),
                     interval_seconds=heartbeat_interval_seconds,
                     timeout_window_seconds=_build_timeout_window_seconds(settings),
+                    progress=progress,
                 )
             )
 
@@ -439,6 +493,7 @@ async def kickoff_build(feature_id: str) -> None:
                 )
 
             stage = "coderunner_kickoff"
+            progress.set_stage("codegen")
             optimized_prompt = _truncate_for_event(spec.get("optimized_prompt", ""), max_chars=6000)
             log_event(
                 db,
@@ -484,6 +539,7 @@ async def kickoff_build(feature_id: str) -> None:
             feature_run.artifacts = {"runner_metadata": runner_metadata}
             feature_run.error_text = ""
 
+            progress.set_stage("pr")
             action_result = perform_action(feature.status, "opened_pr")
             validate_transition(feature.status, action_result.new_status)
             feature.status = action_result.new_status
@@ -567,6 +623,7 @@ async def kickoff_build(feature_id: str) -> None:
                     team_id=feature.slack_team_id,
                 )
 
+            progress.set_stage("preview")
             safe_preview_url = normalize_external_url(result.preview_url or "")
             if safe_preview_url:
                 feature.preview_url = safe_preview_url
@@ -605,6 +662,7 @@ async def kickoff_build(feature_id: str) -> None:
             else:
                 # Preview URL will be set later via signed integration callback.
                 feature.active_build_job_id = ""
+            progress.set_stage("done")
             _post_build_cost_summary(slack, feature)
             feature_run.status = "SUCCEEDED"
             feature_run.pr_url = feature.github_pr_url or feature_run.pr_url

@@ -670,6 +670,68 @@ def developer_mode_repo_blocks(
     ]
 
 
+def build_spec_summary_blocks(
+    spec: dict[str, Any],
+    *,
+    feature_ref: str = "",
+) -> list[dict[str, Any]]:
+    """Build a rich summary of the captured spec for user review."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Feature Request Summary"},
+        },
+    ]
+
+    field_display = [
+        ("Title", spec.get("title")),
+        ("Problem", spec.get("problem")),
+        ("Repository", spec.get("repo")),
+        ("Branch", spec.get("base_branch")),
+        ("Mode", spec.get("implementation_mode")),
+        ("Acceptance Criteria", spec.get("acceptance_criteria")),
+    ]
+
+    for label, value in field_display:
+        if not value:
+            continue
+        if isinstance(value, list):
+            value = "\n".join(f"\u2022 {item}" for item in value)
+        text = f"*{label}:*\n{value}"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text[:3000]},
+        })
+
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Looks good, create it"},
+                "action_id": "ff_confirm_spec",
+                "style": "primary",
+                "value": "confirm",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Edit a field"},
+                "action_id": "ff_edit_field",
+                "value": "edit",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Cancel"},
+                "action_id": "ff_cancel_intake",
+                "value": "cancel",
+            },
+        ],
+    })
+
+    return blocks
+
+
 def developer_mode_branch_blocks(
     *,
     repo_slug: str,
