@@ -15,6 +15,7 @@ from app.slackbot import (
     _is_stop_command,
     _next_field,
     _post_prompt_confirmation_message,
+    _process_session_message,
     _repo_selection_mutable,
     _repo_options_for_slack,
     _set_session_intake_mode,
@@ -163,6 +164,111 @@ def test_create_spec_from_session_sets_default_edit_scope_for_reuse_mode() -> No
     spec = _create_spec_from_session(session)
     assert spec["source_repos"] == []
     assert "Focus on existing modules" in spec["edit_scope"]
+
+
+def test_process_session_message_allows_cancel_while_awaiting_confirmation(monkeypatch) -> None:
+    session = _dummy_session()
+    session.answers["_awaiting_confirmation"] = True
+    dropped: list[IntakeSession] = []
+    posted: list[dict[str, object]] = []
+
+    monkeypatch.setattr(slackbot_mod, "_drop_session", lambda candidate: dropped.append(candidate))
+
+    class DummyClient:
+        def chat_postMessage(self, **kwargs):
+            posted.append(kwargs)
+
+    _process_session_message(
+        DummyClient(),
+        slackbot_mod.logger,
+        Settings.model_construct(),
+        session,
+        event={"text": "cancel", "files": []},
+        user_id=session.user_id,
+        team_id=session.team_id,
+        channel_id=session.channel_id,
+        thread_ts=session.thread_ts,
+        text="cancel",
+        subtype=None,
+    )
+
+    assert dropped == [session]
+    assert posted[0]["text"] == "Intake cancelled. Use `/prfactory` to start again."
+
+
+def test_process_session_message_starts_inline_edit_for_selected_field(monkeypatch) -> None:
+    session = _dummy_session()
+    session.answers["_editing_field"] = True
+    stored: list[dict[str, object]] = []
+    prompted: list[str] = []
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda candidate: stored.append(dict(candidate.answers)))
+    monkeypatch.setattr(slackbot_mod, "_ask_field_question", lambda _client, _session, *, field: prompted.append(field))
+
+    class DummyClient:
+        def chat_postMessage(self, **kwargs):
+            return {"ok": True, "ts": "2.0"}
+
+    _process_session_message(
+        DummyClient(),
+        slackbot_mod.logger,
+        Settings.model_construct(),
+        session,
+        event={"text": "acceptance criteria", "files": []},
+        user_id=session.user_id,
+        team_id=session.team_id,
+        channel_id=session.channel_id,
+        thread_ts=session.thread_ts,
+        text="acceptance criteria",
+        subtype=None,
+    )
+
+    assert "_editing_field" not in session.answers
+    assert session.answers["_editing_target_field"] == "acceptance_criteria"
+    assert session.queue == ["acceptance_criteria"]
+    assert prompted == ["acceptance_criteria"]
+    assert stored[-1]["_editing_target_field"] == "acceptance_criteria"
+
+
+def test_process_session_message_captures_inline_edit_answer_and_finalizes(monkeypatch) -> None:
+    session = _dummy_session()
+    session.answers = {
+        "title": "Add export",
+        "problem": "Old problem",
+        "_editing_target_field": "problem",
+    }
+    session.queue = ["problem"]
+    stored: list[dict[str, object]] = []
+    finalized: list[dict[str, object]] = []
+    posted: list[dict[str, object]] = []
+
+    monkeypatch.setattr(slackbot_mod, "_store_session", lambda candidate: stored.append(dict(candidate.answers)))
+    monkeypatch.setattr(slackbot_mod, "_finalize_session", lambda _client, _settings, candidate: finalized.append(dict(candidate.answers)))
+
+    class DummyClient:
+        def chat_postMessage(self, **kwargs):
+            posted.append(kwargs)
+
+    _process_session_message(
+        DummyClient(),
+        slackbot_mod.logger,
+        Settings.model_construct(),
+        session,
+        event={"text": "New problem statement", "files": []},
+        user_id=session.user_id,
+        team_id=session.team_id,
+        channel_id=session.channel_id,
+        thread_ts=session.thread_ts,
+        text="New problem statement",
+        subtype=None,
+    )
+
+    assert session.answers["problem"] == "New problem statement"
+    assert "_editing_target_field" not in session.answers
+    assert session.queue == []
+    assert any(item["text"] == "Captured." for item in posted)
+    assert finalized[-1]["problem"] == "New problem statement"
+    assert stored[-1]["problem"] == "New problem statement"
 
 
 def testtitle_prompt_blocks_include_visible_question_and_hint() -> None:

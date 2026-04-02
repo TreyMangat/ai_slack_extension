@@ -224,6 +224,27 @@ def _intake_help_text() -> str:
     )
 
 
+EDITABLE_SPEC_FIELDS = (
+    "title",
+    "problem",
+    "repo",
+    "base_branch",
+    "acceptance_criteria",
+)
+
+
+def _editable_field_names_text() -> str:
+    return ", ".join(f"`{field}`" for field in EDITABLE_SPEC_FIELDS)
+
+
+def _normalize_editable_field_name(text: str) -> str:
+    candidate = re.sub(r"\s+", "_", str(text or "").strip().strip("`").lower())
+    candidate = normalize_router_field_name(candidate)
+    if candidate in EDITABLE_SPEC_FIELDS:
+        return candidate
+    return ""
+
+
 def _post_thread_message_with_optional_model_context(
     client: Any,
     *,
@@ -1372,23 +1393,23 @@ def _handle_cost_subcommand(body: dict[str, Any], client: Any, settings: Any) ->
 
 
 def _handle_help_subcommand(body: dict[str, Any], client: Any, settings: Any) -> None:
+    del settings
     user_id = str(body.get("user_id") or "").strip()
     channel_id = str(body.get("channel_id") or "").strip()
     if not user_id or not channel_id:
         return
 
     help_text = "\n".join([
-        f"*{PRIMARY_SLASH_COMMAND}* \u2014 Start a new feature request",
-        f"*{PRIMARY_SLASH_COMMAND} <description>* \u2014 Start with context",
-        f"*{PRIMARY_SLASH_COMMAND} status* \u2014 Your recent requests",
-        f"*{PRIMARY_SLASH_COMMAND} cost* \u2014 Your OpenRouter spend",
-        f"*{PRIMARY_SLASH_COMMAND} help* \u2014 This message",
+        f"*{PRIMARY_SLASH_COMMAND}* \u2014 Start the guided feature intake flow",
+        f"*{PRIMARY_SLASH_COMMAND} <description>* \u2014 Start intake with a seed prompt",
+        f"*{PRIMARY_SLASH_COMMAND} status* \u2014 Show your recent requests",
+        f"*{PRIMARY_SLASH_COMMAND} cost* \u2014 Show your OpenRouter spend",
+        f"*{PRIMARY_SLASH_COMMAND} help* \u2014 Show available subcommands",
         "",
-        "*During intake:*",
-        "\u2022 Type your answers naturally \u2014 the AI will extract the details",
-        "\u2022 Say `skip` to skip optional fields",
-        "\u2022 Say `cancel` to abort",
-        "\u2022 Click buttons when offered (repo, branch selection)",
+        "*Intake flow:*",
+        f"1. Run `{PRIMARY_SLASH_COMMAND}` and answer the prompts in the thread.",
+        "2. Reply naturally, or use `skip` for optional fields.",
+        "3. Review the captured spec summary, then confirm, edit, or cancel.",
         "",
         f"*Other commands:*",
         f"\u2022 `{INDEXER_SLASH_COMMAND} <query>` \u2014 Search repos",
@@ -1450,8 +1471,7 @@ def _branch_selection_mutable(session: IntakeSession) -> bool:
     return _peek_next_field(session) == "base_branch"
 
 
-def _ask_next_question(client: Any, session: IntakeSession) -> None:
-    field = _next_field(session)
+def _ask_field_question(client: Any, session: IntakeSession, *, field: str) -> None:
     if not field:
         return
     if session.mode == "create" and _session_intake_mode(session) == INTAKE_MODE_DEVELOPER:
@@ -1494,54 +1514,59 @@ def _ask_next_question(client: Any, session: IntakeSession) -> None:
             return
         if field == "base_branch":
             repo_slug = str(session.answers.get("repo") or "").strip()
-            settings = get_settings()
-            _warm_branch_cache(
-                settings=settings,
-                user_id=session.user_id,
-                team_id=session.team_id,
-                repo_slug=repo_slug,
-            )
-            options = _branch_options_for_slack(
-                settings,
-                user_id=session.user_id,
-                team_id=session.team_id,
-                repo_slug=repo_slug,
-                query="",
-            )
-            text = (
-                "Select an existing base branch. PRFactory always creates a new work branch automatically."
-            )
-            existing_ts = str(session.answers.get("_branch_prompt_ts") or "").strip()
-            if existing_ts:
-                try:
-                    client.chat_update(
-                        channel=session.channel_id,
-                        ts=existing_ts,
-                        text=text,
-                        blocks=developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
-                    )
-                    return
-                except Exception:
-                    module_logger.error(
-                        "slack_branch_prompt_update_failed channel=%s thread=%s ts=%s",
-                        session.channel_id,
-                        session.thread_ts,
-                        existing_ts,
-                        exc_info=True,
-                    )
-            msg = client.chat_postMessage(
-                channel=session.channel_id,
-                thread_ts=session.thread_ts,
-                text=text,
-                blocks=developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
-            )
-            session.answers["_branch_prompt_ts"] = str(msg.get("ts") or "").strip()
-            _store_session(session)
-            return
+            if repo_slug:
+                settings = get_settings()
+                _warm_branch_cache(
+                    settings=settings,
+                    user_id=session.user_id,
+                    team_id=session.team_id,
+                    repo_slug=repo_slug,
+                )
+                options = _branch_options_for_slack(
+                    settings,
+                    user_id=session.user_id,
+                    team_id=session.team_id,
+                    repo_slug=repo_slug,
+                    query="",
+                )
+                text = (
+                    "Select an existing base branch. PRFactory always creates a new work branch automatically."
+                )
+                existing_ts = str(session.answers.get("_branch_prompt_ts") or "").strip()
+                if existing_ts:
+                    try:
+                        client.chat_update(
+                            channel=session.channel_id,
+                            ts=existing_ts,
+                            text=text,
+                            blocks=developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
+                        )
+                        return
+                    except Exception:
+                        module_logger.error(
+                            "slack_branch_prompt_update_failed channel=%s thread=%s ts=%s",
+                            session.channel_id,
+                            session.thread_ts,
+                            existing_ts,
+                            exc_info=True,
+                        )
+                msg = client.chat_postMessage(
+                    channel=session.channel_id,
+                    thread_ts=session.thread_ts,
+                    text=text,
+                    blocks=developer_mode_branch_blocks(repo_slug=repo_slug, options=options),
+                )
+                session.answers["_branch_prompt_ts"] = str(msg.get("ts") or "").strip()
+                _store_session(session)
+                return
     prompt = QUESTION_BY_FIELD.get(field, f"Please provide `{field}`.")
     if session.mode == "update":
         prompt = f"Update request: {prompt}"
     client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=prompt)
+
+
+def _ask_next_question(client: Any, session: IntakeSession) -> None:
+    _ask_field_question(client, session, field=_next_field(session))
 
 
 def _finalize_session(client: Any, settings: Any, session: IntakeSession) -> None:
@@ -1821,14 +1846,6 @@ def _process_session_message(
         subtype or "",
     )
 
-    if session.answers.get("_awaiting_confirmation"):
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text="Please use the buttons above to confirm, edit, or cancel the feature request.",
-        )
-        return
-
     if text.lower() in {"cancel", "stop", "quit"}:
         _drop_session(session)
         client.chat_postMessage(
@@ -1836,6 +1853,71 @@ def _process_session_message(
             thread_ts=thread_ts,
             text=f"Intake cancelled. Use `{PRIMARY_SLASH_COMMAND}` to start again.",
         )
+        return
+
+    if session.answers.get("_awaiting_confirmation"):
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="Please use the buttons above to confirm, edit, or cancel.",
+        )
+        return
+
+    if session.answers.get("_editing_field"):
+        selected_field = _normalize_editable_field_name(text)
+        if not selected_field:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=f"Reply with the field name you want to edit: {_editable_field_names_text()}",
+            )
+            return
+        session.answers.pop("_editing_field", None)
+        session.answers["_editing_target_field"] = selected_field
+        session.queue = [selected_field]
+        _store_session(session)
+        _ask_field_question(client, session, field=selected_field)
+        return
+
+    editing_target_field = _normalize_editable_field_name(str(session.answers.get("_editing_target_field") or ""))
+    if editing_target_field:
+        previous_repo = str(session.answers.get("repo") or "").strip() if editing_target_field == "repo" else ""
+        require_repo = editing_target_field == "repo" and session.mode == "create" and _repo_required_for_slack_intake(settings)
+        ok, note = _capture_field_answer(
+            session,
+            field=editing_target_field,
+            event=event,
+            require_repo=require_repo,
+        )
+        if not ok:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
+            _ask_field_question(client, session, field=editing_target_field)
+            return
+        session.answers.pop("_editing_target_field", None)
+        _drop_field_from_queue(session, editing_target_field)
+        if editing_target_field == "repo":
+            current_repo = str(session.answers.get("repo") or "").strip()
+            repo_changed = current_repo != previous_repo
+            if repo_changed:
+                session.answers.pop("base_branch", None)
+                session.asked_fields.discard("base_branch")
+                session.answers.pop("_branch_prompt_ts", None)
+                _drop_field_from_queue(session, "base_branch")
+                if _session_intake_mode(session) == INTAKE_MODE_DEVELOPER and current_repo:
+                    session.queue.insert(0, "base_branch")
+            if current_repo:
+                note = (
+                    f"Updated repo: `{current_repo}`. Branch options refreshed."
+                    if previous_repo
+                    else f"Captured repo: `{current_repo}`"
+                )
+        _store_session(session)
+        if note:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=note)
+        if _next_field(session):
+            _ask_next_question(client, session)
+            return
+        _finalize_session(client, settings, session)
         return
 
     field = _next_field(session)
@@ -2371,6 +2453,7 @@ def _apply_repo_selection(
     if selected == REPO_OPTION_NONE:
         session.answers["repo"] = ""
         session.asked_fields.add("repo")
+        session.answers.pop("_editing_target_field", None)
         _drop_field_from_queue(session, "repo")
         session.answers.pop("base_branch", None)
         session.asked_fields.discard("base_branch")
@@ -2392,6 +2475,7 @@ def _apply_repo_selection(
     repo_changed = repo_slug != previous_repo
     session.answers["repo"] = repo_slug
     session.asked_fields.add("repo")
+    session.answers.pop("_editing_target_field", None)
     _drop_field_from_queue(session, "repo")
     if repo_changed:
         session.answers.pop("base_branch", None)
@@ -2523,6 +2607,7 @@ def _apply_branch_selection(
                 "Using repository default base branch.\n"
                 "PRFactory will create a new `prfactory/...` work branch for this request."
             )
+        session.answers.pop("_editing_target_field", None)
         _drop_field_from_queue(session, "base_branch")
         _store_session(session)
         client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=branch_note)
@@ -2540,6 +2625,7 @@ def _apply_branch_selection(
         return
     session.answers["base_branch"] = selected
     session.asked_fields.add("base_branch")
+    session.answers.pop("_editing_target_field", None)
     _drop_field_from_queue(session, "base_branch")
     _store_session(session)
     note = f"Base branch set to `{selected}`."
@@ -2768,28 +2854,22 @@ def _post_prompt_confirmation_message(
 
 
 def _finalize_create_session(client: Any, settings: Any, session: IntakeSession) -> None:
-    spec = _create_spec_from_session(session)
-
-    # If confirmation isn't yet given, post the spec summary for review
     if not session.answers.get("_spec_confirmed"):
+        spec = _create_spec_from_session(session)
         session.answers["_awaiting_confirmation"] = True
-        session.answers["_pending_spec"] = spec
-        _store_session(session)
         blocks = build_spec_summary_blocks(spec)
         client.chat_postMessage(
             channel=session.channel_id,
             thread_ts=session.thread_ts,
-            text="Please review the feature request summary below.",
+            text="Here's what I captured. Please review:",
             blocks=blocks,
         )
+        _store_session(session)
         return
 
-    # Confirmation received — proceed with creation
+    spec = _create_spec_from_session(session)
     session.answers.pop("_awaiting_confirmation", None)
     session.answers.pop("_spec_confirmed", None)
-    pending_spec = session.answers.pop("_pending_spec", None)
-    if pending_spec:
-        spec = pending_spec
 
     title = str(spec.get("title") or "").strip() or "(untitled feature)"
 
@@ -3558,65 +3638,52 @@ def create_slack_bolt_app(settings: Any):
         )
 
     @app.action("ff_confirm_spec")
-    def handle_confirm_spec(ack, body, client, logger):
+    def handle_confirm_spec(ack, body, client):
         ack()
-        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
-        channel_id = body.get("channel", {}).get("id")
-        user_id = body["user"]["id"]
-        thread_ts = _action_root_message_ts(body)
-
+        team_id, channel_id, user_id, thread_ts, _message_ts = _action_context(body)
         session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
         if not session:
             client.chat_postEphemeral(channel=channel_id, user=user_id, text="Session expired. Please start over.")
             return
 
-        session.answers["_spec_confirmed"] = True
         session.answers.pop("_awaiting_confirmation", None)
+        session.answers["_spec_confirmed"] = True
         _store_session(session)
         _finalize_create_session(client, settings, session)
 
     @app.action("ff_edit_field")
-    def handle_edit_field(ack, body, client, logger):
+    def handle_edit_field(ack, body, client):
         ack()
-        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
-        channel_id = body.get("channel", {}).get("id")
-        user_id = body["user"]["id"]
-        thread_ts = _action_root_message_ts(body)
-
+        team_id, channel_id, user_id, thread_ts, _message_ts = _action_context(body)
         session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
         if not session:
             client.chat_postEphemeral(channel=channel_id, user=user_id, text="Session expired. Please start over.")
             return
 
-        editable_fields = ["title", "problem", "repo", "base_branch", "implementation_mode", "acceptance_criteria"]
-        field_list = "\n".join(f"\u2022 `{f}`" for f in editable_fields)
+        session.answers.pop("_awaiting_confirmation", None)
+        session.answers.pop("_spec_confirmed", None)
+        session.answers.pop("_editing_target_field", None)
+        session.answers["_editing_field"] = True
+        session.queue = []
+        _store_session(session)
         client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text=f"Which field would you like to edit? Reply with the field name:\n{field_list}",
+            text="Which field would you like to edit? Reply with the field name: "
+            f"{_editable_field_names_text()}",
         )
 
-        # Re-queue all editable fields so the next message can re-capture one
-        session.answers.pop("_awaiting_confirmation", None)
-        session.answers.pop("_spec_confirmed", None)
-        session.queue = editable_fields[:1]  # Ask for the first field; user reply will re-trigger
-        _store_session(session)
-
     @app.action("ff_cancel_intake")
-    def handle_cancel_intake(ack, body, client, logger):
+    def handle_cancel_intake(ack, body, client):
         ack()
-        team_id = str(body.get("team", {}).get("id") or body.get("team_id") or "").strip()
-        channel_id = body.get("channel", {}).get("id")
-        user_id = body["user"]["id"]
-        thread_ts = _action_root_message_ts(body)
-
+        team_id, channel_id, user_id, thread_ts, _message_ts = _action_context(body)
         session = _get_session(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
         if session:
             _drop_session(session)
         client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
-            text="Feature request cancelled.",
+            text="Intake cancelled.",
         )
 
     @app.action("ff_add_details")
