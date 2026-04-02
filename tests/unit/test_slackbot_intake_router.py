@@ -1281,9 +1281,8 @@ def test_ack_called_first_in_slash_handler(monkeypatch) -> None:
                         func = listener.lazy_listeners[0]
                     break
 
-    # Simpler: just verify _handle_create_command exists and ack() pattern
-    # by checking that process_before_response is enabled on the app
-    assert bolt_app._process_before_response is True
+    # process_before_response must be False to avoid Slack 3-second timeouts
+    assert bolt_app._process_before_response is False
 
 
 def test_advance_to_next_field_shows_branch(monkeypatch) -> None:

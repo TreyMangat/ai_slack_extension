@@ -1674,6 +1674,29 @@ def _handle_model_intake_action(
                     return True
                 _finalize_session(client, settings, session)
                 return True
+            # High-confidence model fill — capture directly, skip dropdown
+            confidence = float(getattr(action, "confidence", 0) or 0)
+            if field_value and confidence >= 0.8:
+                require_repo = session.mode == "create" and _repo_required_for_slack_intake(settings)
+                ok, note = _capture_field_answer(
+                    session,
+                    field="repo",
+                    event={"text": field_value, "files": []},
+                    require_repo=require_repo,
+                )
+                if ok:
+                    _drop_field_from_queue(session, "repo")
+                    _store_session(session)
+                    client.chat_postMessage(
+                        channel=session.channel_id,
+                        thread_ts=session.thread_ts,
+                        text=next_question or f"Using repo `{field_value}`.",
+                    )
+                    if _next_field(session):
+                        _ask_next_question(client, session)
+                    else:
+                        _finalize_session(client, settings, session)
+                    return True
             _show_repo_dropdown_message(
                 client,
                 settings,
@@ -1694,6 +1717,27 @@ def _handle_model_intake_action(
                     return True
                 _finalize_session(client, settings, session)
                 return True
+            # High-confidence model fill — capture directly, skip dropdown
+            confidence = float(getattr(action, "confidence", 0) or 0)
+            if field_value and confidence >= 0.8:
+                ok, note = _capture_field_answer(
+                    session,
+                    field="base_branch",
+                    event={"text": field_value, "files": []},
+                )
+                if ok:
+                    _drop_field_from_queue(session, "base_branch")
+                    _store_session(session)
+                    client.chat_postMessage(
+                        channel=session.channel_id,
+                        thread_ts=session.thread_ts,
+                        text=next_question or f"Using branch `{field_value}`.",
+                    )
+                    if _next_field(session):
+                        _ask_next_question(client, session)
+                    else:
+                        _finalize_session(client, settings, session)
+                    return True
             _show_branch_dropdown_message(
                 client,
                 settings,
@@ -3060,7 +3104,7 @@ def create_slack_bolt_app(settings: Any):
     oauth_runtime = get_slack_oauth_runtime()
     app_kwargs: dict[str, Any] = {
         "signing_secret": settings.slack_signing_secret or "",
-        "process_before_response": True,
+        "process_before_response": False,
     }
     if oauth_runtime is not None:
         app_kwargs["oauth_settings"] = oauth_runtime.oauth_settings

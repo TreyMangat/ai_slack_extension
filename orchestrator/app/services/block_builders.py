@@ -315,17 +315,10 @@ def resolved_model_name(settings: Any, *, tier: str, model_name: str = "") -> st
 # ---------------------------------------------------------------------------
 
 def intake_controls_blocks(*, mode: str) -> list[dict[str, Any]]:
-    current_mode = normalize_intake_mode(mode)
     return [
         {
             "type": "actions",
             "elements": [
-                {
-                    "type": "button",
-                    "action_id": "ff_toggle_mode",
-                    "text": {"type": "plain_text", "text": intake_mode_toggle_label(current_mode)},
-                    "value": current_mode,
-                },
                 {
                     "type": "button",
                     "action_id": "ff_show_help",

@@ -30,8 +30,6 @@ QUESTION_BY_FIELD: dict[str, str] = {
 
 CREATE_FLOW_FIELDS_MINIMAL = [
     "title",
-    "implementation_mode",
-    "edit_scope",
     "repo",
     "base_branch",
 ]

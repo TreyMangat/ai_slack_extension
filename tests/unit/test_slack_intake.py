@@ -56,8 +56,8 @@ def test_build_create_queue_excludes_repo_when_not_required() -> None:
 
 def test_build_create_queue_includes_repo_when_required() -> None:
     queue = _build_create_queue(has_title=False, require_repo=True)
-    assert "implementation_mode" in queue
-    assert "edit_scope" in queue
+    assert "implementation_mode" not in queue
+    assert "edit_scope" not in queue
     assert "repo" in queue
     assert "base_branch" in queue
 
@@ -837,3 +837,19 @@ def test_finalize_create_session_continues_when_header_update_fails(monkeypatch)
         )
         for block_set in [item.get("blocks") for item in posted if isinstance(item.get("blocks"), list)]
     )
+
+
+def test_create_queue_minimal_has_no_implementation_mode():
+    queue = _build_create_queue(has_title=False, require_repo=True, minimal=True)
+    assert "implementation_mode" not in queue
+    assert "edit_scope" not in queue
+    assert "title" in queue
+    assert "repo" in queue
+
+
+def test_process_before_response_is_false():
+    """process_before_response must be False to prevent Slack timeouts."""
+    import pathlib
+
+    source = pathlib.Path("orchestrator/app/slackbot.py").read_text()
+    assert '"process_before_response": False' in source
