@@ -34,6 +34,50 @@ from app.services.llm_costs import aggregate_llm_costs, build_llm_cost_context_b
 from app.services.repo_indexer_adapter import RepoIndexerError, get_repo_indexer_client
 from app.services.slack_oauth import get_slack_oauth_runtime
 from app.services.reviewer_service import is_approver_allowed
+from app.services.intake_session import (
+    IntakeSession,
+    ACTIVE_INTAKES,
+    SESSION_TTL_SECONDS,
+    get_session as _get_session,
+    store_session as _store_session,
+    drop_session as _drop_session,
+    next_field as _next_field,
+    drop_field_from_queue as _drop_field_from_queue,
+    build_create_queue as _build_create_queue,
+    build_update_queue as _build_update_queue,
+    session_key as _session_key,
+    cleanup_expired_sessions as _cleanup_expired_sessions,
+    session_from_record as _session_from_record,
+)
+from app.services.intake_helpers import (
+    QUESTION_BY_FIELD,
+    CREATE_FLOW_FIELDS_MINIMAL,
+    CREATE_FLOW_FIELDS_FULL,
+    UPDATE_FALLBACK_FIELDS,
+    SKIP_TOKENS,
+    URL_RE,
+    AFFIRMATION_PHRASES,
+    INTAKE_MODE_NORMAL,
+    INTAKE_MODE_DEVELOPER,
+    parse_lines as _parse_lines,
+    dedupe as _dedupe,
+    extract_urls as _extract_urls,
+    extract_file_links as _extract_file_links,
+    is_skip as _is_skip,
+    is_stop_command as _is_stop_command,
+    normalize_mode as _normalize_mode,
+    format_mode as _format_mode,
+    normalize_intake_mode as _normalize_intake_mode,
+    session_intake_mode as _session_intake_mode,
+    set_session_intake_mode as _set_session_intake_mode,
+    intake_mode_label as _intake_mode_label,
+    intake_mode_toggle_label as _intake_mode_toggle_label,
+    capture_field_answer as _capture_field_answer,
+    create_spec_from_session as _create_spec_from_session,
+    update_patch_from_session as _update_patch_from_session,
+    default_spec as _default_spec,
+    normalize_branch_name as _normalize_branch_name,
+)
 
 try:
     from app.services.intake_router import IntakeAction, classify_intake_message
@@ -70,61 +114,16 @@ module_logger = logger
 class GitHubAuthError(RuntimeError):
     """Raised when a saved GitHub OAuth connection exists but the token is no longer usable."""
 
-QUESTION_BY_FIELD: dict[str, str] = {
-    "title": "How can I help you?",
-    "problem": "Describe what you want in one short paragraph (what to build + why).",
-    "business_justification": "Why is this needed now?",
-    "links": "Optional: share links/files in this thread, or reply `skip`.",
-    "repo": "Do you know what project/repo this belongs to? Reply with `org/repo`, repo URL, or `unsure`.",
-    "base_branch": "Optional: which base branch should we open the PR against? Reply with branch name, or `skip`.",
-    "implementation_mode": "Should implementation start from scratch or reuse existing project patterns? Reply `scratch` or `reuse`.",
-    "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
-    "edit_scope": "For edit mode, what files/modules/symbols should I touch first? (one short reply, or `skip`)",
-    "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
-    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to use defaults.",
-}
 
-CREATE_FLOW_FIELDS_MINIMAL = [
-    "title",
-    "implementation_mode",
-    "edit_scope",
-    "repo",
-    "base_branch",
-]
-CREATE_FLOW_FIELDS_FULL = [
-    "title",
-    "implementation_mode",
-    "edit_scope",
-    "problem",
-    "repo",
-    "base_branch",
-    "acceptance_criteria",
-    "links",
-]
-
-UPDATE_FALLBACK_FIELDS = [
-    "repo",
-    "base_branch",
-    "implementation_mode",
-    "edit_scope",
-    "source_repos",
-    "problem",
-    "business_justification",
-    "acceptance_criteria",
-    "proposed_solution",
-    "links",
-]
-
-SESSION_TTL_SECONDS = 2 * 60 * 60
 APP_HOME_WELCOME_TTL_SECONDS = 6 * 60 * 60
-URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-SKIP_TOKENS = {"skip", "n/a", "na", "none", "no", "not sure", "unsure", "unknown", "idk"}
+
+
 PRIMARY_SLASH_COMMAND = "/prfactory"
 LEGACY_SLASH_COMMAND = "/feature"
 GITHUB_HELP_SLASH_COMMAND = "/prfactory-github"
 INDEXER_SLASH_COMMAND = "/prfactory-indexer"
-INTAKE_MODE_NORMAL = "normal"
-INTAKE_MODE_DEVELOPER = "developer"
+
+
 REPO_OPTION_NONE = "__NONE__"
 REPO_OPTION_NEW = "__NEW__"
 REPO_OPTION_CONNECT = "__CONNECT__"
@@ -139,30 +138,8 @@ BRANCH_WORKTREE_PATH_NAME = "selection"
 CALLBACK_STALE_ALERTS_DISABLED_EVENT = "callback_stale_alerts_disabled"
 OPENROUTER_MINI_MODEL_DEFAULT = "qwen/qwen3.5-9b"
 OPENROUTER_FRONTIER_MODEL_DEFAULT = "anthropic/claude-opus-4-6"
-AFFIRMATION_PHRASES = {
-    "yes", "yeah", "yep", "yup", "correct", "right", "that's right",
-    "thats right", "that one", "the right one", "yes thats right",
-    "yes that's right", "ya", "sure", "ok", "okay", "confirmed",
-}
 
 
-@dataclass
-class IntakeSession:
-    mode: str  # create | update
-    feature_id: str
-    user_id: str
-    team_id: str
-    channel_id: str
-    thread_ts: str
-    message_ts: str
-    queue: list[str] = field(default_factory=list)
-    answers: dict[str, Any] = field(default_factory=dict)
-    asked_fields: set[str] = field(default_factory=set)
-    base_spec: dict[str, Any] = field(default_factory=dict)
-    started_at: float = field(default_factory=time.time)
-
-
-ACTIVE_INTAKES: dict[str, IntakeSession] = {}
 APP_HOME_WELCOME_CACHE: dict[str, float] = {}
 GITHUB_REPO_OPTIONS_CACHE: dict[str, tuple[float, list[str]]] = {}
 GITHUB_BRANCH_OPTIONS_CACHE: dict[str, tuple[float, list[str]]] = {}
@@ -226,50 +203,6 @@ def _stable_branch_fallback(
     return ""
 
 
-def _parse_lines(text: str) -> list[str]:
-    return [line.strip().lstrip("- ").strip() for line in (text or "").splitlines() if line.strip()]
-
-
-def _dedupe(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for raw in values:
-        item = str(raw).strip()
-        if not item:
-            continue
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        output.append(item)
-    return output
-
-
-def _extract_urls(text: str) -> list[str]:
-    return _dedupe(URL_RE.findall(text or ""))
-
-
-def _extract_file_links(event: dict[str, Any]) -> list[str]:
-    links: list[str] = []
-    for item in event.get("files") or []:
-        if not isinstance(item, dict):
-            continue
-        permalink = str(item.get("permalink") or "").strip()
-        if permalink:
-            links.append(permalink)
-    return _dedupe(links)
-
-
-def _is_skip(text: str) -> bool:
-    value = (text or "").strip().lower()
-    return value in SKIP_TOKENS
-
-
-def _is_stop_command(text: str) -> bool:
-    token = re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
-    return token == "stop"
-
-
 def _disable_stale_alerts_for_thread(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> str:
     channel = (channel_id or "").strip()
     thread = (thread_ts or "").strip()
@@ -318,59 +251,6 @@ def _disable_stale_alerts_for_thread(*, team_id: str, channel_id: str, thread_ts
                 },
             )
         return str(feature.id or "")
-
-
-def _normalize_branch_name(text: str) -> str:
-    branch = str(text or "").splitlines()[0].strip()
-    branch = branch.strip("`").strip()
-    if branch.lower().startswith("refs/heads/"):
-        branch = branch[11:].strip()
-    return branch
-
-
-def _normalize_mode(text: str) -> str:
-    value = (text or "").strip().lower()
-    if value in {"scratch", "new", "new_feature", "from scratch", "build from scratch"}:
-        return "new_feature"
-    if value in {"reuse", "existing", "reuse_existing", "use existing", "existing patterns"}:
-        return "reuse_existing"
-    if "scratch" in value:
-        return "new_feature"
-    if "reuse" in value or "existing" in value:
-        return "reuse_existing"
-    return ""
-
-
-def _format_mode(mode: str) -> str:
-    if mode == "reuse_existing":
-        return "Reuse existing repo patterns"
-    return "Build in target repo (default)"
-
-
-def _normalize_intake_mode(value: str) -> str:
-    normalized = (value or "").strip().lower()
-    if normalized == INTAKE_MODE_DEVELOPER:
-        return INTAKE_MODE_DEVELOPER
-    return INTAKE_MODE_NORMAL
-
-
-def _session_intake_mode(session: IntakeSession) -> str:
-    return _normalize_intake_mode(str((session.answers or {}).get("_intake_mode") or INTAKE_MODE_NORMAL))
-
-
-def _set_session_intake_mode(session: IntakeSession, mode: str) -> None:
-    session.answers["_intake_mode"] = _normalize_intake_mode(mode)
-
-
-def _intake_mode_label(mode: str) -> str:
-    return "Developer" if _normalize_intake_mode(mode) == INTAKE_MODE_DEVELOPER else "Normal"
-
-
-def _intake_mode_toggle_label(mode: str) -> str:
-    current = _normalize_intake_mode(mode)
-    if current == INTAKE_MODE_DEVELOPER:
-        return "Switch to Normal"
-    return "Switch to Developer"
 
 
 def _intake_controls_blocks(*, mode: str) -> list[dict[str, Any]]:
@@ -837,123 +717,6 @@ def _should_send_app_home_welcome(*, team_id: str, user_id: str) -> bool:
         return False
     APP_HOME_WELCOME_CACHE[key] = now
     return True
-
-
-def _session_key(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> str:
-    return f"{team_id}:{channel_id}:{thread_ts}:{user_id}"
-
-
-def _cleanup_expired_sessions() -> None:
-    now = time.time()
-    expired = [k for k, s in ACTIVE_INTAKES.items() if now - s.started_at > SESSION_TTL_SECONDS]
-    for key in expired:
-        ACTIVE_INTAKES.pop(key, None)
-    try:
-        with db_session() as db:
-            db.execute(delete(SlackIntakeSession).where(SlackIntakeSession.expires_at <= datetime.now(timezone.utc)))
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB cleanup failed: {e}[/yellow]")
-
-
-def _session_from_record(record: SlackIntakeSession) -> IntakeSession:
-    queue = [str(x) for x in (record.queue or []) if str(x).strip()]
-    answers = dict(record.answers or {})
-    asked_fields = {str(x) for x in (record.asked_fields or []) if str(x).strip()}
-    base_spec = dict(record.base_spec or {})
-    started_at = (
-        float(record.started_at.timestamp())
-        if isinstance(record.started_at, datetime)
-        else time.time()
-    )
-    return IntakeSession(
-        mode=str(record.mode or "create"),
-        feature_id=str(record.feature_id or ""),
-        user_id=str(record.user_id or ""),
-        team_id=str(getattr(record, "team_id", "") or ""),
-        channel_id=str(record.channel_id or ""),
-        thread_ts=str(record.thread_ts or ""),
-        message_ts=str(record.message_ts or ""),
-        queue=queue,
-        answers=answers,
-        asked_fields=asked_fields,
-        base_spec=base_spec,
-        started_at=started_at,
-    )
-
-
-def _store_session(session: IntakeSession) -> None:
-    _cleanup_expired_sessions()
-    key = _session_key(
-        team_id=session.team_id,
-        channel_id=session.channel_id,
-        thread_ts=session.thread_ts,
-        user_id=session.user_id,
-    )
-    ACTIVE_INTAKES[key] = session
-    try:
-        with db_session() as db:
-            row = db.get(SlackIntakeSession, key)
-            if not row:
-                row = SlackIntakeSession(session_key=key)
-                db.add(row)
-            now = datetime.now(timezone.utc)
-            row.mode = session.mode
-            row.feature_id = session.feature_id
-            row.user_id = session.user_id
-            row.team_id = session.team_id
-            row.channel_id = session.channel_id
-            row.thread_ts = session.thread_ts
-            row.message_ts = session.message_ts
-            row.queue = list(session.queue)
-            row.answers = dict(session.answers)
-            row.asked_fields = sorted(session.asked_fields)
-            row.base_spec = dict(session.base_spec)
-            row.started_at = datetime.fromtimestamp(session.started_at, tz=timezone.utc)
-            row.updated_at = now
-            row.expires_at = now + timedelta(seconds=SESSION_TTL_SECONDS)
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB persistence failed: {e}[/yellow]")
-
-
-def _get_session(*, team_id: str, channel_id: str, thread_ts: str, user_id: str) -> IntakeSession | None:
-    _cleanup_expired_sessions()
-    key = _session_key(team_id=team_id, channel_id=channel_id, thread_ts=thread_ts, user_id=user_id)
-    cached = ACTIVE_INTAKES.get(key)
-    if cached:
-        return cached
-    try:
-        with db_session() as db:
-            record = db.get(SlackIntakeSession, key)
-            if not record:
-                return None
-            now = datetime.now(timezone.utc)
-            expires_at = record.expires_at
-            if isinstance(expires_at, datetime) and expires_at <= now:
-                db.delete(record)
-                return None
-            session = _session_from_record(record)
-            ACTIVE_INTAKES[key] = session
-            return session
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB read failed: {e}[/yellow]")
-        return None
-
-
-def _drop_session(session: IntakeSession) -> None:
-    key = _session_key(
-        team_id=session.team_id,
-        channel_id=session.channel_id,
-        thread_ts=session.thread_ts,
-        user_id=session.user_id,
-    )
-    ACTIVE_INTAKES.pop(key, None)
-    try:
-        with db_session() as db:
-            row = db.get(SlackIntakeSession, key)
-            if row:
-                db.delete(row)
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[yellow]slack intake DB delete failed: {e}[/yellow]")
 
 
 def _feature_message_blocks(feature: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
@@ -2747,61 +2510,8 @@ def _update_feature_message(client: Any, feature: dict[str, Any], *, channel_id:
     )
 
 
-def _default_spec() -> dict[str, Any]:
-    return {
-        "title": "",
-        "problem": "",
-        "business_justification": "",
-        "proposed_solution": "",
-        "acceptance_criteria": [],
-        "non_goals": [],
-        "repo": "",
-        "base_branch": "",
-        "implementation_mode": "new_feature",
-        "source_repos": [],
-        "edit_scope": "",
-        "risk_flags": [],
-        "links": [],
-        "debug_build": False,
-    }
-
-
-def _build_create_queue(*, has_title: bool, require_repo: bool, minimal: bool = True) -> list[str]:
-    queue = list(CREATE_FLOW_FIELDS_MINIMAL if minimal else CREATE_FLOW_FIELDS_FULL)
-    if has_title:
-        queue.remove("title")
-    if not require_repo and "repo" in queue:
-        queue.remove("repo")
-    if "repo" not in queue and "base_branch" in queue:
-        queue.remove("base_branch")
-    return queue
-
-
 def _repo_required_for_slack_intake(settings: Any) -> bool:
     return bool(settings.github_enabled) and not bool(settings.mock_mode)
-
-
-def _build_update_queue(feature: dict[str, Any]) -> list[str]:
-    spec = feature.get("spec") or {}
-    validation = spec.get("_validation") or {}
-    missing = [str(x).strip() for x in (validation.get("missing") or []) if str(x).strip()]
-
-    ordered_missing: list[str] = []
-    for field in [
-        "title",
-        "problem",
-        "business_justification",
-        "acceptance_criteria",
-        "implementation_mode",
-        "source_repos",
-        "edit_scope",
-    ]:
-        if field in missing:
-            ordered_missing.append(field)
-
-    if ordered_missing:
-        return ordered_missing
-    return list(UPDATE_FALLBACK_FIELDS)
 
 
 def _peek_next_field(session: IntakeSession) -> str:
@@ -2825,31 +2535,6 @@ def _peek_next_field(session: IntakeSession) -> str:
     return ""
 
 
-def _next_field(session: IntakeSession) -> str:
-    is_model_flow = str(session.answers.get("_flow") or "").strip() == "model"
-    while session.queue:
-        current = session.queue[0]
-        if current == "base_branch":
-            repo_value = str(session.answers.get("repo") or session.base_spec.get("repo") or "").strip()
-            if is_model_flow and repo_value:
-                pass  # Model flow: keep base_branch when repo is set
-            elif _session_intake_mode(session) != INTAKE_MODE_DEVELOPER or not repo_value:
-                session.queue.pop(0)
-                continue
-        if current == "edit_scope":
-            mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
-            if mode != "reuse_existing":
-                session.queue.pop(0)
-                continue
-        if current == "source_repos":
-            mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
-            if mode != "reuse_existing":
-                session.queue.pop(0)
-                continue
-        return current
-    return ""
-
-
 def _repo_selection_mutable(session: IntakeSession) -> bool:
     if session.mode != "create":
         return False
@@ -2864,10 +2549,6 @@ def _branch_selection_mutable(session: IntakeSession) -> bool:
     if _session_intake_mode(session) == INTAKE_MODE_DEVELOPER:
         return True
     return _peek_next_field(session) == "base_branch"
-
-
-def _drop_field_from_queue(session: IntakeSession, field: str) -> None:
-    session.queue = [item for item in session.queue if item != field]
 
 
 def _ask_next_question(client: Any, session: IntakeSession) -> None:
@@ -2962,172 +2643,6 @@ def _ask_next_question(client: Any, session: IntakeSession) -> None:
     if session.mode == "update":
         prompt = f"Update request: {prompt}"
     client.chat_postMessage(channel=session.channel_id, thread_ts=session.thread_ts, text=prompt)
-
-
-def _capture_field_answer(
-    session: IntakeSession,
-    *,
-    field: str,
-    event: dict[str, Any],
-    require_repo: bool = False,
-) -> tuple[bool, str]:
-    text = str(event.get("text") or "").strip()
-    file_links = _extract_file_links(event)
-
-    if field in {"title", "problem", "business_justification"}:
-        if not text or _is_skip(text):
-            return False, "That field is required before build. Please provide a short answer."
-        session.answers[field] = text
-        session.asked_fields.add(field)
-        return True, "Captured."
-
-    if field == "links":
-        links = _dedupe(_extract_urls(text) + file_links)
-        if links:
-            existing = [str(x).strip() for x in (session.answers.get("links") or []) if str(x).strip()]
-            session.answers["links"] = _dedupe(existing + links)
-            session.asked_fields.add("links")
-            return True, f"Saved {len(links)} link(s)/attachment(s)."
-        return True, "No links added."
-
-    if field == "repo":
-        if not text or _is_skip(text):
-            if require_repo and _session_intake_mode(session) != INTAKE_MODE_DEVELOPER:
-                return False, "Target repo is required. Reply with `org/repo`."
-            session.answers["repo"] = ""
-            return True, "Repo left unspecified."
-        repo_input = text.splitlines()[0].strip()
-        owner, repo = parse_repo_slug(repo_input)
-        if owner and repo:
-            repo_input = f"{owner}/{repo}"
-        session.answers["repo"] = repo_input
-        session.asked_fields.add("repo")
-        return True, "Captured repo/project."
-
-    if field == "base_branch":
-        if not text or _is_skip(text):
-            session.answers["base_branch"] = ""
-            return True, "Using default branch."
-        branch = _normalize_branch_name(text)
-        if not re.match(r"^[A-Za-z0-9._/-]+$", branch):
-            return False, "Branch name can only include letters, numbers, `.`, `_`, `/`, and `-`."
-        session.answers["base_branch"] = branch
-        session.asked_fields.add("base_branch")
-        return True, f"Base branch set to `{branch}`."
-
-    if field == "implementation_mode":
-        mode = _normalize_mode(text)
-        if not mode:
-            return False, "Please reply with `scratch` or `reuse`."
-        session.answers["implementation_mode"] = mode
-        if mode != "reuse_existing":
-            session.answers.pop("source_repos", None)
-            session.answers.pop("edit_scope", None)
-            session.asked_fields.discard("source_repos")
-            session.asked_fields.discard("edit_scope")
-        session.asked_fields.add("implementation_mode")
-        return True, f"Using mode: `{mode}`."
-
-    if field == "source_repos":
-        mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
-        if mode != "reuse_existing":
-            return True, "Reuse references not needed for scratch mode."
-
-        if _is_skip(text) or not text:
-            session.answers["source_repos"] = []
-            session.asked_fields.add("source_repos")
-            return True, "No external reference repos provided; I will use the target repo context only."
-
-        repos = _parse_lines(text)
-        if not repos:
-            return False, "Reuse mode needs at least one reference repo. Please provide one per line."
-        session.answers["source_repos"] = repos
-        session.asked_fields.add("source_repos")
-        return True, f"Saved {len(repos)} source repo reference(s)."
-
-    if field == "edit_scope":
-        mode = str(session.answers.get("implementation_mode") or session.base_spec.get("implementation_mode") or "new_feature")
-        if mode != "reuse_existing":
-            return True, "Edit targeting details are not needed for scratch mode."
-        if not text or _is_skip(text):
-            session.answers["edit_scope"] = "Focus on existing modules and files most directly related to the request."
-            session.asked_fields.add("edit_scope")
-            return True, "No explicit edit target provided; I will infer likely files from context."
-        session.answers["edit_scope"] = text
-        session.asked_fields.add("edit_scope")
-        return True, "Captured edit targeting details."
-
-    if field == "proposed_solution":
-        if not text or _is_skip(text):
-            return True, "No preferred implementation approach captured."
-        session.answers["proposed_solution"] = text
-        session.asked_fields.add("proposed_solution")
-        return True, "Captured implementation notes."
-
-    if field == "acceptance_criteria":
-        criteria = _parse_lines(text)
-        if (not criteria and _is_skip(text)) or (not criteria and not text):
-            session.answers["acceptance_criteria"] = []
-            return True, "No explicit acceptance criteria provided. I will use defaults."
-        if not criteria:
-            return False, "Please provide acceptance criteria lines or reply `skip`."
-        session.answers["acceptance_criteria"] = criteria
-        session.asked_fields.add("acceptance_criteria")
-        return True, f"Captured {len(criteria)} acceptance criteria item(s)."
-
-    return False, f"Unsupported intake field `{field}`."
-
-
-def _create_spec_from_session(session: IntakeSession) -> dict[str, Any]:
-    spec = _default_spec()
-    spec.update(session.answers)
-    seed_prompt = str(spec.get("_seed_prompt") or "").strip()
-    for key in [item for item in spec.keys() if str(item).startswith("_")]:
-        spec.pop(key, None)
-
-    mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
-    spec["implementation_mode"] = mode
-    spec["repo"] = str(spec.get("repo") or "").strip()
-    spec["base_branch"] = str(spec.get("base_branch") or "").strip()
-    spec["edit_scope"] = str(spec.get("edit_scope") or "").strip()
-    spec["source_repos"] = [str(x).strip() for x in (spec.get("source_repos") or []) if str(x).strip()]
-    spec["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
-    if not str(spec.get("problem") or "").strip():
-        if seed_prompt:
-            spec["problem"] = seed_prompt
-        else:
-            title = str(spec.get("title") or "").strip()
-            spec["problem"] = title if title else "Requested via Slack intake."
-    if not str(spec.get("business_justification") or "").strip():
-        problem = str(spec.get("problem") or "").strip()
-        spec["business_justification"] = (
-            f"Requested via Slack intake. Context: {problem[:200]}"
-            if problem
-            else "Requested via Slack intake."
-        )
-    criteria = [str(x).strip() for x in (spec.get("acceptance_criteria") or []) if str(x).strip()]
-    if not criteria:
-        title = str(spec.get("title") or "feature").strip()
-        problem = str(spec.get("problem") or "").strip()
-        problem_excerpt = problem[:160].rstrip() if problem else title
-        criteria = [
-            f"Implements requested behavior: {problem_excerpt}.",
-            "Changes are committed and opened as a PR for review.",
-        ]
-    spec["acceptance_criteria"] = criteria
-
-    if mode == "reuse_existing" and not str(spec.get("edit_scope") or "").strip():
-        spec["edit_scope"] = "Focus on existing modules and files that directly implement this request."
-
-    return spec
-
-
-def _update_patch_from_session(session: IntakeSession) -> dict[str, Any]:
-    patch: dict[str, Any] = {}
-    for field in sorted(session.asked_fields):
-        if field in session.answers:
-            patch[field] = session.answers[field]
-    return patch
 
 
 def _finalize_session(client: Any, settings: Any, session: IntakeSession) -> None:
