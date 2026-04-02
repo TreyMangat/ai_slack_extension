@@ -41,6 +41,7 @@ _COMPLETE_SPEC = {
 _INCOMPLETE_SPEC = {
     "title": "Something",
     "problem": "",
+    "repo": "org/frontend",
     "business_justification": "",
     "acceptance_criteria": [],
 }
@@ -212,4 +213,5 @@ class TestRuleBasedUnchanged:
         is_valid, missing, warnings = validate_spec(_INCOMPLETE_SPEC)
         assert is_valid is False
         assert "problem" in missing
-        assert "business_justification" in missing
+        assert "business_justification" not in missing
+        assert "acceptance_criteria" not in missing

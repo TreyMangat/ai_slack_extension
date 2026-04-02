@@ -120,6 +120,7 @@ class TestPromptAssembly:
     def test_required_fields_always_present(self) -> None:
         prompt = build_intake_system_prompt()
         assert "REQUIRED FIELDS" in prompt
+        assert "OPTIONAL FIELDS" in prompt
         assert "title:" in prompt
         assert "acceptance_criteria:" in prompt
 

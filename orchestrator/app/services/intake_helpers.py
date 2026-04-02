@@ -25,7 +25,7 @@ QUESTION_BY_FIELD: dict[str, str] = {
     "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
     "edit_scope": "For edit mode, what files/modules/symbols should I touch first? (one short reply, or `skip`)",
     "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
-    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to use defaults.",
+    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to leave blank.",
 }
 
 CREATE_FLOW_FIELDS_MINIMAL = [
@@ -287,7 +287,7 @@ def capture_field_answer(
         criteria = parse_lines(text)
         if (not criteria and is_skip(text)) or (not criteria and not text):
             session.answers["acceptance_criteria"] = []
-            return True, "No explicit acceptance criteria provided. I will use defaults."
+            return True, "Acceptance criteria left blank for now."
         if not criteria:
             return False, "Please provide acceptance criteria lines or reply `skip`."
         session.answers["acceptance_criteria"] = criteria
@@ -300,39 +300,28 @@ def capture_field_answer(
 def create_spec_from_session(session: Any) -> dict[str, Any]:
     spec = default_spec()
     spec.update(session.answers)
-    seed_prompt = str(spec.get("_seed_prompt") or "").strip()
     for key in [item for item in spec.keys() if str(item).startswith("_")]:
         spec.pop(key, None)
 
+    spec["title"] = str(spec.get("title") or "").strip()
+    spec["problem"] = str(spec.get("problem") or "").strip()
+    spec["business_justification"] = str(spec.get("business_justification") or "").strip()
     mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
     spec["implementation_mode"] = mode
     spec["repo"] = str(spec.get("repo") or "").strip()
     spec["base_branch"] = str(spec.get("base_branch") or "").strip()
     spec["edit_scope"] = str(spec.get("edit_scope") or "").strip()
-    spec["source_repos"] = [str(x).strip() for x in (spec.get("source_repos") or []) if str(x).strip()]
+    raw_source_repos = spec.get("source_repos") or []
+    if isinstance(raw_source_repos, str):
+        spec["source_repos"] = parse_lines(raw_source_repos)
+    else:
+        spec["source_repos"] = [str(x).strip() for x in raw_source_repos if str(x).strip()]
     spec["links"] = [str(x).strip() for x in (spec.get("links") or []) if str(x).strip()]
-    if not str(spec.get("problem") or "").strip():
-        if seed_prompt:
-            spec["problem"] = seed_prompt
-        else:
-            title = str(spec.get("title") or "").strip()
-            spec["problem"] = title if title else "Requested via Slack intake."
-    if not str(spec.get("business_justification") or "").strip():
-        problem = str(spec.get("problem") or "").strip()
-        spec["business_justification"] = (
-            f"Requested via Slack intake. Context: {problem[:200]}"
-            if problem
-            else "Requested via Slack intake."
-        )
-    criteria = [str(x).strip() for x in (spec.get("acceptance_criteria") or []) if str(x).strip()]
-    if not criteria:
-        title = str(spec.get("title") or "feature").strip()
-        problem = str(spec.get("problem") or "").strip()
-        problem_excerpt = problem[:160].rstrip() if problem else title
-        criteria = [
-            f"Implements requested behavior: {problem_excerpt}.",
-            "Changes are committed and opened as a PR for review.",
-        ]
+    raw_acceptance_criteria = spec.get("acceptance_criteria") or []
+    if isinstance(raw_acceptance_criteria, str):
+        criteria = parse_lines(raw_acceptance_criteria)
+    else:
+        criteria = [str(x).strip() for x in raw_acceptance_criteria if str(x).strip()]
     spec["acceptance_criteria"] = criteria
 
     if mode == "reuse_existing" and not str(spec.get("edit_scope") or "").strip():

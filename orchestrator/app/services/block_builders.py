@@ -40,7 +40,7 @@ QUESTION_BY_FIELD: dict[str, str] = {
     "source_repos": "If reusing existing patterns, which repos should be references? One per line.",
     "edit_scope": "For edit mode, what files/modules/symbols should I touch first? (one short reply, or `skip`)",
     "proposed_solution": "Any preferred implementation approach or constraints? Reply `skip` if none.",
-    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to use defaults.",
+    "acceptance_criteria": "Optional: acceptance criteria, one per line. Reply `skip` to leave blank.",
 }
 
 

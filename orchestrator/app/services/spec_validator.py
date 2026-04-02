@@ -9,14 +9,14 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_FIELDS = ["title", "problem", "business_justification"]
+REQUIRED_FIELDS = ["title", "problem", "repo"]
 COMPLETION_WEIGHTS = {
-    "title": 20,
-    "problem": 20,
-    "business_justification": 15,
-    "acceptance_criteria": 20,
-    "repo": 15,
+    "title": 30,
+    "problem": 30,
+    "repo": 20,
     "implementation_mode": 10,
+    "business_justification": 5,
+    "acceptance_criteria": 5,
 }
 
 
@@ -37,10 +37,6 @@ def validate_spec(spec: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
         if not str(spec.get(f, "")).strip():
             missing.append(f)
 
-    acceptance = spec.get("acceptance_criteria") or []
-    if not isinstance(acceptance, list) or len([a for a in acceptance if str(a).strip()]) == 0:
-        missing.append("acceptance_criteria")
-
     mode = str(spec.get("implementation_mode", "new_feature")).strip() or "new_feature"
     if mode not in {"new_feature", "reuse_existing"}:
         missing.append("implementation_mode")
@@ -49,14 +45,8 @@ def validate_spec(spec: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
     if mode == "reuse_existing":
         if not isinstance(source_repos, list) or len([r for r in source_repos if str(r).strip()]) == 0:
             missing.append("source_repos")
-        if not str(spec.get("repo", "")).strip():
-            warnings.append("repo is empty; first source repo will be treated as execution target")
     elif isinstance(source_repos, list) and any(str(r).strip() for r in source_repos):
         warnings.append("source_repos provided for new_feature mode; they will be treated as references only")
-
-    # Warnings (not blockers)
-    if not str(spec.get("repo", "")).strip():
-        warnings.append("repo is empty (OK for local mock mode)")
 
     risk_flags = spec.get("risk_flags") or []
     if isinstance(risk_flags, list) and any(str(x).lower() in {"payments", "auth", "migrations"} for x in risk_flags):

@@ -50,7 +50,7 @@ def _required_fields_section(
         branch_hint = " Suggest from the branch list below when possible."
 
     return (
-        "REQUIRED FIELDS (collect all before confirming):\n"
+        "REQUIRED FIELDS (collect these before confirming):\n"
         "- title: A SHORT ticket-style subject line, max 8 words. "
         "Example: \"Add dark mode toggle\" NOT \"I want to build a dark mode for the "
         "settings page of my application\". Shorten whatever the user says.\n"
@@ -58,8 +58,11 @@ def _required_fields_section(
         "to implement it. If the user gives a vague description, ask follow-up "
         "questions to make it specific.\n"
         f"- repo: Which repository this should be built in.{repo_hint}\n"
+        "\n"
+        "OPTIONAL FIELDS (ask only if the user seems interested):\n"
         f"- branch: Which branch to base the work on.{branch_hint}\n"
-        "- acceptance_criteria: How do we know it's done? What should be testable?\n\n"
+        "- acceptance_criteria: Specific, testable conditions. Only ask if the user hasn't "
+        "already implied them. Don't generate generic ones.\n\n"
         "IMPORTANT: The 'title' field_value must be a SHORT summary (under 8 "
         "words). The full description goes in 'description', not 'title'. If the "
         "user gives one sentence, extract a short title AND keep the full "
