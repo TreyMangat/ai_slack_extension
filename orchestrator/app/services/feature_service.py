@@ -4,12 +4,13 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.models import FeatureRequest
 from app.schemas import FeatureRequestCreate, FeatureSpecUpdateRequest
 from app.services.event_logger import log_event
 from app.services.prompt_optimizer import attach_optimized_prompt
 from app.services.reviewer_service import ensure_approver_allowed
-from app.services.spec_validator import spec_completion_report, validate_spec_with_llm_sync
+from app.services.spec_validator import spec_completion_report, validate_spec, validate_spec_with_llm_sync
 from app.services.url_safety import normalize_external_url_list
 from app.state_machine import (
     BUILDING,
@@ -21,6 +22,14 @@ from app.state_machine import (
     perform_action,
     validate_transition,
 )
+
+try:
+    from app.services.frontier_validator import validate_spec_with_frontier_sync
+except ImportError:  # pragma: no cover - covered by fallback behavior
+    validate_spec_with_frontier_sync = None  # type: ignore[assignment]
+    HAS_FRONTIER_VALIDATOR = False
+else:
+    HAS_FRONTIER_VALIDATOR = True
 
 
 class BuildAlreadyInProgressError(ValueError):
@@ -90,6 +99,38 @@ def _apply_llm_validation_artifacts(
     )
 
 
+def _frontier_llm_analysis(result: object) -> dict[str, object] | None:
+    suggestions_text = str(getattr(result, "suggestions", "") or "").strip()
+    missing_info = [str(item).strip() for item in (getattr(result, "missing_info", []) or []) if str(item).strip()]
+
+    analysis = {
+        "model": str(getattr(result, "model", "") or "").strip(),
+        "tier": str(getattr(result, "tier", "") or "").strip().lower(),
+        "status": "READY_FOR_BUILD" if bool(getattr(result, "is_valid", False)) else "NEEDS_INFO",
+        "missing_fields": missing_info,
+        "suggestions": [suggestions_text] if suggestions_text else [],
+        "confidence": float(getattr(result, "confidence", 0.0) or 0.0),
+        "usage": dict(getattr(result, "usage", {}) or {}),
+        "cost_estimate_usd": round(float(getattr(result, "cost_estimate_usd", 0.0) or 0.0), 6),
+        "reasoning": str(getattr(result, "reasoning", "") or "").strip(),
+    }
+
+    if not any(
+        [
+            analysis["model"],
+            analysis["tier"],
+            analysis["missing_fields"],
+            analysis["suggestions"],
+            analysis["confidence"],
+            analysis["usage"],
+            analysis["cost_estimate_usd"],
+            analysis["reasoning"],
+        ]
+    ):
+        return None
+    return analysis
+
+
 def create_feature_request(db: Session, payload: FeatureRequestCreate) -> FeatureRequest:
     spec_data = payload.spec.model_dump()
     spec_data["links"] = normalize_external_url_list(spec_data.get("links") or [])
@@ -123,7 +164,53 @@ def create_feature_request(db: Session, payload: FeatureRequestCreate) -> Featur
     )
 
     # Validate spec immediately and update state
-    is_valid, missing, warnings, llm_analysis = validate_spec_with_llm_sync(feature.spec, feature_id=feature.id)
+    is_valid, missing, warnings = validate_spec(feature.spec)
+    llm_analysis: dict[str, object] | None = None
+
+    settings = get_settings()
+    openrouter_enabled = bool(str(getattr(settings, "openrouter_api_key", "") or "").strip())
+    if is_valid and HAS_FRONTIER_VALIDATOR and validate_spec_with_frontier_sync and openrouter_enabled:
+        frontier_result = validate_spec_with_frontier_sync(feature.spec)
+        next_spec = dict(feature.spec or {})
+
+        improved_title = str(getattr(frontier_result, "improved_title", "") or "").strip()
+        if improved_title:
+            next_spec["title"] = improved_title
+            feature.title = improved_title[:200]
+
+        improved_problem = str(getattr(frontier_result, "improved_problem", "") or "").strip()
+        if improved_problem:
+            next_spec["problem"] = improved_problem
+
+        improved_acceptance = [
+            str(item).strip()
+            for item in (getattr(frontier_result, "acceptance_criteria", []) or [])
+            if str(item).strip()
+        ]
+        if improved_acceptance:
+            next_spec["acceptance_criteria"] = improved_acceptance
+
+        next_spec["_frontier_validation"] = {
+            "is_valid": bool(getattr(frontier_result, "is_valid", False)),
+            "confidence": float(getattr(frontier_result, "confidence", 0.0) or 0.0),
+            "reasoning": str(getattr(frontier_result, "reasoning", "") or "").strip(),
+        }
+        feature.spec = next_spec
+
+        llm_analysis = _frontier_llm_analysis(frontier_result)
+
+        suggestions = str(getattr(frontier_result, "suggestions", "") or "").strip()
+        if suggestions:
+            warnings = [*warnings, suggestions]
+
+        if not bool(getattr(frontier_result, "is_valid", False)):
+            is_valid = False
+            missing = [
+                str(item).strip()
+                for item in (getattr(frontier_result, "missing_info", []) or [])
+                if str(item).strip()
+            ] or ["Spec needs more detail"]
+
     _set_validation_metadata(feature, is_valid=is_valid, missing=missing, warnings=warnings)
     _apply_llm_validation_artifacts(db, feature, llm_analysis=llm_analysis)
 

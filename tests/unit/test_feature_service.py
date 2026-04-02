@@ -7,6 +7,7 @@ import pytest
 
 from app.models import FeatureRequest
 from app.schemas import FeatureRequestCreate, FeatureSpecPatch, FeatureSpecUpdateRequest
+from app.services.frontier_validator import ValidationResult
 from app.services.feature_service import (
     BuildAlreadyInProgressError,
     _apply_llm_validation_artifacts,
@@ -196,18 +197,30 @@ class TestValidationHelpers:
 class TestCreateFeatureRequest:
     def test_create_feature_request_sets_metadata_and_ready_status(self, mock_db_session):
         payload = _create_payload(links=["https://example.com/spec", "javascript:alert(1)"])
-        llm_analysis = {
-            "model": "anthropic/claude-opus-4-6",
-            "tier": "frontier",
-            "usage": {"input_tokens": 20, "output_tokens": 10},
-            "cost_estimate_usd": 0.0025,
-        }
+        frontier_result = ValidationResult(
+            is_valid=True,
+            confidence=0.94,
+            acceptance_criteria=["Button exists", "CSV downloads"],
+            reasoning="Specific enough to build",
+            model="anthropic/claude-opus-4-6",
+            tier="frontier",
+            usage={"input_tokens": 20, "output_tokens": 10},
+            cost_estimate_usd=0.0025,
+        )
 
         with (
             patch(
-                "app.services.feature_service.validate_spec_with_llm_sync",
-                return_value=(True, [], ["repo looks good"], llm_analysis),
+                "app.services.feature_service.validate_spec",
+                return_value=(True, [], ["repo looks good"]),
             ) as validate_mock,
+            patch(
+                "app.services.feature_service.validate_spec_with_frontier_sync",
+                return_value=frontier_result,
+            ) as frontier_mock,
+            patch(
+                "app.services.feature_service.get_settings",
+                return_value=MagicMock(openrouter_api_key="sk-or-test-key"),
+            ),
             patch("app.services.feature_service.log_event") as log_event_mock,
         ):
             feature = create_feature_request(mock_db_session, payload)
@@ -219,14 +232,17 @@ class TestCreateFeatureRequest:
         assert feature.spec["_meta"]["version"] == 1
         assert feature.spec["_meta"]["last_updated_by"] == "U_TEST"
         assert feature.spec["_validation"]["is_valid"] is True
-        assert feature.llm_spec_analysis == llm_analysis
+        assert feature.spec["_frontier_validation"]["is_valid"] is True
+        assert feature.spec["acceptance_criteria"] == ["Button exists", "CSV downloads"]
+        assert feature.llm_spec_analysis is not None
+        assert feature.llm_spec_analysis["model"] == "anthropic/claude-opus-4-6"
         assert feature.slack_channel_id == "C_TEST"
         assert "optimized_prompt" in feature.spec
         validate_mock.assert_called_once()
+        frontier_mock.assert_called_once()
         called_spec = validate_mock.call_args.args[0]
         assert called_spec["links"] == ["https://example.com/spec"]
         assert "_validation" not in called_spec
-        assert validate_mock.call_args.kwargs["feature_id"] == feature.id
         assert log_event_mock.call_count == 3
 
     def test_create_feature_request_invalid_spec_moves_to_needs_info(self, mock_db_session):
@@ -234,9 +250,10 @@ class TestCreateFeatureRequest:
 
         with (
             patch(
-                "app.services.feature_service.validate_spec_with_llm_sync",
-                return_value=(False, ["problem"], ["problem is vague"], None),
-            ),
+                "app.services.feature_service.validate_spec",
+                return_value=(False, ["problem"], ["problem is vague"]),
+            ) as validate_mock,
+            patch("app.services.feature_service.validate_spec_with_frontier_sync") as frontier_mock,
             patch("app.services.feature_service.log_event") as log_event_mock,
         ):
             feature = create_feature_request(mock_db_session, payload)
@@ -245,6 +262,8 @@ class TestCreateFeatureRequest:
         assert feature.llm_spec_analysis is None
         assert feature.spec["_validation"]["missing"] == ["problem"]
         assert feature.spec["_validation"]["warnings"] == ["problem is vague"]
+        validate_mock.assert_called_once()
+        frontier_mock.assert_not_called()
         assert log_event_mock.call_count == 2
 
 
