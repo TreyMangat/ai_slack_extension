@@ -1,0 +1,2 @@
+OpenClaw E2E marker artifact for deterministic pipeline verification.
+UTC timestamp: 2026-02-21T11:10:25Z
