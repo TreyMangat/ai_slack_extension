@@ -1,0 +1,57 @@
+:root {
+  color: #101828;
+  background: linear-gradient(160deg, #f5f7fa 0%, #e8eef9 100%);
+  font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.page {
+  max-width: 820px;
+  margin: 48px auto;
+  padding: 28px;
+  border-radius: 16px;
+  background: #ffffffcc;
+  box-shadow: 0 20px 48px rgba(16, 24, 40, 0.14);
+}
+
+h1 {
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+.problem {
+  margin-top: 0;
+  margin-bottom: 20px;
+}
+
+.button-demo {
+  margin-bottom: 24px;
+}
+
+.primary-button {
+  border: none;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+
+.primary-button:hover {
+  background: #1d4ed8;
+}
+
+.click-output {
+  margin-top: 10px;
+  margin-bottom: 0;
+}
+
+li {
+  margin-bottom: 6px;
+}
