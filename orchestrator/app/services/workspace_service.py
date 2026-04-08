@@ -103,22 +103,32 @@ def _is_relative_to(path: Path, maybe_parent: Path) -> bool:
         return False
 
 
-def _resolve_local_repo_path(repo_ref: str, allowed_root: Path) -> Path | None:
+def _resolve_local_repo_path(repo_ref: str, allowed_roots: list[Path]) -> Path | None:
     raw = repo_ref.strip()
     if not raw:
         return None
 
-    direct = Path(raw).expanduser()
-    if not direct.is_absolute():
-        direct = (allowed_root / direct).resolve()
-    else:
-        direct = direct.resolve()
+    roots = [root.resolve() for root in allowed_roots]
+    if not roots:
+        return None
 
-    if not direct.exists():
+    direct = Path(raw).expanduser()
+    if direct.is_absolute():
+        candidate = direct.resolve()
+        if not candidate.exists():
+            return None
+        if any(_is_relative_to(candidate, root) for root in roots):
+            return candidate
         return None
-    if not _is_relative_to(direct, allowed_root):
-        return None
-    return direct
+
+    for root in roots:
+        candidate = (root / direct).resolve()
+        if not candidate.exists():
+            continue
+        if _is_relative_to(candidate, root):
+            return candidate
+
+    return None
 
 
 def _copy_snapshot(source: Path, destination: Path, ignore_patterns: list[str]) -> None:
@@ -256,6 +266,11 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
     repos_to_process = source_repos[: settings.workspace_max_source_repos]
 
     allowed_copy_root = Path(settings.workspace_local_copy_root).resolve()
+    allowed_copy_roots = [allowed_copy_root]
+    workspace_root_reference_seed = workspace_root / "references"
+    if workspace_root_reference_seed.exists() and workspace_root_reference_seed.is_dir():
+        allowed_copy_roots.append(workspace_root_reference_seed)
+
     ignore_patterns = settings.workspace_copy_ignore_patterns()
     clone_token = ""
     if settings.workspace_enable_git_clone and settings.github_enabled:
@@ -268,7 +283,7 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
         slug = _safe_slug(repo_ref, index=index)
         destination = references_path / f"{index:02d}_{slug}"
 
-        local_path = _resolve_local_repo_path(repo_ref, allowed_copy_root)
+        local_path = _resolve_local_repo_path(repo_ref, allowed_copy_roots)
         if local_path is not None:
             try:
                 _copy_snapshot(local_path, destination, ignore_patterns=ignore_patterns)
@@ -278,7 +293,7 @@ def prepare_workspace(feature_id: str, spec: dict[str, Any]) -> WorkspacePrepara
                         destination=str(destination),
                         method="local_copy",
                         status="prepared",
-                        detail=f"snapshot copied from local path under {allowed_copy_root}",
+                        detail="snapshot copied from approved local path",
                     )
                 )
                 continue
